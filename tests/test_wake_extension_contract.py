@@ -15,7 +15,7 @@ def test_wake_extension_has_minimal_permissions_and_loopback_control_boundary() 
     )
 
     assert manifest["manifest_version"] == 3
-    assert manifest["version"] == "0.1.27"
+    assert manifest["version"] == "0.1.29"
     assert set(manifest["permissions"]) == {
         "storage",
         "activeTab",

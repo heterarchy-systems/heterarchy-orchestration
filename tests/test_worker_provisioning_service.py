@@ -603,6 +603,50 @@ def test_operator_retry_rejects_stale_project_binding(tmp_path: Path) -> None:
     assert persisted.failure_reason == "app_menu_unavailable"
 
 
+def test_stale_operator_block_does_not_block_current_binding_admission(
+    tmp_path: Path,
+) -> None:
+    current = [datetime(2026, 8, 13, tzinfo=UTC)]
+    service, repository, binding_service, project_id = _bound_provisioning_service(
+        tmp_path=tmp_path, current=current
+    )
+    admitted = service.admit_next()
+    assert admitted is not None
+    blocked, _retry_after_ms = service.fail_callback(
+        request_id=admitted.request_id,
+        admission_revision=admitted.admission_revision or 0,
+        reason="bootstrap_unavailable",
+    )
+    binding = binding_service.get_binding(project_id=project_id)
+    updated_binding = binding_service.upsert_binding(
+        project_id=project_id,
+        expected_revision=binding.revision,
+        metadata=ProjectBindingAdapterMetadata(
+            provider="chatgpt",
+            project_ref="project-alpha",
+            project_path="/g/project-alpha",
+            app_ref="plugin_beta",
+            app_label="ChatOrchestration",
+        ),
+    )
+    service.upsert_demand(
+        project_id=project_id,
+        desired_capacity=2,
+        spawn_needed=2,
+        binding_revision=updated_binding.revision,
+    )
+    current[0] += timedelta(seconds=12)
+
+    retried = service.admit_next()
+
+    assert retried is not None
+    assert retried.request_id != blocked.request_id
+    assert retried.binding_revision == updated_binding.revision
+    assert retried.adapter_metadata == updated_binding.adapter_metadata
+    persisted_block = repository.read_request(request_id=blocked.request_id)
+    assert persisted_block.status is ProvisioningRequestStatus.OPERATOR_BLOCKED
+
+
 def test_operator_retry_rejects_non_blocked_request(tmp_path: Path) -> None:
     current = [datetime(2026, 8, 13, tzinfo=UTC)]
     service, _repository, _binding_service, _project_id = _bound_provisioning_service(

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatToCodex Runtime Wake",
-  "version": "0.1.27",
+  "version": "0.1.29",
   "description": "Wakes registered ChatGPT Worker or Main review chats when ChatToCodex runtime state is ready.",
   "permissions": [
     "storage",

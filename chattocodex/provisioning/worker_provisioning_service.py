@@ -342,7 +342,9 @@ class WorkerProvisioningService:
                 if _admission_blocked(state.admission, now=now):
                     return state
                 operator_blocked_project_ids = _operator_blocked_project_ids(
-                    state=state
+                    state=state,
+                    bindings=bindings,
+                    binding_required=self._project_binding_service is not None,
                 )
                 candidates = [
                     item
@@ -1451,18 +1453,35 @@ def _admission_blocked(admission: ProvisioningAdmissionState, *, now: datetime) 
     )
 
 
-def _operator_blocked_project_ids(*, state: ProvisioningStoreState) -> frozenset[str]:
+def _operator_blocked_project_ids(
+    *,
+    state: ProvisioningStoreState,
+    bindings: dict[str, ProjectBindingState | None],
+    binding_required: bool,
+) -> frozenset[str]:
     """Return projects with a durable non-rate-limit terminal browser failure.
 
     A failed provider/UI attempt is intentionally fail-closed. Capacity reconciliation
     may keep publishing the unmet deficit, but it cannot convert that durable operator
     blocker into repeated background tab creation.
     """
-    return frozenset(
-        request.project_id
-        for request in state.requests
-        if request.status is ProvisioningRequestStatus.OPERATOR_BLOCKED
-    )
+    blocked_project_ids: set[str] = set()
+    for request in state.requests:
+        if request.status is not ProvisioningRequestStatus.OPERATOR_BLOCKED:
+            continue
+        if not binding_required:
+            blocked_project_ids.add(request.project_id)
+            continue
+        binding = bindings.get(request.project_id)
+        if binding is None:
+            blocked_project_ids.add(request.project_id)
+            continue
+        if (
+            request.binding_revision == binding.revision
+            and request.adapter_metadata == binding.adapter_metadata
+        ):
+            blocked_project_ids.add(request.project_id)
+    return frozenset(blocked_project_ids)
 
 
 def _retry_after_ms(

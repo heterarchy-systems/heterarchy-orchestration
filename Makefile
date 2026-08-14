@@ -7,7 +7,11 @@ dev_env_check:
 	fi
 
 install-local: dev_env_check
-	uv sync --reinstall-package chattocodex
+	# CPython 3.14 skips .pth files carrying macOS UF_HIDDEN. Install the
+	# current source as a regular local wheel so console entry points also work
+	# when a copied or corrupted .venv has stale Finder hidden flags. The normal
+	# environment repair is: chflags -R nohidden .venv
+	uv pip install --offline --python .venv/bin/python --force-reinstall --no-deps .
 
 rule_check: dev_env_check
 	uv run python chattocodex/.agents/verify_manifest.py

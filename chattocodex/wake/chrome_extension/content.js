@@ -23,6 +23,8 @@ globalThis.__chatToCodexWakeAdapter = {
 
 const POLL_INTERVAL_MS = 2000;
 const RETRY_AFTER_MS = 90000;
+const WORKER_BOOTSTRAP_COMMAND =
+  " ChatToCodex worker registration handshake only. Do not use tools, access projects, or perform work.";
 let inFlightWakeKey = null;
 let appSelectionFailureCode = "app_mention_unavailable";
 let extensionContextAvailable = true;
@@ -1030,14 +1032,20 @@ async function bootstrapProvisionedWorker(bootstrapToken, rawAppIdentity) {
   }
 
   // A new conversation needs a real message to obtain its persistent `/c/`
-  // identity.  The message contains only the app mention: no work payload is
-  // injected until the normal post-registration wake path later authorizes it.
+  // identity.  Preserve the app-only draft as the durable capability, then
+  // append a fixed no-work handshake solely because the provider currently
+  // disables Send for an app-only composer.  The normal wake path remains the
+  // only boundary allowed to inject or authorize actual work.
   composer.focus();
   if (
     !hasRuntimeAppDraftOnly &&
     !replaceComposerText(composer, appMentionText(appIdentity))
   ) {
-    return { ok: false, code: "bootstrap_unavailable", retryable: false };
+    return {
+      ok: false,
+      code: "bootstrap_draft_insert_failed",
+      retryable: false,
+    };
   }
   await delay(450);
   if (!isRuntimeMentionDraftOwned(composer, appIdentity)) {
@@ -1057,19 +1065,90 @@ async function bootstrapProvisionedWorker(bootstrapToken, rawAppIdentity) {
   if (!isRuntimeMentionDraftOwned(composer, appIdentity)) {
     return { ok: false, code: "composer_changed", retryable: false };
   }
+  const registrationDraft = readComposerText(composer);
+  focusComposerEnd(composer);
+  if (!insertComposerText(composer, WORKER_BOOTSTRAP_COMMAND)) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+      { allowPartialCommand: true },
+    );
+    return {
+      ok: false,
+      code: "bootstrap_body_insert_failed",
+      retryable: false,
+    };
+  }
+  await delay(200);
+  if (!isBootstrapWakeDraftOwned(composer, appIdentity, registrationDraft)) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return { ok: false, code: "composer_changed", retryable: false };
+  }
   const sendButton = await waitForSendButton(4000);
-  if (
-    !sendButton ||
-    !isCurrentSendButton(sendButton) ||
-    isGeneratingResponse() ||
-    hasProviderRateLimitSignal() ||
-    !isRuntimeMentionDraftOwned(composer, appIdentity) ||
-    !isProvisioningDocumentStillUnclaimed()
-  ) {
-    clearBootstrapDraftIfUnchanged(composer, appIdentity);
-    return hasProviderRateLimitSignal()
-      ? { ok: false, code: "provider_rate_limited", rateLimited: true }
-      : { ok: false, code: "bootstrap_unavailable", retryable: false };
+  if (hasProviderRateLimitSignal()) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return { ok: false, code: "provider_rate_limited", rateLimited: true };
+  }
+  if (!sendButton) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return {
+      ok: false,
+      code: "bootstrap_send_button_unavailable",
+      retryable: false,
+    };
+  }
+  if (!isCurrentSendButton(sendButton) || sendButton.disabled === true) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return {
+      ok: false,
+      code: "bootstrap_send_button_replaced",
+      retryable: false,
+    };
+  }
+  if (isGeneratingResponse()) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return { ok: false, code: "generation_in_progress", retryable: false };
+  }
+  if (!isBootstrapWakeDraftOwned(composer, appIdentity, registrationDraft)) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return { ok: false, code: "composer_changed", retryable: false };
+  }
+  if (!isProvisioningDocumentStillUnclaimed()) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return {
+      ok: false,
+      code: "provisioning_tab_claimed",
+      retryable: false,
+    };
   }
   const ownership = await sendExtensionMessage({
     type: "provision:confirmBootstrapSubmit",
@@ -1078,19 +1157,82 @@ async function bootstrapProvisionedWorker(bootstrapToken, rawAppIdentity) {
   // The background check yields to Chrome and page code. Re-read every local
   // ownership signal afterwards so a replaced composer, a human draft, or a
   // newly focused provisioning tab can never inherit the old send button.
-  if (
-    !ownership?.ok ||
-    !ownership.safe ||
-    !isCurrentSendButton(sendButton) ||
-    !isRuntimeMentionDraftOwned(composer, appIdentity) ||
-    !isProvisioningDocumentStillUnclaimed() ||
-    isGeneratingResponse() ||
-    hasProviderRateLimitSignal()
-  ) {
-    clearBootstrapDraftIfUnchanged(composer, appIdentity);
+  if (!ownership?.ok) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return {
+      ok: false,
+      code: "bootstrap_ownership_unavailable",
+      retryable: false,
+    };
+  }
+  if (!ownership.safe) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
     return { ok: false, code: "bootstrap_ownership_lost", retryable: false };
   }
-  const registrationDraft = readComposerText(composer);
+  if (!isCurrentSendButton(sendButton) || sendButton.disabled === true) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return {
+      ok: false,
+      code: "bootstrap_send_button_replaced",
+      retryable: false,
+    };
+  }
+  if (!isBootstrapWakeDraftOwned(composer, appIdentity, registrationDraft)) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return { ok: false, code: "composer_changed", retryable: false };
+  }
+  if (!isProvisioningDocumentStillUnclaimed()) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return {
+      ok: false,
+      code: "provisioning_tab_claimed",
+      retryable: false,
+    };
+  }
+  if (isGeneratingResponse()) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return { ok: false, code: "generation_in_progress", retryable: false };
+  }
+  if (hasProviderRateLimitSignal()) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return { ok: false, code: "provider_rate_limited", rateLimited: true };
+  }
+  if (!isBootstrapWakeDraftOwned(composer, appIdentity, registrationDraft)) {
+    restoreBootstrapRegistrationDraftIfUnchanged(
+      composer,
+      appIdentity,
+      registrationDraft,
+    );
+    return { ok: false, code: "composer_changed", retryable: false };
+  }
   sendButton.click();
   return { ok: true, registrationDraft };
 }
@@ -1178,6 +1320,48 @@ function clearBootstrapDraftIfUnchanged(composer, appIdentity) {
   if (composerContainsOnlyAppMention(composer, appIdentity)) {
     replaceComposerText(composer, "");
   }
+}
+
+function isBootstrapWakeDraftOwned(composer, appIdentity, registrationDraft) {
+  return Boolean(
+    readComposerText(composer) ===
+      `${registrationDraft}${WORKER_BOOTSTRAP_COMMAND}` &&
+      isRuntimeWakeDraftOwned(
+        composer,
+        appIdentity,
+        WORKER_BOOTSTRAP_COMMAND,
+        {
+          allowEmptySelectedAppPrefix:
+            !normalizeComposerAppText(registrationDraft),
+        },
+      ),
+  );
+}
+
+function restoreBootstrapRegistrationDraftIfUnchanged(
+  composer,
+  appIdentity,
+  registrationDraft,
+  { allowPartialCommand = false } = {},
+) {
+  if (
+    findComposer() !== composer ||
+    !composerHasSelectedApp(composer, appIdentity)
+  ) {
+    return false;
+  }
+  const currentDraft = readComposerText(composer);
+  if (!currentDraft.startsWith(registrationDraft)) {
+    return false;
+  }
+  const commandSuffix = currentDraft.slice(registrationDraft.length);
+  if (
+    commandSuffix !== WORKER_BOOTSTRAP_COMMAND &&
+    !(allowPartialCommand && WORKER_BOOTSTRAP_COMMAND.startsWith(commandSuffix))
+  ) {
+    return false;
+  }
+  return replaceComposerText(composer, registrationDraft);
 }
 
 function consumeRegistrationDraft(rawAppIdentity) {
@@ -1656,15 +1840,18 @@ function replaceComposerText(composer, text) {
   range.selectNodeContents(composer);
   selection?.removeAllRanges();
   selection?.addRange(range);
-  return executeContentEditableCommand("insertText", text) &&
+  return executeContentEditableCommand(composer, "insertText", text) &&
     readComposerText(composer) === text;
 }
 
 function insertComposerText(composer, text) {
   if (composer instanceof HTMLTextAreaElement) {
-    composer.setRangeText(text, composer.selectionStart, composer.selectionEnd, "end");
+    const start = composer.selectionStart;
+    const end = composer.selectionEnd;
+    const expected = `${composer.value.slice(0, start)}${text}${composer.value.slice(end)}`;
+    composer.setRangeText(text, start, end, "end");
     composer.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
-    return;
+    return composer.value === expected;
   }
 
   // ProseMirror-backed composers can render one multiline insertText mutation
@@ -1673,12 +1860,12 @@ function insertComposerText(composer, text) {
   // by explicit line-break transactions.
   const lines = text.split("\n");
   for (const [index, line] of lines.entries()) {
-    if (line && !executeContentEditableCommand("insertText", line)) {
+    if (line && !executeContentEditableCommand(composer, "insertText", line)) {
       return false;
     }
     if (
       index < lines.length - 1 &&
-      !executeContentEditableCommand("insertLineBreak", null)
+      !executeContentEditableCommand(composer, "insertLineBreak", null)
     ) {
       return false;
     }
@@ -1713,15 +1900,51 @@ function replaceExactSelectedAppResidual(composer, text) {
   range.selectNodeContents(children[2]);
   selection?.removeAllRanges();
   selection?.addRange(range);
-  return executeContentEditableCommand("insertText", text.slice(prefix.length));
+  return executeContentEditableCommand(
+    composer,
+    "insertText",
+    text.slice(prefix.length),
+  );
 }
 
-function executeContentEditableCommand(command, data) {
+function executeContentEditableCommand(composer, command, data) {
+  let nativeInputObserved = false;
+  const observeNativeInput = () => {
+    nativeInputObserved = true;
+  };
+  composer.addEventListener("input", observeNativeInput);
+  let commandApplied = false;
   try {
-    return document.execCommand(command, false, data ?? "") === true;
+    commandApplied = document.execCommand(command, false, data ?? "") === true;
   } catch (_error) {
     return false;
+  } finally {
+    composer.removeEventListener("input", observeNativeInput);
   }
+  if (!commandApplied) {
+    return false;
+  }
+
+  // Chromium normally emits `input` synchronously for execCommand, but the
+  // controlled ChatGPT editor has also been observed accepting the transient
+  // DOM mutation without committing it to provider state.  In that narrow
+  // case, emit the missing transaction signal ourselves.  Do not duplicate a
+  // native event: the listener above spans only the synchronous command call.
+  if (!nativeInputObserved) {
+    try {
+      composer.dispatchEvent(
+        new InputEvent("input", {
+          bubbles: true,
+          composed: true,
+          inputType: command,
+          data: command === "insertLineBreak" ? null : data ?? "",
+        }),
+      );
+    } catch (_error) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function focusComposerEnd(composer) {

@@ -699,6 +699,7 @@ function makeContentRuntime({
   appIdentity = APP_IDENTITY,
   mutateDuringDelay = null,
   sendInitiallyVisible = true,
+  sendRequiresNonAppText = false,
   bootstrapSafety = { ok: true, safe: true },
   mutateDuringOwnershipCheck = null,
   inlineSelectedApp = false,
@@ -1080,8 +1081,40 @@ function makeContentRuntime({
     composer.value = initialComposerText;
   }
   let currentComposer = composer;
+  function currentComposerText() {
+    return contentEditableComposer
+      ? String(currentComposer.textContent || "")
+      : String(currentComposer.value || "");
+  }
+  function currentComposerContainsOnlySelectedApp() {
+    if (!selectedApp) {
+      return false;
+    }
+    const normalize = (value) =>
+      String(value || "")
+        .replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
+        .replace(/\s+/g, "")
+        .toLocaleLowerCase();
+    const text = normalize(currentComposerText());
+    const label = normalize(selectedAppLabel);
+    const iconInitial = Array.from(label)[0] || "";
+    return [
+      `@${label}`,
+      label,
+      iconInitial,
+      `@${iconInitial}`,
+      `${iconInitial}${label}`,
+      `@${iconInitial}${label}`,
+    ]
+      .filter(Boolean)
+      .includes(text);
+  }
   const sendButton = {
-    disabled: false,
+    get disabled() {
+      return (
+        sendRequiresNonAppText && currentComposerContainsOnlySelectedApp()
+      );
+    },
     clicks: 0,
     getBoundingClientRect() {
       return { width: 1, height: 1 };
@@ -2401,7 +2434,11 @@ async function contentEditableInsertionCommitsProviderState() {
   assert.equal(sent, true);
   assert.equal(reconciled.sendButton.clicks, 1);
   assert.equal(reconciled.composer.textContent, APP_IDENTITY.appLabel + command);
-  assert.ok(reconciled.composer.inputEvents.length > 1);
+  assert.equal(
+    reconciled.composer.inputEvents.length,
+    command.split("\n").length * 2 - 1,
+    "native execCommand input events must not be duplicated",
+  );
   assert.ok(
     reconciled.composer.inputEvents.every(
       (event) => event.bubbles === true && event.composed === true,
@@ -2442,6 +2479,35 @@ async function contentEditableInsertionCommitsProviderState() {
   assert.equal(humanEditedSent, false);
   assert.equal(humanEdited.sendButton.clicks, 0);
   assert.ok(humanEdited.composer.textContent.endsWith(" human edit"));
+
+  const missingNativeInput = makeContentRuntime({
+    contentEditableComposer: true,
+    revertExecCommandWithoutInput: true,
+    execCommandEmitsInput: false,
+    inlineSelectedApp: true,
+    initialComposerText: APP_IDENTITY.appLabel,
+    mentionCandidates: false,
+    runtimeOwnedDraftSafety: { ok: true, safe: true },
+  });
+  const missingNativeInputSent = await missingNativeInput.api.sendAppCommand({
+    appIdentity: APP_IDENTITY,
+    command,
+    draftMarker: "wtgt_react_reconcile",
+  });
+  assert.equal(
+    missingNativeInputSent,
+    true,
+    "contenteditable insertion must synthesize input when execCommand mutates the DOM without emitting it",
+  );
+  assert.equal(missingNativeInput.sendButton.clicks, 1);
+  assert.equal(
+    missingNativeInput.composer.textContent,
+    APP_IDENTITY.appLabel + command,
+  );
+  assert.equal(
+    missingNativeInput.composer.inputEvents.length,
+    command.split("\n").length * 2 - 1,
+  );
 }
 
 async function providerShadowReconciliationCannotStrandCurrentWakeAcrossPolls() {
@@ -3927,8 +3993,38 @@ async function bootstrapComposerAndOwnershipRacesNeverSubmit() {
       "token-inline",
       APP_IDENTITY,
     );
-  assert.equal(inlineSelectionResult.ok, true);
+  assert.equal(
+    inlineSelectionResult.ok,
+    true,
+    JSON.stringify(inlineSelectionResult),
+  );
   assert.equal(inlineSelection.sendButton.clicks, 1);
+
+  const bootstrapBodyRequired = makeContentRuntime({
+    inlineSelectedApp: true,
+    mentionCandidates: false,
+    sendRequiresNonAppText: true,
+  });
+  const bootstrapBodyRequiredResult =
+    await bootstrapBodyRequired.api.bootstrapProvisionedWorker(
+      "token-bootstrap-body-required",
+      APP_IDENTITY,
+    );
+  assert.equal(
+    bootstrapBodyRequiredResult.ok,
+    true,
+    "bootstrap must append a fixed non-work body when the provider disables app-only sends",
+  );
+  assert.equal(bootstrapBodyRequired.sendButton.clicks, 1);
+  assert.equal(
+    bootstrapBodyRequiredResult.registrationDraft,
+    `@${APP_IDENTITY.appLabel}`,
+    "the durable registration capability must preserve the original app-only draft",
+  );
+  assert.match(
+    bootstrapBodyRequired.composer.value,
+    /registration handshake/i,
+  );
 
   const noOpMentionSelection = makeContentRuntime({
     mentionSelectionNoop: true,
@@ -4166,7 +4262,38 @@ async function bootstrapComposerAndOwnershipRacesNeverSubmit() {
       APP_IDENTITY,
     );
   assert.equal(claimedHiddenProviderControlsResult.ok, false);
+  assert.equal(
+    claimedHiddenProviderControlsResult.code,
+    "app_picker_unavailable",
+    "a claimed document must not use hidden provider controls",
+  );
+  assert.equal(claimedHiddenProviderControlsResult.retryable, false);
   assert.equal(claimedHiddenProviderControls.sendButton.clicks, 0);
+
+  const claimedInlineSelection = makeContentRuntime({
+    inlineSelectedApp: true,
+    mentionCandidates: false,
+    visibilityState: "visible",
+    documentHasFocus: true,
+  });
+  const claimedInlineSelectionResult =
+    await claimedInlineSelection.api.bootstrapProvisionedWorker(
+      "token-claimed-inline-selection",
+      APP_IDENTITY,
+    );
+  assert.equal(claimedInlineSelectionResult.ok, false);
+  assert.equal(
+    claimedInlineSelectionResult.code,
+    "provisioning_tab_claimed",
+    "a visible or focused provisioning document must report the exact closed failure boundary",
+  );
+  assert.equal(claimedInlineSelectionResult.retryable, false);
+  assert.equal(claimedInlineSelection.sendButton.clicks, 0);
+  assert.equal(
+    claimedInlineSelection.composer.value,
+    `@${APP_IDENTITY.appLabel}`,
+    "a rejected bootstrap must restore the exact app-only registration draft",
+  );
 
   const delayedMenu = makeContentRuntime({
     mentionCandidates: false,
@@ -4279,6 +4406,11 @@ async function bootstrapComposerAndOwnershipRacesNeverSubmit() {
   assert.equal(claimedResult.ok, false);
   assert.equal(claimedResult.code, "bootstrap_ownership_lost");
   assert.equal(claimed.sendButton.clicks, 0);
+  assert.equal(
+    claimed.composer.value,
+    `@${APP_IDENTITY.appLabel}`,
+    "ownership loss must remove only the runtime-owned handshake body",
+  );
 
   const replacedDuringOwnership = makeContentRuntime({
     mutateDuringOwnershipCheck({ replaceComposer, newComposer }) {
@@ -4291,8 +4423,13 @@ async function bootstrapComposerAndOwnershipRacesNeverSubmit() {
       APP_IDENTITY,
     );
   assert.equal(lateReplacementResult.ok, false);
-  assert.equal(lateReplacementResult.code, "bootstrap_ownership_lost");
+  assert.equal(lateReplacementResult.code, "composer_changed");
   assert.equal(replacedDuringOwnership.sendButton.clicks, 0);
+  assert.equal(
+    replacedDuringOwnership.currentComposer.value,
+    "human draft after background ownership check",
+    "a replacement composer owned by the user must never be cleared",
+  );
 
   const invalidated = makeContentRuntime({ runtimeSendThrows: true });
   const invalidatedResult = await invalidated.api.bootstrapProvisionedWorker(
@@ -4300,8 +4437,13 @@ async function bootstrapComposerAndOwnershipRacesNeverSubmit() {
     APP_IDENTITY,
   );
   assert.equal(invalidatedResult.ok, false);
-  assert.equal(invalidatedResult.code, "bootstrap_ownership_lost");
+  assert.equal(invalidatedResult.code, "bootstrap_ownership_unavailable");
   assert.equal(invalidated.sendButton.clicks, 0);
+  assert.equal(
+    invalidated.composer.value,
+    `@${APP_IDENTITY.appLabel}`,
+    "an unavailable background boundary must restore the app-only draft",
+  );
 }
 
 function makeProjectProvisioningContentRuntime({
