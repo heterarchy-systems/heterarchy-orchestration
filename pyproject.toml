@@ -1,0 +1,91 @@
+[project]
+name = "chattocodex"
+version = "0.1.0"
+description = "Local control plane for one Main Chat and N ChatGPT worker chats"
+readme = "README.md"
+requires-python = ">=3.14.4"
+dependencies = [
+    "pydantic",
+    "pydantic-settings",
+    "asyncer",
+    "mcp",
+    "starlette>=1.5.0",
+    "uvicorn[standard]>=0.52.1"
+]
+
+[project.scripts]
+chattocodex = "chattocodex.cli:main"
+chattocodex-mcp = "chattocodex.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["chattocodex*"]
+exclude = ["tests*"]
+namespaces = true
+
+[tool.setuptools.package-data]
+"chattocodex.control_panel" = ["static/*"]
+"chattocodex.wake" = ["chrome_extension/*"]
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "pyrefly",
+    "pytest>=9.0.3",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+src = [".", "tests"]
+extend-exclude = [
+    ".agents",
+    ".venv",
+    ".ruff_cache",
+    ".pytest_cache",
+    ".next",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "PIE", "PERF", "N", "RUF"]
+ignore = [
+    "E501",
+    "B008",
+    "SIM108",
+]
+exclude = [
+    "**/tests/**",
+]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pyrefly]
+python-version = "3.14.4"
+project-includes = ["."]
+project-excludes = [
+    "**/tests/**",
+    "**/__pycache__",
+    "**/.venv/**",
+    "**/venv/**",
+    "**/.mypy_cache/**",
+    "**/.ruff_cache/**",
+    "**/build/**",
+    "**/dist/**",
+    "**/.pytest_cache/**",
+    "**/.git/**",
+]
+search-path = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "--strict-markers"
+norecursedirs = [".venv", ".pytest_cache", ".ruff_cache", "node_modules"]

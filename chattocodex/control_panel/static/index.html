@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChatToCodex 설정</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div class="brand-mark" aria-hidden="true"><span></span></div>
+      <div>
+        <p class="eyebrow">MULTI-CHAT CONTROL PLANE</p>
+        <h1>ChatToCodex 설정</h1>
+        <p class="subtitle">작업 폴더와 원격 MCP 연결만 준비합니다. 실제 Worker 수와 역할은 Chat에서 결정합니다.</p>
+      </div>
+    </header>
+
+    <section class="status-strip" aria-label="현재 상태">
+      <div class="status-item"><span id="configured-dot" class="dot"></span><div><b>설정</b><small id="configured-label">확인 중</small></div></div>
+      <div class="status-item"><span id="mcp-dot" class="dot"></span><div><b>MCP</b><small id="mcp-label">중지</small></div></div>
+      <div class="status-item"><span id="tunnel-dot" class="dot"></span><div><b>Tunnel</b><small id="tunnel-label">중지</small></div></div>
+      <div class="status-item"><span id="oauth-dot" class="dot"></span><div><b>OAuth</b><small id="oauth-label">확인 중</small></div></div>
+    </section>
+
+    <section class="card">
+      <div class="section-heading">
+        <div><span class="step">1</span><h2>작업 폴더</h2></div>
+        <span id="project-count" class="pill">0 projects</span>
+      </div>
+      <p class="section-copy">여기에 등록된 프로젝트만 Main Chat에서 선택할 수 있습니다.</p>
+      <div class="field-row">
+        <input id="workspace-root" type="text" spellcheck="false" placeholder="/Users/me/Documents/projects">
+        <button id="browse-button" class="button secondary" type="button">찾아보기</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-heading"><div><span class="step">2</span><h2>원격 연결</h2></div></div>
+      <p class="section-copy">도메인이 없으면 무료 Quick Tunnel로 바로 시작할 수 있습니다.</p>
+      <div class="mode-grid">
+        <label class="mode-card selected" id="quick-card">
+          <input type="radio" name="remote-mode" value="quick_tunnel" checked>
+          <span class="mode-icon">⚡</span>
+          <span><b>Free Quick Tunnel</b><small>Cloudflare 계정·도메인 불필요</small></span>
+          <em>Dogfood 추천</em>
+        </label>
+        <label class="mode-card" id="custom-card">
+          <input type="radio" name="remote-mode" value="custom_domain">
+          <span class="mode-icon">◈</span>
+          <span><b>Custom Domain</b><small>기존 Cloudflare hostname 사용</small></span>
+        </label>
+      </div>
+      <div id="custom-domain-wrap" class="field-block hidden">
+        <label for="custom-origin">HTTPS 도메인</label>
+        <input id="custom-origin" type="text" spellcheck="false" placeholder="mcp.example.com">
+      </div>
+      <div class="field-block compact">
+        <label for="mcp-port">로컬 MCP 포트</label>
+        <input id="mcp-port" type="number" value="8765" min="1024" max="65535">
+      </div>
+      <div class="notice quick-notice" id="quick-notice">Quick Tunnel 주소는 재시작할 때 바뀔 수 있습니다. 첫 실제 N-Chat 검증에는 이 방식이 가장 단순합니다.</div>
+    </section>
+
+    <section class="card">
+      <div class="section-heading"><div><span class="step">3</span><h2>OAuth Owner Token</h2></div><span id="token-state" class="pill neutral">미설정</span></div>
+      <p class="section-copy">ChatGPT 연결 승인 화면에 붙여넣는 로컬 소유자 토큰입니다. 원문은 파일에 저장하지 않습니다.</p>
+      <div class="field-row token-row">
+        <input id="owner-token" type="password" readonly placeholder="Start 또는 토큰 생성 후 표시됩니다">
+        <button id="copy-token-button" class="button secondary" type="button" disabled>복사</button>
+        <button id="rotate-token-button" class="button ghost" type="button">생성 / 교체</button>
+      </div>
+      <p class="microcopy">앱을 다시 켠 뒤 원문이 필요하면 새 토큰을 생성할 수 있습니다. 기존 OAuth 세션의 access/refresh token과는 별도입니다.</p>
+    </section>
+
+    <section class="card action-card">
+      <div class="section-heading"><div><span class="step">4</span><h2>실행</h2></div></div>
+      <div class="actions">
+        <button id="save-button" class="button secondary" type="button">설정 저장</button>
+        <button id="start-button" class="button primary" type="button">MCP 시작</button>
+        <button id="stop-button" class="button danger" type="button" disabled>중지</button>
+      </div>
+      <div id="action-message" class="action-message" role="status"></div>
+    </section>
+
+    <section class="card connector-card">
+      <div class="section-heading"><div><span class="step">5</span><h2>ChatGPT 연결</h2></div><span class="pill neutral">수동 등록 1회</span></div>
+      <p class="section-copy">아래 URL을 ChatGPT Developer Mode의 Custom MCP App에 등록한 뒤 OAuth 승인 화면에서 Owner Token을 입력합니다.</p>
+      <div class="connector-box">
+        <code id="connector-url">MCP를 시작하면 Connector URL이 표시됩니다.</code>
+        <button id="copy-url-button" class="button secondary" type="button" disabled>URL 복사</button>
+      </div>
+      <ol class="steps-list">
+        <li>ChatGPT Settings → Apps / Developer Mode에서 새 MCP App 생성</li>
+        <li>Connector URL을 붙여넣고 OAuth 연결 시작</li>
+        <li>ChatToCodex 승인 화면에서 Owner Token 입력</li>
+        <li>연결 후 Main Chat과 별도 Worker Chats에서 같은 App 사용</li>
+      </ol>
+    </section>
+
+    <details class="card logs-card">
+      <summary>실행 로그 / 진단</summary>
+      <div class="log-columns">
+        <div><h3>MCP</h3><pre id="mcp-logs">로그 없음</pre></div>
+        <div><h3>Cloudflare</h3><pre id="tunnel-logs">로그 없음</pre></div>
+      </div>
+    </details>
+
+    <footer>ChatToCodex · N-Chat Orchestration R&amp;D</footer>
+  </main>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

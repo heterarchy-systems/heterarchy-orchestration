@@ -1,0 +1,97 @@
+{
+  "name": "chattocodex-rule-harness",
+  "version": "1.0.0",
+  "rules_root": "docs/rule",
+  "files": [
+    {
+      "path": "docs/rule/00-overview.md",
+      "sha256": "5f8a69acd1f59539d09dc02f4982ed5244deb1f37b1e4d0676e984eed8d95ff5",
+      "bytes": 685
+    },
+    {
+      "path": "docs/rule/01-architecture-boundary-rules.md",
+      "sha256": "61f5b49a8c1f7c2685dbbfecf880f22ae5f124fd117d8bd6f0b5cb33119b73af",
+      "bytes": 945
+    },
+    {
+      "path": "docs/rule/02-folder-module-rules.md",
+      "sha256": "4c0d23556b191bc3f7aa4563fe923a4b86bdac8ade1441dfd850943e1f818e24",
+      "bytes": 770
+    },
+    {
+      "path": "docs/rule/03-naming-rules.md",
+      "sha256": "2fe3483c7bd3ffa00b664b7bc48ae6ac384534480438ccf11e805c77b6c9e567",
+      "bytes": 789
+    },
+    {
+      "path": "docs/rule/04-pydantic-validation-rules.md",
+      "sha256": "e5a84c6009fa69183cb06af764ba15fa0c399470fb61469d106b736922aaa9b0",
+      "bytes": 779
+    },
+    {
+      "path": "docs/rule/05-dataclass-internal-dto-rules.md",
+      "sha256": "fd136fb6ef484af0a1fa4ea7c49ef53790a5df1e69d75e3f919c99a6e97179dd",
+      "bytes": 573
+    },
+    {
+      "path": "docs/rule/06-typeddict-dictionary-rules.md",
+      "sha256": "ab25cbf8a10f1043c5ab6b4772889a4b13c90a10f1fb05b18ffa81e42caa9458",
+      "bytes": 617
+    },
+    {
+      "path": "docs/rule/07-type-strictness-rules.md",
+      "sha256": "73c881dc3455b2fad1283c102692b340f5f64bfe7e1727db51c9163e950d743a",
+      "bytes": 657
+    },
+    {
+      "path": "docs/rule/08-class-function-cohesion-rules.md",
+      "sha256": "6d58aa3c8c703f16d6d2845b76e561e1557be7e20367e7c085bffa09642fa62a",
+      "bytes": 715
+    },
+    {
+      "path": "docs/rule/09-schema-normalization-rules.md",
+      "sha256": "ecbe1bc8658aefac3c67d5462627ea4430571b729fe0e3e21539afcd1ade6b00",
+      "bytes": 773
+    },
+    {
+      "path": "docs/rule/10-storage-index-rules.md",
+      "sha256": "fe23ffedc7f87e15af35d7b3ca77995bc2e6018eb782f486b18d6a05ae7320d6",
+      "bytes": 1248
+    },
+    {
+      "path": "docs/rule/11-async-io-rules.md",
+      "sha256": "f3e2692e5ae3bf924116cb0d3ede08abb0cb4c90c1ca06e4f2bcf35564824840",
+      "bytes": 926
+    },
+    {
+      "path": "docs/rule/12-error-exception-rules.md",
+      "sha256": "9d715d88d0065ce1ce94d80bec67242d40fc18dca2db6fe44907897368beb756",
+      "bytes": 743
+    },
+    {
+      "path": "docs/rule/13-lint-typecheck-test-rules.md",
+      "sha256": "79466868bd56b543efac0a1a763a8fd160029c100c454158d0012f1b1cd0892e",
+      "bytes": 562
+    },
+    {
+      "path": "docs/rule/14-refactoring-rules.md",
+      "sha256": "410357072e5a5bc5568fc090dea82815011e94406a2fcd7d7dfded50e590cca7",
+      "bytes": 762
+    },
+    {
+      "path": "docs/rule/15-agent-execution-rules.md",
+      "sha256": "8e1ba751c57ff6b5477a8e7a22d20bc871a4f9c98b324d403de6002558acd709",
+      "bytes": 1040
+    },
+    {
+      "path": "docs/rule/README.md",
+      "sha256": "809f9209d5a28073e8f43d3c5649c7f65319e7c71892fdd1a2b8516d51a221fa",
+      "bytes": 922
+    },
+    {
+      "path": "docs/rule/규칙.md",
+      "sha256": "6b227dfcd751801cd1dfb40275db372e5dead8a8d7e2ea8f503f8999f86923c4",
+      "bytes": 1637
+    }
+  ]
+}

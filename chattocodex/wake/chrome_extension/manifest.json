@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "ChatToCodex Runtime Wake",
+  "version": "0.1.27",
+  "description": "Wakes registered ChatGPT Worker or Main review chats when ChatToCodex runtime state is ready.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8790/*",
+    "https://chatgpt.com/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*"
+      ],
+      "js": [
+        "content.js",
+        "project_bound_provisioning_content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

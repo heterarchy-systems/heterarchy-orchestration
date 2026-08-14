@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ChatToCodex Runtime Wake</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Main Review Runtime</h1>
+      <p id="conversation" class="muted">현재 Chat 확인 중…</p>
+      <p id="status" role="status">Control Panel 확인 중…</p>
+      <label for="project">프로젝트</label>
+      <select id="project" disabled></select>
+      <button id="register" type="button" disabled>
+        이 Chat을 Main reviewer로 등록
+      </button>
+      <p id="hint" class="hint">
+        Worker Chat은 Main 요청에 따라 같은 GPT Project 안에서 자동 생성·등록됩니다. 이 popup은 Main reviewer 한 번 등록에만 사용합니다.
+      </p>
+    </main>
+    <script src="runtime_conversation_identity.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

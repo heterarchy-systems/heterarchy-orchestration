@@ -1,0 +1,17 @@
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ChatToCodex runtime state
+.chattocodex/
+.chattocodex-*/
+
+# Local ChatGPT-to-Codex execution/checkpoint artifacts
+.chatgpt2codex/
+.codex/
+ChatToCodex_Codex_Implementation_Prompt.md
