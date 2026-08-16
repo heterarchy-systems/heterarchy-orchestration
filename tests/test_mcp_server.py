@@ -36,6 +36,7 @@ _EXPECTED_TOOLS = {
     "integration_preview",
     "integration_apply",
     "delegate_work",
+    "prepare_scheduled_work",
     "delegation_status",
     "orchestrate_work",
     "workflow_status",

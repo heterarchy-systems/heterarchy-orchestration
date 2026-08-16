@@ -239,11 +239,29 @@ class BrokerService:
                 slot_handle=slot_handle,
             )
 
+    def claim_task_for_run(
+        self,
+        *,
+        slot_id: str,
+        slot_handle: str,
+        run_id: str,
+    ) -> BrokerAssignment | None:
+        with (
+            self._lock_registry.hold(entity_key="broker:claim-task"),
+            self._lock_registry.hold(entity_key=f"broker:slot:{slot_id}"),
+        ):
+            return self._claim_task_locked(
+                slot_id=slot_id,
+                slot_handle=slot_handle,
+                run_id=run_id,
+            )
+
     def _claim_task_locked(
         self,
         *,
         slot_id: str,
         slot_handle: str,
+        run_id: str | None = None,
     ) -> BrokerAssignment | None:
         slot = self._require_slot_capability(
             slot_id=slot_id,
@@ -255,7 +273,11 @@ class BrokerService:
                 resource_id=slot.slot_id,
                 message="Worker Slot is already busy with an assignment.",
             )
-        broker_task = self._next_ready_task(project_id=slot.project_id)
+        broker_task = (
+            self._next_ready_task(project_id=slot.project_id)
+            if run_id is None
+            else self._next_ready_task(project_id=slot.project_id, run_id=run_id)
+        )
         if broker_task is None:
             return None
 
@@ -559,7 +581,12 @@ class BrokerService:
             is_complete=bool(broker_tasks) and completed_count == len(broker_tasks),
         )
 
-    def _next_ready_task(self, *, project_id: str) -> BrokerTaskState | None:
+    def _next_ready_task(
+        self,
+        *,
+        project_id: str,
+        run_id: str | None = None,
+    ) -> BrokerTaskState | None:
         queued = sorted(
             (
                 task
@@ -569,6 +596,8 @@ class BrokerService:
             key=lambda task: (task.created_at, task.broker_task_id),
         )
         for broker_task in queued:
+            if run_id is not None and broker_task.run_id != run_id:
+                continue
             run = self._run_repository.read(run_id=broker_task.run_id)
             if run.status is not RunStatus.ACTIVE or run.project_id != project_id:
                 continue

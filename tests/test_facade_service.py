@@ -12,7 +12,10 @@ from chattocodex.facade.facade_service import ChatFacadeService
 from chattocodex.git.git_command_runner import GitCommandRunner
 from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
 from chattocodex.orchestration.orchestration_dto import TaskStatus
-from chattocodex.orchestration.orchestration_exceptions import InvalidTransitionError
+from chattocodex.orchestration.orchestration_exceptions import (
+    CapabilityDeniedError,
+    InvalidTransitionError,
+)
 from chattocodex.orchestration.run_orchestration_service import RunOrchestrationService
 from chattocodex.orchestration.worker_execution_service import WorkerExecutionService
 from chattocodex.persistence.broker_repository import (
@@ -26,10 +29,17 @@ from chattocodex.persistence.orchestration_state_repository import (
 )
 from chattocodex.persistence.wake_presence_repository import WakePresenceRepository
 from chattocodex.persistence.wake_target_repository import WakeTargetRepository
+from chattocodex.persistence.worker_wake_capability_repository import (
+    WorkerWakeCapabilityRepository,
+)
 from chattocodex.wake.wake_dto import WakeTargetStatus
 from chattocodex.wake.wake_exceptions import WakeTargetConflictError
 from chattocodex.wake.wake_presence_service import WakePresenceService
 from chattocodex.wake.wake_target_service import WakeTargetService
+from chattocodex.wake.worker_wake_capability_dto import WorkerWakeCapabilityStatus
+from chattocodex.wake.worker_wake_capability_service import (
+    WorkerWakeCapabilityService,
+)
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
 
 
@@ -88,16 +98,25 @@ class _Runtime:
         self.wake_presence_service = WakePresenceService(
             repository=WakePresenceRepository(state_root=self.state_root)
         )
+        self.wake_target_repository = WakeTargetRepository(state_root=self.state_root)
         self.wake_target_service = WakeTargetService(
-            repository=WakeTargetRepository(state_root=self.state_root),
+            repository=self.wake_target_repository,
             presence_service=self.wake_presence_service,
             lock_registry=locks,
+        )
+        self.worker_wake_capability_service = WorkerWakeCapabilityService(
+            repository=WorkerWakeCapabilityRepository(state_root=self.state_root),
+            lock_registry=locks,
+            physical_target_exists=lambda wake_target_id: (
+                self.wake_target_repository.exists(wake_target_id=wake_target_id)
+            ),
         )
         self.facade = ChatFacadeService(
             run_service=run_service,
             broker_service=self.broker_service,
             wake_target_service=self.wake_target_service,
             workspace_project_service=workspace_service,
+            worker_wake_capability_service=self.worker_wake_capability_service,
         )
 
 
@@ -295,13 +314,82 @@ def test_fresh_work_requires_registered_wake_target(tmp_path: Path) -> None:
         ),
     )
 
-    with pytest.raises(InvalidTransitionError, match="current Chrome Wake delivery"):
+    with pytest.raises(
+        InvalidTransitionError, match="server-issued Worker Wake delivery"
+    ):
         runtime.facade.work(
             project_id=None,
             slot_id=None,
             slot_handle=None,
             label="main-chat-must-not-self-claim",
         )
+
+
+def test_prepare_scheduled_work_claims_without_physical_wake_and_rejects_replay(
+    tmp_path: Path,
+) -> None:
+    runtime = _Runtime(tmp_path=tmp_path)
+    started = runtime.facade.prepare_scheduled_work(
+        goal="Scheduled one-worker probe",
+        project_id=runtime.project_id,
+        requested_parallelism=1,
+        tasks=(
+            DelegationTaskSpec(
+                key="probe",
+                role="scheduler-worker",
+                objective="Return a deterministic probe result.",
+                depends_on=(),
+            ),
+        ),
+    )
+    assert runtime.wake_target_repository.list_all() == ()
+    assert len(started.wake_capabilities) == 1
+    capability = started.wake_capabilities[0]
+    assert capability.status is WorkerWakeCapabilityStatus.ISSUED
+
+    work = runtime.facade.work(
+        project_id=runtime.project_id,
+        slot_id=None,
+        slot_handle=None,
+        label="scheduled-worker-1",
+        wake_target_id=capability.wake_target_id,
+        wake_revision=capability.wake_revision,
+    )
+    assert work.registered is True
+    assert work.assignment is not None
+    assert work.assignment.run.run_id == started.run.state.run_id
+    assert runtime.wake_target_repository.list_all() == ()
+    assert runtime.worker_wake_capability_service.owns_slot(slot_id=work.slot.slot_id)
+
+    with pytest.raises(CapabilityDeniedError):
+        runtime.facade.work(
+            project_id=runtime.project_id,
+            slot_id=None,
+            slot_handle=None,
+            label="scheduled-worker-replay",
+            wake_target_id=capability.wake_target_id,
+            wake_revision=capability.wake_revision,
+        )
+
+    runtime.worker_service.update_task(
+        run_id=work.assignment.run.run_id,
+        worker_id=work.assignment.worker.worker_id,
+        worker_handle=work.assignment.worker_handle,
+        task_id=work.assignment.task.task_id,
+        expected_revision=work.assignment.task.revision,
+        status=TaskStatus.COMPLETED,
+        progress_summary="scheduler probe complete",
+        result="SCHEDULED_WORKER_E2E_PASS",
+    )
+    done = runtime.facade.work_done(
+        slot_id=work.slot.slot_id,
+        slot_handle=work.slot_handle,
+    )
+    assert done.slot.status is WorkerSlotStatus.IDLE
+    assert runtime.wake_target_repository.list_all() == ()
+    status = runtime.facade.delegation_status(run_id=started.run.state.run_id).snapshot
+    assert status.completed_count == 1
+    assert status.is_complete is True
 
 
 def test_work_auto_registers_resumes_and_reuses_same_slot_for_new_role(

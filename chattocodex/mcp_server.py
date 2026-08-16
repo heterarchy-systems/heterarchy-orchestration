@@ -86,6 +86,9 @@ from chattocodex.persistence.worker_result_repository import WorkerResultReposit
 from chattocodex.persistence.worker_runtime_presence_store import (
     WorkerRuntimePresenceStore,
 )
+from chattocodex.persistence.worker_wake_capability_repository import (
+    WorkerWakeCapabilityRepository,
+)
 from chattocodex.project_runtime.project_binding_service import ProjectBindingService
 from chattocodex.project_runtime.workspace_execution_layout import (
     WorkspaceExecutionLayout,
@@ -113,6 +116,9 @@ from chattocodex.run_control.run_control_mcp_boundary import register_workflow_t
 from chattocodex.runtime_settings import RuntimeSettings
 from chattocodex.wake.wake_presence_service import WakePresenceService
 from chattocodex.wake.wake_target_service import WakeTargetService
+from chattocodex.wake.worker_wake_capability_service import (
+    WorkerWakeCapabilityService,
+)
 from chattocodex.worker_runtime.broker_ready_capacity_projection import (
     BrokerReadyCapacityProjection,
 )
@@ -199,6 +205,18 @@ def create_mcp_server(
             project_id=project_id
         )
     )
+    worker_wake_capability_service = WorkerWakeCapabilityService(
+        repository=WorkerWakeCapabilityRepository(state_root=execution_root),
+        lock_registry=lock_registry,
+        physical_target_exists=lambda wake_target_id: wake_target_repository.exists(
+            wake_target_id=wake_target_id
+        ),
+    )
+    worker_wake_capability_service.attach_connector_epoch_resolver(
+        lambda project_id: project_binding_service.resolve_connector_epoch(
+            project_id=project_id
+        )
+    )
     worker_provisioning_service = WorkerProvisioningService(
         repository=WorkerProvisioningRepository(state_root=execution_root),
         project_binding_service=project_binding_service,
@@ -267,6 +285,7 @@ def create_mcp_server(
         workspace_project_service=workspace_project_service,
         run_control_coordinator=run_control_coordinator,
         consumer_group_coordinator=consumer_group_coordinator,
+        worker_wake_capability_service=worker_wake_capability_service,
     )
     project_read_service = ProjectReadService(
         run_repository=run_repository,

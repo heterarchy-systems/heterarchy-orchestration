@@ -15,7 +15,6 @@ from chattocodex.schemas.orchestration_schemas import (
     ObjectiveText,
     Revision,
     RoleText,
-    RunHandle,
     RunId,
     RunView,
     TaskView,
@@ -117,34 +116,6 @@ class WorkerSlotRecord(BrokerTimestampedRecord):
         return self
 
 
-class BrokerTaskCreateRequest(BrokerBoundaryModel):
-    run_id: RunId
-    run_handle: RunHandle
-    objective: ObjectiveText
-    role: RoleText | None = None
-    depends_on: tuple[BrokerTaskId, ...] = ()
-
-
-class WorkerSlotRegisterRequest(BrokerBoundaryModel):
-    project_id: ProjectId
-    label: SlotLabel | None = None
-
-
-class WorkerClaimTaskRequest(BrokerBoundaryModel):
-    slot_id: WorkerSlotId
-    slot_handle: WorkerSlotHandle
-    wait_seconds: WaitSeconds = 0
-
-
-class WorkerAssignmentFinishRequest(BrokerBoundaryModel):
-    slot_id: WorkerSlotId
-    slot_handle: WorkerSlotHandle
-
-
-class BrokerRunStatusRequest(BrokerBoundaryModel):
-    run_id: RunId
-
-
 class BrokerTaskView(BrokerBoundaryModel):
     broker_task_id: BrokerTaskId
     run_id: RunId
@@ -174,17 +145,6 @@ class WorkerSlotView(BrokerBoundaryModel):
     updated_at: datetime
 
 
-class BrokerTaskCreateSuccess(BrokerBoundaryModel):
-    ok: Literal[True] = True
-    broker_task: BrokerTaskView
-
-
-class WorkerSlotRegisterSuccess(BrokerBoundaryModel):
-    ok: Literal[True] = True
-    slot: WorkerSlotView
-    slot_handle: WorkerSlotHandle
-
-
 class WorkerAssignmentView(BrokerBoundaryModel):
     broker_task: BrokerTaskView
     slot: WorkerSlotView
@@ -192,12 +152,6 @@ class WorkerAssignmentView(BrokerBoundaryModel):
     worker: WorkerView
     task: TaskView
     worker_handle: WorkerHandle
-
-
-class WorkerClaimTaskSuccess(BrokerBoundaryModel):
-    ok: Literal[True] = True
-    assignment: WorkerAssignmentView | None
-    timed_out: bool = False
 
 
 class WorkerAssignmentFinishSuccess(BrokerBoundaryModel):

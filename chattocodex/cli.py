@@ -13,6 +13,8 @@ from chattocodex.remote.cloudflare_tunnel import (
 from chattocodex.runtime_settings import RuntimeSettings
 from chattocodex.schemas.setup_schemas import SetupRequest
 from chattocodex.setup.runtime_setup_service import RuntimeSetupService
+from chattocodex.wake.worker_browser_runtime_dto import WorkerBrowserRuntimeMode
+from chattocodex.wake.worker_browser_runtime_service import WorkerBrowserRuntimeService
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -54,6 +56,21 @@ def _build_parser() -> argparse.ArgumentParser:
     app_parser.add_argument("--host", default="127.0.0.1")
     app_parser.add_argument("--port", type=int, default=8790)
     app_parser.add_argument("--no-open", action="store_true")
+
+    worker_browser_parser = subcommands.add_parser(
+        "worker-browser",
+        help="Run the persistent Project Worker Chat browser transport.",
+    )
+    worker_browser_parser.add_argument("--chrome-binary", type=Path, default=None)
+    worker_browser_parser.add_argument("--profile-root", type=Path, default=None)
+    worker_browser_parser.add_argument(
+        "--visible-bootstrap",
+        action="store_true",
+        help=(
+            "Open the persistent Worker profile visibly for one-time ChatGPT login "
+            "or provider setup. Normal Worker dispatch should run headless."
+        ),
+    )
 
     tunnel_parser = subcommands.add_parser(
         "tunnel",
@@ -128,6 +145,18 @@ def main() -> None:
             open_browser=not args.no_open,
         )
         return
+    if args.command == "worker-browser":
+        mode = (
+            WorkerBrowserRuntimeMode.VISIBLE_BOOTSTRAP
+            if args.visible_bootstrap
+            else WorkerBrowserRuntimeMode.HEADLESS
+        )
+        exit_code = WorkerBrowserRuntimeService(state_root=state_root).run_foreground(
+            chrome_binary=args.chrome_binary,
+            profile_root=args.profile_root,
+            mode=mode,
+        )
+        raise SystemExit(exit_code)
 
     host = getattr(args, "host", None) or base_settings.host
     port = getattr(args, "port", None) or base_settings.port

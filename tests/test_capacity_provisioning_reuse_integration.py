@@ -431,6 +431,9 @@ def test_n2_provisioning_then_second_run_reuses_the_same_consumers(
         request.request_id for request in runtime.provisioning.list_status()[1]
     } == first_request_ids
     assert runtime.provisioning.pending_provisioning_count(runtime.project_id) == 0
+    assert {
+        target.wake_target_id for target in runtime.wake_target_repository.list_all()
+    } == {target_a, target_b}
 
 
 def test_retiring_unbound_unclaimed_workers_reserves_exact_replacements(

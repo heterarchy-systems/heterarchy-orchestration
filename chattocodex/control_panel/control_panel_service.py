@@ -8,6 +8,9 @@ from chattocodex.auth.owner_token_service import (
 from chattocodex.control_panel.cloudflare_process_supervisor import (
     CloudflareProcessSupervisor,
 )
+from chattocodex.control_panel.control_panel_database_bridge import (
+    ControlPanelDatabaseBridge,
+)
 from chattocodex.control_panel.control_panel_dto import (
     ControlPanelPreferences,
     ControlPanelSnapshot,
@@ -22,9 +25,16 @@ from chattocodex.control_panel.control_panel_preferences_repository import (
     ControlPanelPreferencesRepository,
 )
 from chattocodex.control_panel.mcp_process_supervisor import McpProcessSupervisor
+from chattocodex.control_panel.worker_browser_process_supervisor import (
+    WorkerBrowserProcessSupervisor,
+)
+from chattocodex.database.database_config import DatabaseConfig
 from chattocodex.orchestration.orchestration_exceptions import ResourceNotFoundError
 from chattocodex.persistence.atomic_json_file import AtomicJsonFileError
 from chattocodex.persistence.runtime_config_repository import RuntimeConfigRepository
+from chattocodex.schemas.control_panel_operations_schemas import (
+    ControlPanelOperationsResponse,
+)
 from chattocodex.schemas.control_panel_schemas import (
     ControlPanelPreferencesRequest,
     normalize_custom_origin,
@@ -32,6 +42,7 @@ from chattocodex.schemas.control_panel_schemas import (
 )
 from chattocodex.schemas.setup_schemas import SetupRequest
 from chattocodex.setup.runtime_setup_service import RuntimeSetupService
+from chattocodex.wake.worker_browser_runtime_dto import WorkerBrowserRuntimeMode
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
 
 
@@ -56,8 +67,24 @@ class ControlPanelService:
             host=mcp_host,
         )
         self._tunnel_process = CloudflareProcessSupervisor(local_host=mcp_host)
+        self._worker_browser = WorkerBrowserProcessSupervisor(
+            state_root=self._state_root
+        )
+        self._database_bridge = ControlPanelDatabaseBridge(
+            config=DatabaseConfig.from_environment()
+        )
         self._lifecycle_lock = asyncio.Lock()
         self._visible_owner_token: str | None = None
+
+    async def project_operations_read_model(
+        self,
+        *,
+        snapshot: ControlPanelOperationsResponse,
+    ) -> ControlPanelOperationsResponse:
+        return await asyncio.to_thread(
+            self._database_bridge.project_or_fallback,
+            snapshot=snapshot,
+        )
 
     async def save_preferences(
         self,
@@ -172,6 +199,32 @@ class ControlPanelService:
         self._visible_owner_token = token
         return token
 
+    async def start_worker_browser_setup(self) -> None:
+        """Open the dedicated Worker browser profile for interactive ChatGPT setup."""
+        async with self._lifecycle_lock:
+            await self._worker_browser.start(
+                mode=WorkerBrowserRuntimeMode.VISIBLE_BOOTSTRAP
+            )
+
+    async def start_worker_browser_headless(self) -> None:
+        """Start the reusable Worker browser with its persistent profile."""
+        async with self._lifecycle_lock:
+            await self._worker_browser.start(mode=WorkerBrowserRuntimeMode.HEADLESS)
+
+    async def stop_worker_browser(self) -> None:
+        """Stop the Control Panel-managed Worker browser process."""
+        async with self._lifecycle_lock:
+            await self._worker_browser.stop()
+
+    def worker_browser_running(self) -> bool:
+        return self._worker_browser.is_running()
+
+    def worker_browser_mode(self) -> WorkerBrowserRuntimeMode | None:
+        return self._worker_browser.mode()
+
+    def worker_browser_profile_initialized(self) -> bool:
+        return self._worker_browser.profile_initialized()
+
     async def snapshot(self) -> ControlPanelSnapshot:
         preferences = await asyncio.to_thread(self._load_preferences)
         project_count = 0
@@ -209,6 +262,7 @@ class ControlPanelService:
 
     async def shutdown(self) -> None:
         async with self._lifecycle_lock:
+            await self._worker_browser.stop()
             await self._stop_processes()
 
     async def _configure_runtime(

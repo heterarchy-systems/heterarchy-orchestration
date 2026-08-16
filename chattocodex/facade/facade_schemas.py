@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
@@ -16,6 +17,7 @@ from chattocodex.schemas.broker_schemas import (
 from chattocodex.schemas.orchestration_schemas import GoalText, RunHandle, RunView
 from chattocodex.schemas.project_schemas import ProjectId
 from chattocodex.schemas.wake_schemas import WakeTargetId
+from chattocodex.wake.worker_wake_capability_dto import WorkerWakeTransport
 
 TaskKey = Annotated[
     str,
@@ -64,6 +66,26 @@ class DelegateWorkSuccess(FacadeBoundaryModel):
     run: RunView
     run_handle: RunHandle
     tasks: tuple[DelegatedTaskView, ...]
+
+
+class ScheduledWakeCapabilityView(FacadeBoundaryModel):
+    wake_target_id: WakeTargetId
+    wake_revision: int = Field(ge=1)
+    transport: WorkerWakeTransport
+    expires_at: datetime
+    scheduled_task_prompt: str
+
+
+class PrepareScheduledWorkRequest(DelegateWorkRequest):
+    pass
+
+
+class PrepareScheduledWorkSuccess(FacadeBoundaryModel):
+    ok: Literal[True] = True
+    run: RunView
+    run_handle: RunHandle
+    tasks: tuple[DelegatedTaskView, ...]
+    wake_capabilities: tuple[ScheduledWakeCapabilityView, ...]
 
 
 class DelegationStatusRequest(FacadeBoundaryModel):

@@ -10,8 +10,14 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
-from chattocodex.control_panel.control_panel_exceptions import ControlPanelError
+from chattocodex.control_panel.control_panel_exceptions import (
+    ControlPanelError,
+    RuntimeLifecycleError,
+)
 from chattocodex.control_panel.control_panel_mapper import build_control_panel_status
+from chattocodex.control_panel.control_panel_operations_service import (
+    ControlPanelOperationsService,
+)
 from chattocodex.control_panel.control_panel_service import ControlPanelService
 from chattocodex.control_panel.loopback_request_guard import LoopbackRequestGuard
 from chattocodex.control_panel.macos_folder_picker import choose_workspace_folder
@@ -165,6 +171,62 @@ def create_control_panel_app(
             )
         except ControlPanelError as error:
             return _control_panel_error_response(error=error)
+
+    async def operations(_request: Request) -> Response:
+        try:
+            return _json_response(model=await _operations_snapshot())
+        except OrchestrationError as error:
+            return _orchestration_error_response(error=error)
+
+    async def worker_browser_setup(_request: Request) -> Response:
+        try:
+            await service.start_worker_browser_setup()
+            return _json_response(model=await _operations_snapshot())
+        except ControlPanelError as error:
+            return _control_panel_error_response(error=error)
+        except OrchestrationError as error:
+            return _orchestration_error_response(error=error)
+
+    async def worker_browser_start(_request: Request) -> Response:
+        try:
+            await service.start_worker_browser_headless()
+            return _json_response(model=await _operations_snapshot())
+        except ControlPanelError as error:
+            return _control_panel_error_response(error=error)
+        except OrchestrationError as error:
+            return _orchestration_error_response(error=error)
+
+    async def worker_browser_stop(_request: Request) -> Response:
+        try:
+            await service.stop_worker_browser()
+            return _json_response(model=await _operations_snapshot())
+        except ControlPanelError as error:
+            return _control_panel_error_response(error=error)
+        except OrchestrationError as error:
+            return _orchestration_error_response(error=error)
+
+    async def _operations_snapshot():
+        if runtime_boundary_provider is None:
+            raise RuntimeLifecycleError(
+                message="Operations routes require the workspace runtime boundary provider."
+            )
+        boundaries = runtime_boundary_provider.current()
+        projects = await asyncio.to_thread(_current_wake_service().list_projects)
+        bindings = await asyncio.to_thread(
+            _current_project_binding_service().list_bindings
+        )
+        operations_service = ControlPanelOperationsService(
+            execution_root=boundaries.execution_root
+        )
+        source_snapshot = await asyncio.to_thread(
+            operations_service.snapshot,
+            projects=projects,
+            bindings=bindings,
+            browser_running=service.worker_browser_running(),
+            browser_mode=service.worker_browser_mode(),
+            browser_profile_initialized=service.worker_browser_profile_initialized(),
+        )
+        return await service.project_operations_read_model(snapshot=source_snapshot)
 
     async def wake_projects(_request: Request) -> Response:
         try:
@@ -605,6 +667,22 @@ def create_control_panel_app(
             Route("/api/stop", stop_runtime, methods=["POST"]),
             Route("/api/owner-token/rotate", rotate_owner_token, methods=["POST"]),
             Route("/api/folder-picker", folder_picker, methods=["POST"]),
+            Route("/api/operations", operations, methods=["GET"]),
+            Route(
+                "/api/worker-browser/setup",
+                worker_browser_setup,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/worker-browser/start",
+                worker_browser_start,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/worker-browser/stop",
+                worker_browser_stop,
+                methods=["POST"],
+            ),
             Route("/api/wake/projects", wake_projects, methods=["GET"]),
             Route("/api/wake/targets/register", wake_register, methods=["POST"]),
             Route(

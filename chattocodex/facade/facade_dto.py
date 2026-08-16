@@ -8,6 +8,7 @@ from chattocodex.broker.broker_dto import (
     WorkerSlotState,
 )
 from chattocodex.orchestration.orchestration_dto import CreatedRun
+from chattocodex.wake.worker_wake_capability_dto import WorkerWakeCapabilityState
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -28,6 +29,13 @@ class DelegatedTask:
 class DelegationStarted:
     run: CreatedRun
     tasks: tuple[DelegatedTask, ...]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ScheduledDelegationStarted:
+    run: CreatedRun
+    tasks: tuple[DelegatedTask, ...]
+    wake_capabilities: tuple[WorkerWakeCapabilityState, ...]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

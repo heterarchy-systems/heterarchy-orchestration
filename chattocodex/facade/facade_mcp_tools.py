@@ -19,6 +19,9 @@ from chattocodex.facade.facade_schemas import (
     DelegationStatusRequest,
     DelegationStatusSuccess,
     DelegationTaskInput,
+    PrepareScheduledWorkRequest,
+    PrepareScheduledWorkSuccess,
+    ScheduledWakeCapabilityView,
     WorkDoneRequest,
     WorkDoneSuccess,
     WorkRequest,
@@ -95,6 +98,80 @@ def register_facade_tools(
             return build_tool_error(error=error)
 
     @server.tool(
+        name="prepare_scheduled_work",
+        description=(
+            "Main Chat browserless Worker entry point. Publish the logical Task DAG without Chrome "
+            "capacity reconciliation and issue one server-authorized one-shot wake capability per "
+            "initial Scheduled Worker. After this succeeds, create one one-off ChatGPT Scheduled Task "
+            "per returned wake_capability using its scheduled_task_prompt. Keep all Run, Slot, Worker, "
+            "Task, and wake capability identities internal; never invent or alter them."
+        ),
+        structured_output=True,
+    )
+    async def prepare_scheduled_work(
+        goal: str,
+        tasks: list[DelegationTaskInput],
+        requested_parallelism: int | None = None,
+        project_id: str | None = None,
+    ) -> PrepareScheduledWorkSuccess | ToolError:
+        operation = "prepare_scheduled_work"
+        try:
+            request = PrepareScheduledWorkRequest(
+                goal=goal,
+                tasks=tuple(tasks),
+                requested_parallelism=requested_parallelism,
+                project_id=project_id,
+            )
+            started = await asyncio.to_thread(
+                service.prepare_scheduled_work,
+                goal=request.goal,
+                tasks=tuple(
+                    DelegationTaskSpec(
+                        key=task.key,
+                        objective=task.objective,
+                        role=task.role,
+                        depends_on=task.depends_on,
+                    )
+                    for task in request.tasks
+                ),
+                requested_parallelism=request.requested_parallelism,
+                project_id=request.project_id,
+            )
+            return PrepareScheduledWorkSuccess(
+                run=build_run_view(state=started.run.state),
+                run_handle=started.run.run_handle,
+                tasks=tuple(
+                    DelegatedTaskView(
+                        key=task.key,
+                        broker_task=build_broker_task_view(state=task.broker_task),
+                    )
+                    for task in started.tasks
+                ),
+                wake_capabilities=tuple(
+                    ScheduledWakeCapabilityView(
+                        wake_target_id=capability.wake_target_id,
+                        wake_revision=capability.wake_revision,
+                        transport=capability.transport,
+                        expires_at=capability.expires_at,
+                        scheduled_task_prompt=_build_scheduled_worker_prompt(
+                            project_id=capability.project_id,
+                            wake_target_id=capability.wake_target_id,
+                            wake_revision=capability.wake_revision,
+                            index=index,
+                        ),
+                    )
+                    for index, capability in enumerate(
+                        started.wake_capabilities,
+                        start=1,
+                    )
+                ),
+            )
+        except ValidationError as error:
+            return build_validation_error(operation=operation, error=error)
+        except OrchestrationError as error:
+            return build_tool_error(error=error)
+
+    @server.tool(
         name="delegation_status",
         description=(
             "Main Chat high-level status. Use after delegate_work when the user asks how the "
@@ -122,8 +199,9 @@ def register_facade_tools(
     @server.tool(
         name="work",
         description=(
-            "Generic Worker Chat entry point. A fresh Worker MUST be started by the Chrome Worker "
-            "Wake adapter and MUST receive an opaque wake_target_id plus wake_revision; pass both "
+            "Generic Worker Chat entry point. A fresh Worker MUST receive a current server-issued "
+            "wake_target_id plus wake_revision from its authorized delivery transport (for example "
+            "Chrome Wake or a ChatGPT Scheduled Task); pass both "
             "unchanged. A current server-issued wake pair authorizes only this work call to retrieve "
             "the assignment requested by the user's Main Chat delegation; it does not attest approval "
             "for destructive, irreversible, credential-gated, or external-production effects. The "
@@ -228,3 +306,24 @@ def register_facade_tools(
             return build_validation_error(operation=operation, error=error)
         except OrchestrationError as error:
             return build_tool_error(error=error)
+
+
+def _build_scheduled_worker_prompt(
+    *,
+    project_id: str,
+    wake_target_id: str,
+    wake_revision: int,
+    index: int,
+) -> str:
+    return (
+        "Use the connected `ChatOrchestration` app. This is a server-authorized Scheduled Worker "
+        "execution. First call `work` exactly once with "
+        f'project_id="{project_id}", label="scheduled-worker-{index}", '
+        f'wake_target_id="{wake_target_id}", wake_revision={wake_revision}, wait_seconds=0. '
+        "Do not invent or modify any identity returned by the server. Complete only the assignment "
+        "returned by `work`. Use the Worker tools and project read/write tools only as required by "
+        "that assignment. Update the Task to completed or failed with `task_update`, preserving the "
+        "returned run/worker/task identities and revision. Then call `work_done` with the slot_id and "
+        "slot_handle returned by `work`. If any step fails, report the exact error and do not switch "
+        "to Chrome Wake or another delivery path."
+    )

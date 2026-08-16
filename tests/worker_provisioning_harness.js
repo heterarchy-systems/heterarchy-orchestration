@@ -365,6 +365,10 @@ function makeProvisioningRuntime({
     path.join(extensionRoot, "runtime_tab_reopen_policy.js"),
     "utf8",
   );
+  const persistentWorkerSource = fs.readFileSync(
+    path.join(extensionRoot, "persistent_worker_runtime_policy.js"),
+    "utf8",
+  );
   const provisioningSource = fs.readFileSync(
     path.join(extensionRoot, "worker_provisioning_adapter.js"),
     "utf8",
@@ -377,6 +381,8 @@ function makeProvisioningRuntime({
     identitySource +
     "\n" +
     policySource +
+    "\n" +
+    persistentWorkerSource +
     "\n" +
     provisioningSource +
     "\n" +

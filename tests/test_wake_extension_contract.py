@@ -7,6 +7,9 @@ from pathlib import Path
 _EXTENSION_ROOT = (
     Path(__file__).resolve().parents[1] / "chattocodex" / "wake" / "chrome_extension"
 )
+_TYPESCRIPT_ROOT = (
+    Path(__file__).resolve().parents[1] / "chattocodex" / "wake" / "chrome_extension_ts"
+)
 
 
 def test_wake_extension_has_minimal_permissions_and_loopback_control_boundary() -> None:
@@ -40,6 +43,7 @@ def test_service_worker_imported_scripts_are_packaged_and_parseable() -> None:
     assert imported_names == (
         "runtime_conversation_identity.js",
         "runtime_tab_reopen_policy.js",
+        "persistent_worker_runtime_policy.js",
         "worker_provisioning_adapter.js",
     )
     node = shutil.which("node")
@@ -55,6 +59,35 @@ def test_service_worker_imported_scripts_are_packaged_and_parseable() -> None:
                 timeout=5,
             )
             assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_persistent_worker_typescript_source_matches_packaged_javascript(
+    tmp_path: Path,
+) -> None:
+    tsc = shutil.which("tsc")
+    if tsc is None:
+        return
+    completed = subprocess.run(
+        (
+            tsc,
+            "-p",
+            str(_TYPESCRIPT_ROOT / "tsconfig.json"),
+            "--outDir",
+            str(tmp_path),
+        ),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    generated = (tmp_path / "persistent_worker_runtime_policy.js").read_text(
+        encoding="utf-8"
+    )
+    packaged = (_EXTENSION_ROOT / "persistent_worker_runtime_policy.js").read_text(
+        encoding="utf-8"
+    )
+    assert generated == packaged
 
 
 def test_browser_wake_payload_contains_only_opaque_routing_identity() -> None:

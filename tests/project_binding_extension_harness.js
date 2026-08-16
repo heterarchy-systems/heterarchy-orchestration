@@ -68,6 +68,7 @@ function makeRuntime() {
   const source = [
     "runtime_conversation_identity.js",
     "runtime_tab_reopen_policy.js",
+    "persistent_worker_runtime_policy.js",
     "worker_provisioning_adapter.js",
     "service_worker.js",
   ]

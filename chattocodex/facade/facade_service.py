@@ -10,6 +10,7 @@ from chattocodex.facade.facade_dto import (
     DelegationStarted,
     DelegationStatus,
     DelegationTaskSpec,
+    ScheduledDelegationStarted,
     WorkerWork,
     WorkerWorkDone,
 )
@@ -20,6 +21,7 @@ from chattocodex.orchestration.orchestration_exceptions import (
 from chattocodex.orchestration.run_orchestration_service import RunOrchestrationService
 from chattocodex.run_control.run_control_coordinator import RunControlCoordinator
 from chattocodex.wake.wake_target_service import WakeTargetService
+from chattocodex.wake.worker_wake_capability_service import WorkerWakeCapabilityService
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
 
 
@@ -33,6 +35,7 @@ class ChatFacadeService:
         workspace_project_service: WorkspaceProjectService,
         run_control_coordinator: RunControlCoordinator | None = None,
         consumer_group_coordinator: ConsumerGroupCoordinator | None = None,
+        worker_wake_capability_service: WorkerWakeCapabilityService | None = None,
     ) -> None:
         self._run_service = run_service
         self._broker_service = broker_service
@@ -40,6 +43,7 @@ class ChatFacadeService:
         self._workspace_project_service = workspace_project_service
         self._run_control_coordinator = run_control_coordinator
         self._consumer_group_coordinator = consumer_group_coordinator
+        self._worker_wake_capability_service = worker_wake_capability_service
 
     def delegate_work(
         self,
@@ -112,6 +116,68 @@ class ChatFacadeService:
             tasks=tuple(created_by_key[spec.key] for spec in tasks),
         )
 
+    def prepare_scheduled_work(
+        self,
+        *,
+        goal: str,
+        tasks: tuple[DelegationTaskSpec, ...],
+        requested_parallelism: int | None = None,
+        project_id: str | None,
+    ) -> ScheduledDelegationStarted:
+        """Publish Broker work and issue one-shot wake capabilities without browser provisioning."""
+        if self._worker_wake_capability_service is None:
+            raise InvalidTransitionError(
+                operation="prepare_scheduled_work",
+                resource_id="worker-wake-capability",
+                message="Scheduled Worker wake capabilities are not configured.",
+            )
+        ordered_specs = self._validate_and_order_tasks(tasks=tasks)
+        resolved_project_id = self._resolve_project_id(
+            project_id=project_id,
+            prefer_ready=False,
+        )
+        parallelism = _resolve_requested_parallelism(
+            requested_parallelism=requested_parallelism,
+            tasks=ordered_specs,
+        )
+        created_run = self._run_service.create_run(
+            goal=goal,
+            project_id=resolved_project_id,
+            requested_parallelism=parallelism,
+        )
+
+        created_by_key: dict[str, DelegatedTask] = {}
+        for spec in ordered_specs:
+            broker_task = self._broker_service.create_broker_task(
+                run_id=created_run.state.run_id,
+                run_handle=created_run.run_handle,
+                objective=spec.objective,
+                role=spec.role,
+                depends_on=tuple(
+                    created_by_key[dependency].broker_task.broker_task_id
+                    for dependency in spec.depends_on
+                ),
+            )
+            created_by_key[spec.key] = DelegatedTask(
+                key=spec.key,
+                broker_task=broker_task,
+            )
+
+        root_count = sum(not spec.depends_on for spec in ordered_specs)
+        wake_count = min(parallelism, max(1, root_count))
+        wake_capabilities = tuple(
+            self._worker_wake_capability_service.issue(
+                project_id=resolved_project_id,
+                run_id=created_run.state.run_id,
+            )
+            for _ in range(wake_count)
+        )
+        return ScheduledDelegationStarted(
+            run=created_run,
+            tasks=tuple(created_by_key[spec.key] for spec in tasks),
+            wake_capabilities=wake_capabilities,
+        )
+
     def delegation_status(self, *, run_id: str) -> DelegationStatus:
         """Return the Broker-owned status for one logical delegation Run.
 
@@ -162,9 +228,10 @@ class ChatFacadeService:
                 operation="work",
                 resource_id="wake-target",
                 message=(
-                    "A new Worker Slot can claim work only from a current Chrome Wake delivery. "
-                    "Wait for the Runtime Wake extension to supply both wake_target_id and "
-                    "wake_revision instead of claiming delegated work from the Main Chat."
+                    "A new Worker Slot can claim work only from a current server-issued Worker "
+                    "Wake delivery. Wait for an authorized delivery transport to supply both "
+                    "wake_target_id and wake_revision instead of claiming delegated work from "
+                    "the Main Chat."
                 ),
             )
         if slot_id is not None and wake_revision is not None:
@@ -223,6 +290,16 @@ class ChatFacadeService:
         wake_revision: int,
     ) -> WorkerWork:
         """Consume one wake revision while its cross-process claim lock is held."""
+        if (
+            self._worker_wake_capability_service is not None
+            and self._worker_wake_capability_service.owns(wake_target_id=wake_target_id)
+        ):
+            return self._work_from_server_wake_capability(
+                project_id=project_id,
+                label=label,
+                wake_target_id=wake_target_id,
+                wake_revision=wake_revision,
+            )
         wake_target = self._wake_target_service.reserve_wake_claim(
             wake_target_id=wake_target_id,
             wake_revision=wake_revision,
@@ -289,6 +366,72 @@ class ChatFacadeService:
             released_previous=acquired.released_previous,
         )
 
+    def _work_from_server_wake_capability(
+        self,
+        *,
+        project_id: str | None,
+        label: str | None,
+        wake_target_id: str,
+        wake_revision: int,
+    ) -> WorkerWork:
+        assert self._worker_wake_capability_service is not None
+        capability = self._worker_wake_capability_service.reserve(
+            wake_target_id=wake_target_id,
+            wake_revision=wake_revision,
+        )
+        acquired = None
+        try:
+            if project_id is not None and project_id != capability.project_id:
+                raise InvalidTransitionError(
+                    operation="work",
+                    resource_id=wake_target_id,
+                    message="Server-issued Worker wake capability belongs to a different project.",
+                )
+            resolved_project_id = self._resolve_project_id(
+                project_id=project_id or capability.project_id,
+                prefer_ready=False,
+            )
+            created = self._broker_service.register_slot(
+                project_id=resolved_project_id,
+                label=label,
+            )
+            assignment = self._broker_service.claim_task_for_run(
+                slot_id=created.state.slot_id,
+                slot_handle=created.slot_handle,
+                run_id=capability.run_id,
+            )
+            if assignment is None:
+                raise InvalidTransitionError(
+                    operation="work",
+                    resource_id=capability.run_id,
+                    message="Scheduled Worker wake arrived before its Run had a ready Broker Task.",
+                )
+            acquired = assignment
+            self._worker_wake_capability_service.commit(
+                wake_target_id=wake_target_id,
+                wake_revision=wake_revision,
+                slot_id=assignment.slot.slot_id,
+            )
+        except OrchestrationError:
+            if acquired is not None:
+                self._broker_service.recover_abandoned_assignment(
+                    slot_id=acquired.slot.slot_id,
+                    reason="Server-issued Worker wake capability claim did not commit.",
+                )
+            self._worker_wake_capability_service.abort(
+                wake_target_id=wake_target_id,
+                wake_revision=wake_revision,
+            )
+            raise
+        return WorkerWork(
+            slot=assignment.slot,
+            slot_handle=created.slot_handle,
+            assignment=assignment,
+            registered=True,
+            resumed=False,
+            released_previous=False,
+        )
+
     def work_done(self, *, slot_id: str, slot_handle: str) -> WorkerWorkDone:
         """Release a terminal assignment and reconcile follow-up project capacity.
 
@@ -306,26 +449,33 @@ class ChatFacadeService:
             slot_id=slot_id,
             slot_handle=slot_handle,
         )
+        scheduled_slot = (
+            self._worker_wake_capability_service is not None
+            and self._worker_wake_capability_service.owns_slot(slot_id=slot.slot_id)
+        )
         if slot.status is WorkerSlotStatus.IDLE:
-            self._wake_target_service.release_slot(slot_id=slot.slot_id)
+            if not scheduled_slot:
+                self._wake_target_service.release_slot(slot_id=slot.slot_id)
             return WorkerWorkDone(slot=slot, finished=None, already_idle=True)
         active_run_id = slot.current_run_id
         finished = self._broker_service.finish_assignment(
             slot_id=slot_id,
             slot_handle=slot_handle,
         )
-        self._wake_target_service.release_slot(slot_id=slot_id)
+        if not scheduled_slot:
+            self._wake_target_service.release_slot(slot_id=slot_id)
         if active_run_id is not None:
             snapshot = self._broker_service.get_run_status(run_id=active_run_id)
-            if self._consumer_group_coordinator is not None:
-                self._consumer_group_coordinator.reconcile_project(
-                    project_id=finished.slot.project_id
-                )
-            else:
-                self._wake_target_service.sync_ready_capacity(
-                    project_id=finished.slot.project_id,
-                    ready_count=snapshot.ready_count,
-                )
+            if not scheduled_slot:
+                if self._consumer_group_coordinator is not None:
+                    self._consumer_group_coordinator.reconcile_project(
+                        project_id=finished.slot.project_id
+                    )
+                else:
+                    self._wake_target_service.sync_ready_capacity(
+                        project_id=finished.slot.project_id,
+                        ready_count=snapshot.ready_count,
+                    )
             if self._run_control_coordinator is not None:
                 self._run_control_coordinator.refresh_by_run(run_id=active_run_id)
         return WorkerWorkDone(

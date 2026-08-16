@@ -227,6 +227,34 @@ If a Worker calls `work` again while an assignment is active, ChatToCodex safely
 
 Completing a task can unlock DAG successors. `work_done` recalculates READY capacity, reuses or wakes an eligible recoverable target, and records a project-bound provisioning deficit only when existing capacity is insufficient.
 
+### Shared Broker Cluster management
+
+The management model follows Kafka's separation of cluster, broker, namespace-like ownership, and Consumer Group coordination without copying Kafka topic/partition/offset semantics. ChatToCodex has one provider-independent Broker Cluster over the configured execution root. Every local Project is isolated as a Broker namespace, while provider adapters remain outside this layer.
+
+```text
+Shared Broker Cluster
+├── Controller: broker-0
+├── Broker node: broker-0
+│
+├── Project namespace A
+│   ├── Broker Tasks / Worker Slots / Runs
+│   └── Consumer Group(s)
+│
+├── Project namespace B
+│   ├── Broker Tasks / Worker Slots / Runs
+│   └── Consumer Group(s)
+│
+└── Group Coordinator Directory
+    ├── group-A -> broker-0
+    └── group-B -> broker-0
+```
+
+The current MVP is an embedded single-node cluster, so `broker-0` combines the Broker and Controller roles. Group Coordinator ownership is nevertheless resolved through a stable group-id hash over eligible Broker nodes. This keeps coordinator ownership independent from ChatGPT, Chrome, or any future provider runtime and leaves a direct seam for multiple Broker nodes later.
+
+Today's persisted Consumer Group topology is still one default Group per Project. Broker management exposes it as `<project_id>:default`; this is a compatibility identity, not a long-term requirement that Project and Consumer Group remain 1:1. Future multiple Consumer Groups per Project can replace that persistence shape without changing Broker namespace management or provider adapters.
+
+The Runtime Console exposes the cluster, Controller, per-Project namespace queue pressure, reusable Worker Slot pressure, and Group Coordinator ownership. PostgreSQL mirrors the same management view as a read model; the file-backed Broker state remains the execution source of truth.
+
 ## Durable state
 
 The current PoC separates global control-plane state from project execution state. OAuth, the Owner Token, and the configured workspace remain under the global ChatToCodex state root (by default `~/.chattocodex`). Runs and all execution artifacts live under the configured working project instead:
@@ -299,6 +327,33 @@ before starting the new version; mixed old/new processes do not share a lock nam
 The same loopback process exposes the Worker boundary under `/api/wake/*` and the Main review boundary under `/api/main-runtime/review-targets/*`. The Worker boundary includes an opaque per-target runtime-heartbeat endpoint so the extension can advertise recoverability without pretending the Chat tab itself is open. These are local Chrome Runtime Adapter boundaries and are not added to the public MCP catalog. Neither loopback response carries Workflow or Run identity.
 
 Create the ChatGPT Custom MCP App in Developer Mode with the Connector URL shown by the Control Panel, complete OAuth, and enter the Owner Token only on the local ChatToCodex approval page.
+
+### PostgreSQL operations read model
+
+The Broker, Consumer Group coordinator, wake leases, and Run Control state remain file-backed execution authorities. PostgreSQL is deliberately a **management read model**, not a second assignment authority. The Runtime Console projects the current durable file snapshot into PostgreSQL and reads that projection back for the UI. If PostgreSQL or its Python driver is unavailable, Worker execution continues from the file-backed state and the Runtime Console reports the database as degraded instead of changing assignment semantics.
+
+The local development database is defined in `compose.yaml` and binds only to loopback. Copy `.env.example` if you want to override the development database name, credentials, or port, then start PostgreSQL:
+
+```bash
+make db-config
+make db-up
+```
+
+The host process that runs `chattocodex app` must receive `CHATTOCODEX_DATABASE_URL`. The example value is:
+
+```text
+postgresql://chattocodex:chattocodex-local@127.0.0.1:55432/chattocodex
+```
+
+PostgreSQL access is loaded lazily through `psycopg`; a normal file-backed runtime does not import the driver. The first successful database projection applies the packaged SQL migrations in `chattocodex/database/migrations/`, then refreshes normalized Project, Consumer Group, Worker, and Run tables plus a validated JSONB operations snapshot. Database credentials are never returned by `/api/operations`.
+
+The Worker Browser remains a host-side process because it owns a local persistent Chrome profile and loopback-only Runtime Adapter. `compose.yaml` containerizes PostgreSQL only; it does not move Chrome, the local workspace, or the MCP trust boundary into a container.
+
+Stop the local database with:
+
+```bash
+make db-down
+```
 
 ## Current Wake MVP boundary
 

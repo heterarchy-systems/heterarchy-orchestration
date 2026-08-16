@@ -1,4 +1,4 @@
-importScripts("runtime_conversation_identity.js", "runtime_tab_reopen_policy.js");
+importScripts("runtime_conversation_identity.js", "runtime_tab_reopen_policy.js", "persistent_worker_runtime_policy.js");
 importScripts("worker_provisioning_adapter.js");
 
 const CONTROL_ORIGIN = "http://127.0.0.1:8790";
@@ -520,6 +520,17 @@ async function ensureConversationTab(conversationUrl, registration, candidate) {
   const conversationId = chatConversationId(conversationUrl);
   if (!conversationId) {
     throw new Error("Registered Chat URL is missing a persistent conversation ID.");
+  }
+  if (
+    registration.kind === "worker" &&
+    !persistentWorkerConversationMatchesRegistration(
+      registration,
+      conversationUrl,
+    )
+  ) {
+    throw new Error(
+      "Registered Worker Chat no longer matches its persistent conversation identity.",
+    );
   }
 
   const located = await findConversationTab(
