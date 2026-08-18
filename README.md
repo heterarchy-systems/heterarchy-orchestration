@@ -60,7 +60,7 @@ Ask for delegated work naturally:
 보안 / 백엔드 / 제품 관점으로 보고 마지막에 종합해줘.
 ```
 
-For simple fire-and-report delegation, ChatToCodex can still use `delegate_work`. When the user asks the Main Chat to inspect Worker results, approve completion, or request corrective work, the Main Chat uses `orchestrate_work`. The durable Run Control Coordinator owns the execution round, DAG dependencies, Main Review Gate, and bounded rework loop. Only tasks whose prerequisites are complete are published to the external `herterarchy-broker`, which then owns claim, lease, fencing, and completion authority.
+For simple fire-and-report delegation, ChatToCodex can still use `delegate_work`. When the user asks the Main Chat to inspect Worker results, approve completion, or request corrective work, the Main Chat uses `orchestrate_work`. The durable Run Control Coordinator owns the execution round, DAG dependencies, Main Review Gate, and bounded rework loop. Only tasks whose prerequisites are complete are published to the external `heterarchy-broker`, which then owns claim, lease, fencing, and completion authority.
 
 Worker completion automatically refreshes the coordinated Run. When every Worker Task in the current execution round is terminal, the workflow moves to `WAITING_MAIN_REVIEW`. The Main Chat checks `workflow_status`, inspects reports/results/diffs/tests, then calls `review_workflow` with `approve`, `rework`, or `fail`. A rework decision creates a new execution round with a new corrective Worker DAG. Rework rounds are bounded by `max_rework_rounds`.
 
@@ -180,7 +180,7 @@ Low-level Broker actions and Wake actions are deliberately not registered as pub
                           │ publish READY tasks
                           ▼
                  ┌──────────────────┐
-                 │ herterarchy-     │
+                 │ heterarchy-     │
                  │ broker           │
                  │                  │
                  │ Consumer Groups  │
@@ -239,7 +239,7 @@ Completing a task can unlock DAG successors. `work_done` recalculates READY capa
 
 ### External Broker boundary
 
-`heterarchy-orchestration` consumes [`herterarchy-broker`](https://github.com/heterarchy-systems/herterarchy-broker) through its Python SDK. The dependency is pinned in `pyproject.toml`/`uv.lock`; orchestration does not carry a second Broker implementation.
+`heterarchy-orchestration` consumes [`heterarchy-broker`](https://github.com/heterarchy-systems/heterarchy-broker) through its Python SDK. The dependency is pinned in `pyproject.toml`/`uv.lock`; orchestration does not carry a second Broker implementation.
 
 The current production adapter targets one standalone Broker endpoint:
 
@@ -327,7 +327,7 @@ Create the ChatGPT Custom MCP App in Developer Mode with the Connector URL shown
 
 ### PostgreSQL operations read model
 
-Run/DAG projection, physical Worker capacity, wake leases, and Run Control state remain file-backed orchestration authorities. Work assignment itself is authoritative in the external `herterarchy-broker`. PostgreSQL is deliberately a **management read model**, not a second assignment authority. The Runtime Console projects the current orchestration snapshot into PostgreSQL and reads that projection back for the UI. If PostgreSQL or its Python driver is unavailable, Worker execution continues without changing Broker assignment semantics.
+Run/DAG projection, physical Worker capacity, wake leases, and Run Control state remain file-backed orchestration authorities. Work assignment itself is authoritative in the external `heterarchy-broker`. PostgreSQL is deliberately a **management read model**, not a second assignment authority. The Runtime Console projects the current orchestration snapshot into PostgreSQL and reads that projection back for the UI. If PostgreSQL or its Python driver is unavailable, Worker execution continues without changing Broker assignment semantics.
 
 The local development database is defined in `compose.yaml` and binds only to loopback. Copy `.env.example` if you want to override the development database name, credentials, or port, then start PostgreSQL:
 

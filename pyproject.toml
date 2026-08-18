@@ -8,7 +8,7 @@ dependencies = [
     "pydantic",
     "pydantic-settings",
     "asyncer",
-    "herterarchy-broker-sdk @ git+https://github.com/heterarchy-systems/herterarchy-broker.git@0d332d2#subdirectory=sdks/python",
+    "heterarchy-broker-sdk @ git+https://github.com/heterarchy-systems/heterarchy-broker.git@b37c61b#subdirectory=sdks/python",
     "mcp",
     "starlette>=1.5.0",
     "uvicorn[standard]>=0.52.1"

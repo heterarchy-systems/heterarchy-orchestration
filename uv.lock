@@ -111,7 +111,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "asyncer" },
-    { name = "herterarchy-broker-sdk" },
+    { name = "heterarchy-broker-sdk" },
     { name = "mcp" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -129,7 +129,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "asyncer" },
-    { name = "herterarchy-broker-sdk", git = "https://github.com/heterarchy-systems/herterarchy-broker.git?subdirectory=sdks%2Fpython&rev=0d332d2" },
+    { name = "heterarchy-broker-sdk", git = "https://github.com/heterarchy-systems/heterarchy-broker.git?subdirectory=sdks%2Fpython&rev=b37c61b" },
     { name = "mcp" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -225,9 +225,9 @@ wheels = [
 ]
 
 [[package]]
-name = "herterarchy-broker-sdk"
+name = "heterarchy-broker-sdk"
 version = "0.1.0"
-source = { git = "https://github.com/heterarchy-systems/herterarchy-broker.git?subdirectory=sdks%2Fpython&rev=0d332d2#0d332d259c10794534389bb803f8ae745a8fabc6" }
+source = { git = "https://github.com/heterarchy-systems/heterarchy-broker.git?subdirectory=sdks%2Fpython&rev=b37c61b#b37c61b1936e7f05802daeecc4b913458d6d8781" }
 
 [[package]]
 name = "httpcore2"

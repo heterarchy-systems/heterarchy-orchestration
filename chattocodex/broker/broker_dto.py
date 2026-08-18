@@ -26,7 +26,7 @@ class BrokerTaskState:
     """Local orchestration projection for a task published to the external Broker.
 
     DAG dependency readiness and Run mapping belong to orchestration. Claim, lease,
-    fencing, and completion authority belong to `herterarchy-broker`.
+    fencing, and completion authority belong to `heterarchy-broker`.
     """
 
     schema_version: int
