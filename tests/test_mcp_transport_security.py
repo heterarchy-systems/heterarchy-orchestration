@@ -9,6 +9,7 @@ from chattocodex.auth.oauth_dto import OAuthServerOptions
 from chattocodex.auth.owner_token_service import OwnerTokenService
 from chattocodex.mcp_server import create_mcp_server
 from chattocodex.remote.mcp_transport_security import build_mcp_transport_security
+from tests.broker_support import FakeWorkBrokerGateway
 
 _PUBLIC_ORIGIN = "https://stands-confidence-void-walter.trycloudflare.com"
 _INITIALIZE_REQUEST = {
@@ -27,6 +28,7 @@ def _build_app(*, tmp_path: Path):
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=tmp_path / "state",
         workspace_root=workspace_root,
     )
@@ -80,6 +82,7 @@ def test_openid_discovery_alias_matches_oauth_metadata(tmp_path: Path) -> None:
     workspace_root.mkdir()
     OwnerTokenService(state_root=state_root).generate()
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=state_root,
         workspace_root=workspace_root,
         oauth_options=OAuthServerOptions(
@@ -116,6 +119,7 @@ def test_quick_tunnel_host_completes_oauth_then_authenticated_mcp(
     workspace_root.mkdir()
     owner_token = OwnerTokenService(state_root=state_root).generate()
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=state_root,
         workspace_root=workspace_root,
         oauth_options=OAuthServerOptions(

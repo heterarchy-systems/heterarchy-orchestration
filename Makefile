@@ -31,7 +31,7 @@ node_check:
 	@node tests/persistent_worker_runtime_policy_harness.js
 
 test: dev_env_check node_check
-	uv run pytest -q
+	uv run python -m pytest -q
 
 test_free_threaded: node_check
 	uv run --isolated --locked --managed-python --python 3.14t --no-editable python -c 'import sys, sysconfig; import cryptography, httptools, pydantic_core, pytest, uvloop; assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1; assert not sys._is_gil_enabled(); raise SystemExit(pytest.main(["-q"]))'

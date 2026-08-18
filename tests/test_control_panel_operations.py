@@ -1,17 +1,45 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
-from chattocodex.consumer_group.consumer_group_state import ConsumerGroupState
+from chattocodex.broker_client.broker_operations_gateway import (
+    BrokerConsumerGroupDirectory,
+    BrokerConsumerGroupView,
+)
 from chattocodex.control_panel.control_panel_operations_service import (
     ControlPanelOperationsService,
 )
 from chattocodex.orchestration.orchestration_dto import RunState, RunStatus
-from chattocodex.persistence.consumer_group_state_store import ConsumerGroupStateStore
 from chattocodex.persistence.orchestration_state_repository import RunStateRepository
 from chattocodex.persistence.wake_target_repository import WakeTargetRepository
+from chattocodex.persistence.worker_runtime_group_state_store import (
+    WorkerRuntimeGroupStateStore,
+)
 from chattocodex.wake.wake_dto import WakeTargetState, WakeTargetStatus
 from chattocodex.wake.worker_browser_runtime_dto import WorkerBrowserRuntimeMode
+from chattocodex.worker_runtime.worker_runtime_group_state import (
+    WorkerRuntimeGroupState,
+)
 from chattocodex.workspace.workspace_project_dto import WorkspaceProject
+
+
+class _BrokerOperations:
+    def __init__(self, *, namespace_id: str) -> None:
+        self._directory = BrokerConsumerGroupDirectory(
+            term=5,
+            revision=12,
+            groups=(
+                BrokerConsumerGroupView(
+                    group_id="sample-company",
+                    namespace_id=namespace_id,
+                    generation=7,
+                    group_revision=11,
+                    consumer_count=3,
+                ),
+            ),
+        )
+
+    def group_directory(self) -> BrokerConsumerGroupDirectory:
+        return self._directory
 
 
 def test_operations_snapshot_projects_consumer_group_workers_and_runs(
@@ -38,12 +66,12 @@ def test_operations_snapshot_projects_consumer_group_workers_and_runs(
             updated_at=now,
         )
     )
-    ConsumerGroupStateStore(state_root=execution_root).write(
-        state=ConsumerGroupState(
+    WorkerRuntimeGroupStateStore(state_root=execution_root).write(
+        state=WorkerRuntimeGroupState(
             schema_version=1,
             project_id=project_id,
-            generation=2,
-            member_ids=(wake_target_id,),
+            topology_generation=2,
+            wake_target_ids=(wake_target_id,),
             revision=5,
             created_at=now,
             updated_at=now,
@@ -66,7 +94,10 @@ def test_operations_snapshot_projects_consumer_group_workers_and_runs(
         )
     )
 
-    snapshot = ControlPanelOperationsService(execution_root=execution_root).snapshot(
+    snapshot = ControlPanelOperationsService(
+        execution_root=execution_root,
+        broker_operations=_BrokerOperations(namespace_id=project_id),
+    ).snapshot(
         projects=(
             WorkspaceProject(
                 project_id=project_id,
@@ -83,18 +114,17 @@ def test_operations_snapshot_projects_consumer_group_workers_and_runs(
     assert snapshot.browser.running is True
     assert snapshot.browser.mode is WorkerBrowserRuntimeMode.HEADLESS
     assert snapshot.broker is not None
-    assert snapshot.broker.cluster_id == "local-broker-cluster"
-    assert snapshot.broker.controller_node_id == "broker-0"
+    assert snapshot.broker.term == 5
+    assert snapshot.broker.revision == 12
     assert snapshot.broker.namespaces[0].project_id == project_id
-    assert snapshot.broker.namespaces[0].consumer_group_count == 1
-    assert snapshot.broker.group_coordinators[0].project_id == project_id
-    assert snapshot.broker.group_coordinators[0].generation == 2
-    assert snapshot.broker.group_coordinators[0].member_count == 1
+    assert snapshot.broker.consumer_groups[0].namespace_id == project_id
+    assert snapshot.broker.consumer_groups[0].generation == 7
+    assert snapshot.broker.consumer_groups[0].consumer_count == 3
     assert snapshot.totals.project_count == 1
-    assert snapshot.totals.consumer_group_count == 1
+    assert snapshot.totals.runtime_group_count == 1
     assert snapshot.totals.worker_count == 1
     assert snapshot.totals.idle == 1
     assert snapshot.totals.active_runs == 1
-    assert snapshot.projects[0].consumer_group.generation == 2
-    assert snapshot.projects[0].consumer_group.workers[0].wake_revision == 3
+    assert snapshot.projects[0].worker_runtime.topology_generation == 2
+    assert snapshot.projects[0].worker_runtime.workers[0].wake_revision == 3
     assert snapshot.recent_runs[0].requested_parallelism == 2

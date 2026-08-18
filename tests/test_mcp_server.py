@@ -20,6 +20,7 @@ from chattocodex.schemas.project_binding_schemas import (
     ProjectBindingAdapterMetadata,
 )
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from tests.broker_support import FakeWorkBrokerGateway
 
 _EXPECTED_TOOLS = {
     "project_list",
@@ -73,6 +74,7 @@ def _create_workspace(tmp_path: Path) -> Path:
 
 def test_mcp_server_exposes_expected_tools(tmp_path: Path) -> None:
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=tmp_path / "state",
         workspace_root=_create_workspace(tmp_path),
     )
@@ -86,6 +88,7 @@ def test_mcp_server_exposes_expected_tools(tmp_path: Path) -> None:
 
 def test_mcp_server_accepts_connector_qualified_tool_names(tmp_path: Path) -> None:
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=tmp_path / "state",
         workspace_root=_create_workspace(tmp_path),
     )
@@ -103,6 +106,7 @@ def test_mcp_server_accepts_connector_qualified_tool_names(tmp_path: Path) -> No
 
 def test_mcp_server_rejects_qualified_unknown_tool_names(tmp_path: Path) -> None:
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=tmp_path / "state",
         workspace_root=_create_workspace(tmp_path),
     )
@@ -120,6 +124,7 @@ def test_mcp_server_rejects_malformed_qualified_tool_names(
     name: str,
 ) -> None:
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=tmp_path / "state",
         workspace_root=_create_workspace(tmp_path),
     )
@@ -133,6 +138,7 @@ def test_mcp_server_rejects_malformed_qualified_tool_names(
 
 def test_review_requests_route_to_orchestrated_main_review(tmp_path: Path) -> None:
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=tmp_path / "state",
         workspace_root=_create_workspace(tmp_path),
     )
@@ -160,6 +166,7 @@ def test_delegate_work_rejects_non_git_project_before_state_is_written(
     project_root.mkdir(parents=True)
     (project_root / "pyproject.toml").write_text("[project]\nname = 'sample-project'\n")
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=state_root,
         workspace_root=workspace_root,
     )
@@ -206,6 +213,7 @@ def test_mcp_execution_state_can_live_under_configured_workspace(
         .project_id
     )
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=control_root,
         workspace_root=workspace_root,
         execution_state_root=execution_root,
@@ -256,6 +264,7 @@ def test_mcp_ready_reconciliation_persists_bound_project_provisioning_demand(
         ),
     )
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=control_root,
         workspace_root=workspace_root,
         execution_state_root=execution_root,

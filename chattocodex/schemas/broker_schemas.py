@@ -25,6 +25,10 @@ from chattocodex.schemas.project_schemas import ProjectId
 
 BrokerTaskId = Annotated[str, StringConstraints(pattern=r"^btask_[0-9a-f]{24}$")]
 WorkerSlotId = Annotated[str, StringConstraints(pattern=r"^slot_[0-9a-f]{24}$")]
+BrokerConsumerId = Annotated[
+    str,
+    StringConstraints(pattern=r"^consumer_[0-9a-f]{24}$"),
+]
 WorkerSlotHandle = Annotated[
     str,
     StringConstraints(pattern=r"^slh_[A-Za-z0-9_-]{32,128}$"),
@@ -65,6 +69,7 @@ class BrokerTaskRecord(BrokerTimestampedRecord):
     assigned_worker_id: str | None
     assigned_task_id: str | None
     revision: Revision
+    external_published: bool = False
 
     @model_validator(mode="after")
     def validate_assignment_shape(self) -> BrokerTaskRecord:
@@ -88,6 +93,7 @@ class WorkerSlotRecord(BrokerTimestampedRecord):
     schema_version: Literal[1] = 1
     slot_id: WorkerSlotId
     project_id: ProjectId
+    broker_consumer_id: BrokerConsumerId | None = None
     slot_handle_digest: CapabilityDigest
     label: SlotLabel | None
     status: WorkerSlotStatus
@@ -96,6 +102,11 @@ class WorkerSlotRecord(BrokerTimestampedRecord):
     current_worker_id: str | None
     current_task_id: str | None
     revision: Revision
+    broker_term: int | None = None
+    broker_group_generation: int | None = None
+    broker_lease_id: str | None = None
+    broker_lease_epoch: int | None = None
+    broker_lease_expires_at_ms: int | None = None
 
     @model_validator(mode="after")
     def validate_assignment_shape(self) -> WorkerSlotRecord:
@@ -113,6 +124,23 @@ class WorkerSlotRecord(BrokerTimestampedRecord):
             value is None for value in assignment
         ):
             raise ValueError("busy worker slots require a complete assignment")
+        broker_lease = (
+            self.broker_term,
+            self.broker_group_generation,
+            self.broker_lease_id,
+            self.broker_lease_epoch,
+            self.broker_lease_expires_at_ms,
+        )
+        if self.status is WorkerSlotStatus.IDLE and any(
+            value is not None for value in broker_lease
+        ):
+            raise ValueError("idle worker slots cannot retain an external Broker lease")
+        if any(value is not None for value in broker_lease) and any(
+            value is None for value in broker_lease
+        ):
+            raise ValueError(
+                "external Broker lease metadata must be complete when present"
+            )
         return self
 
 

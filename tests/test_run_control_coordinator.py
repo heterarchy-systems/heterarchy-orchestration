@@ -7,14 +7,14 @@ import pytest
 from chattocodex.broker.broker_service import BrokerService
 from chattocodex.facade.facade_service import ChatFacadeService
 from chattocodex.git.git_command_runner import GitCommandRunner
-from chattocodex.main_runtime.main_review_resume_coordinator import (
-    MainReviewResumeCoordinator,
+from chattocodex.main_runtime.main_review_chat_presence_tracker import (
+    MainReviewChatPresenceTracker,
 )
 from chattocodex.main_runtime.main_review_delivery_lease_tracker import (
     MainReviewDeliveryLeaseTracker,
 )
-from chattocodex.main_runtime.main_review_chat_presence_tracker import (
-    MainReviewChatPresenceTracker,
+from chattocodex.main_runtime.main_review_resume_coordinator import (
+    MainReviewResumeCoordinator,
 )
 from chattocodex.main_runtime.main_review_target_coordinator import (
     MainReviewTargetCoordinator,
@@ -32,13 +32,13 @@ from chattocodex.persistence.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.main_review_target_store import MainReviewTargetStore
-from chattocodex.persistence.main_review_delivery_lease_store import (
-    MainReviewDeliveryLeaseStore,
-)
 from chattocodex.persistence.main_review_chat_presence_store import (
     MainReviewChatPresenceStore,
 )
+from chattocodex.persistence.main_review_delivery_lease_store import (
+    MainReviewDeliveryLeaseStore,
+)
+from chattocodex.persistence.main_review_target_store import MainReviewTargetStore
 from chattocodex.persistence.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
@@ -53,13 +53,14 @@ from chattocodex.run_control.run_control_state import (
     WorkflowStatus,
     WorkflowTaskSpec,
 )
-from chattocodex.wake.wake_presence_service import WakePresenceService
 from chattocodex.wake.wake_dto import WakeTargetStatus
+from chattocodex.wake.wake_presence_service import WakePresenceService
 from chattocodex.wake.wake_target_service import WakeTargetService
 from chattocodex.worker_runtime.broker_ready_capacity_projection import (
     BrokerReadyCapacityProjection,
 )
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from tests.broker_support import FakeWorkBrokerGateway
 
 
 class _Clock:
@@ -118,6 +119,7 @@ class _Runtime:
             lock_registry=locks,
         )
         self.broker_service = BrokerService(
+            work_broker_gateway=FakeWorkBrokerGateway(),
             run_repository=self.run_repository,
             worker_repository=self.worker_repository,
             task_repository=self.task_repository,

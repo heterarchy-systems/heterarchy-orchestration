@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from agent_broker import BrokerClientConfig
 from mcp.server.mcpserver import MCPServer
 
 from chattocodex.auth.oauth_compatibility_routes import (
@@ -15,8 +16,9 @@ from chattocodex.broker.abandoned_assignment_recovery import (
     AbandonedAssignmentRecovery,
 )
 from chattocodex.broker.broker_service import BrokerService
-from chattocodex.consumer_group.consumer_group_coordinator import (
-    ConsumerGroupCoordinator,
+from chattocodex.broker_client.external_broker_gateway import (
+    AgentBrokerGateway,
+    WorkBrokerGateway,
 )
 from chattocodex.facade.facade_mcp_tools import register_facade_tools
 from chattocodex.facade.facade_service import ChatFacadeService
@@ -57,7 +59,6 @@ from chattocodex.persistence.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.consumer_group_state_store import ConsumerGroupStateStore
 from chattocodex.persistence.git_worktree_repository import GitWorktreeRepository
 from chattocodex.persistence.main_review_chat_presence_store import (
     MainReviewChatPresenceStore,
@@ -83,6 +84,9 @@ from chattocodex.persistence.worker_provisioning_repository import (
 )
 from chattocodex.persistence.worker_report_repository import WorkerReportRepository
 from chattocodex.persistence.worker_result_repository import WorkerResultRepository
+from chattocodex.persistence.worker_runtime_group_state_store import (
+    WorkerRuntimeGroupStateStore,
+)
 from chattocodex.persistence.worker_runtime_presence_store import (
     WorkerRuntimePresenceStore,
 )
@@ -128,6 +132,9 @@ from chattocodex.worker_runtime.wake_delivery_lease_tracker import (
 from chattocodex.worker_runtime.worker_assignment_lease_reconciler import (
     WorkerAssignmentLeaseReconciler,
 )
+from chattocodex.worker_runtime.worker_runtime_coordinator import (
+    WorkerRuntimeCoordinator,
+)
 from chattocodex.worker_runtime.worker_runtime_presence_tracker import (
     WorkerRuntimePresenceTracker,
 )
@@ -139,6 +146,7 @@ def create_mcp_server(
     *,
     state_root: Path,
     workspace_root: Path,
+    work_broker_gateway: WorkBrokerGateway,
     execution_state_root: Path | None = None,
     mcp_path: str = "/mcp",
     oauth_options: OAuthServerOptions | None = None,
@@ -178,6 +186,7 @@ def create_mcp_server(
         task_repository=task_repository,
         broker_task_repository=broker_task_repository,
         slot_repository=worker_slot_repository,
+        work_broker_gateway=work_broker_gateway,
         workspace_project_service=workspace_project_service,
         lock_registry=lock_registry,
     )
@@ -236,11 +245,14 @@ def create_mcp_server(
             task_repository=task_repository,
             lock_registry=lock_registry,
         ),
+        assignment_lease_renewer=lambda slot_id: broker_service.renew_assignment_lease(
+            slot_id=slot_id
+        ),
         wake_target_service=wake_target_service,
         lock_registry=lock_registry,
     )
-    consumer_group_coordinator = ConsumerGroupCoordinator(
-        state_store=ConsumerGroupStateStore(state_root=execution_root),
+    worker_runtime_coordinator = WorkerRuntimeCoordinator(
+        state_store=WorkerRuntimeGroupStateStore(state_root=execution_root),
         wake_target_repository=wake_target_repository,
         wake_presence_service=wake_presence_service,
         runtime_presence_tracker=runtime_presence_tracker,
@@ -251,8 +263,8 @@ def create_mcp_server(
         pending_provisioning_count=worker_provisioning_service.pending_provisioning_count,
         on_capacity_decision=worker_provisioning_service.on_capacity_decision,
     )
-    worker_provisioning_service.attach_consumer_group_coordinator(
-        consumer_group_coordinator
+    worker_provisioning_service.attach_worker_runtime_coordinator(
+        worker_runtime_coordinator
     )
     run_control_coordinator = RunControlCoordinator(
         repository=run_control_state_store,
@@ -261,7 +273,7 @@ def create_mcp_server(
         wake_target_service=wake_target_service,
         workspace_project_service=workspace_project_service,
         lock_registry=lock_registry,
-        consumer_group_coordinator=consumer_group_coordinator,
+        worker_runtime_coordinator=worker_runtime_coordinator,
     )
     main_review_target_coordinator = MainReviewTargetCoordinator(
         target_store=MainReviewTargetStore(state_root=execution_root),
@@ -284,7 +296,7 @@ def create_mcp_server(
         wake_target_service=wake_target_service,
         workspace_project_service=workspace_project_service,
         run_control_coordinator=run_control_coordinator,
-        consumer_group_coordinator=consumer_group_coordinator,
+        worker_runtime_coordinator=worker_runtime_coordinator,
         worker_wake_capability_service=worker_wake_capability_service,
     )
     project_read_service = ProjectReadService(
@@ -368,7 +380,11 @@ def create_mcp_server(
     return server
 
 
-def serve_configured(*, settings: RuntimeSettings) -> None:
+def serve_configured(
+    *,
+    settings: RuntimeSettings,
+    work_broker_gateway: WorkBrokerGateway | None = None,
+) -> None:
     config = RuntimeConfigRepository(state_root=settings.state_root).read()
     oauth_options: OAuthServerOptions | None = None
     if config.oauth_enabled:
@@ -385,9 +401,18 @@ def serve_configured(*, settings: RuntimeSettings) -> None:
         )
 
     workspace_root = Path(config.workspace_root).expanduser().resolve()
+    broker_gateway = work_broker_gateway or AgentBrokerGateway(
+        config=BrokerClientConfig(
+            host=settings.broker_host,
+            port=settings.broker_port,
+            timeout_seconds=settings.broker_timeout_seconds,
+        ),
+        lease_duration_ms=settings.broker_lease_duration_ms,
+    )
     server = create_mcp_server(
         state_root=settings.state_root,
         workspace_root=workspace_root,
+        work_broker_gateway=broker_gateway,
         execution_state_root=WorkspaceExecutionLayout.state_root(
             workspace_root=workspace_root
         ),

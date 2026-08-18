@@ -3,11 +3,6 @@ from datetime import datetime
 
 import pytest
 
-from chattocodex.broker.broker_management_dto import (
-    BrokerClusterTopology,
-    BrokerNodeRole,
-    BrokerNodeStatus,
-)
 from chattocodex.control_panel.control_panel_database_bridge import (
     ControlPanelDatabaseBridge,
 )
@@ -17,8 +12,7 @@ from chattocodex.database.operations_read_model_repository import (
     OperationsReadModelRepository,
 )
 from chattocodex.schemas.broker_management_schemas import (
-    BrokerClusterOperationsView,
-    BrokerNodeOperationsView,
+    BrokerOperationsView,
 )
 from chattocodex.schemas.control_panel_operations_schemas import (
     ControlPanelOperationsResponse,
@@ -41,19 +35,11 @@ def _snapshot() -> ControlPanelOperationsResponse:
             projected_at=None,
             message="PostgreSQL read model is not configured.",
         ),
-        broker=BrokerClusterOperationsView(
-            cluster_id="local-broker-cluster",
-            topology=BrokerClusterTopology.EMBEDDED_SINGLE_NODE,
-            controller_node_id="broker-0",
-            nodes=(
-                BrokerNodeOperationsView(
-                    node_id="broker-0",
-                    roles=(BrokerNodeRole.BROKER, BrokerNodeRole.CONTROLLER),
-                    status=BrokerNodeStatus.ONLINE,
-                ),
-            ),
+        broker=BrokerOperationsView(
+            term=3,
+            revision=9,
             namespaces=(),
-            group_coordinators=(),
+            consumer_groups=(),
             queued_count=0,
             ready_count=0,
             claimed_count=0,
@@ -64,7 +50,7 @@ def _snapshot() -> ControlPanelOperationsResponse:
         ),
         totals=OperationsTotalsView(
             project_count=0,
-            consumer_group_count=0,
+            runtime_group_count=0,
             worker_count=0,
             idle=0,
             waking=0,
@@ -196,10 +182,16 @@ def test_postgres_read_model_projects_and_reads_back_snapshot() -> None:
     assert connection.committed is True
     assert any("operations_projection" in query for query in cursor.queries)
     assert any("operations_projects" in query for query in cursor.queries)
-    assert any("operations_consumer_groups" in query for query in cursor.queries)
+    assert any("operations_runtime_groups" in query for query in cursor.queries)
     assert any("operations_runs" in query for query in cursor.queries)
-    assert any("operations_broker_cluster" in query for query in cursor.queries)
-    assert any("operations_broker_nodes" in query for query in cursor.queries)
+    assert any("operations_broker_state" in query for query in cursor.queries)
+    assert any("operations_broker_consumer_groups" in query for query in cursor.queries)
+    assert not any(
+        "INSERT INTO operations_broker_nodes" in query for query in cursor.queries
+    )
+    assert not any(
+        "INSERT INTO operations_group_coordinators" in query for query in cursor.queries
+    )
 
 
 def test_postgres_read_model_healthcheck_uses_select_one() -> None:

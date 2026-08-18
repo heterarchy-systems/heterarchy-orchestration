@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 
 from chattocodex.mcp_server import create_mcp_server
+from tests.broker_support import FakeWorkBrokerGateway
 
 
 def _workspace(tmp_path: Path) -> Path:
@@ -40,6 +41,7 @@ def _payload(result: object) -> dict[str, object]:
 
 def test_orchestrate_work_and_status_are_real_mcp_boundaries(tmp_path: Path) -> None:
     server = create_mcp_server(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         state_root=tmp_path / "state",
         workspace_root=_workspace(tmp_path),
     )

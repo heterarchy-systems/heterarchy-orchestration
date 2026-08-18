@@ -8,9 +8,6 @@ from typing import Protocol
 from chattocodex.broker.abandoned_assignment_recovery import (
     AbandonedAssignmentRecovery,
 )
-from chattocodex.consumer_group.consumer_group_coordinator import (
-    ConsumerGroupCoordinator,
-)
 from chattocodex.main_runtime.main_review_chat_presence_tracker import (
     MainReviewChatPresenceTracker,
 )
@@ -30,7 +27,6 @@ from chattocodex.persistence.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.consumer_group_state_store import ConsumerGroupStateStore
 from chattocodex.persistence.main_review_chat_presence_store import (
     MainReviewChatPresenceStore,
 )
@@ -53,6 +49,9 @@ from chattocodex.persistence.wake_presence_repository import WakePresenceReposit
 from chattocodex.persistence.wake_target_repository import WakeTargetRepository
 from chattocodex.persistence.worker_provisioning_repository import (
     WorkerProvisioningRepository,
+)
+from chattocodex.persistence.worker_runtime_group_state_store import (
+    WorkerRuntimeGroupStateStore,
 )
 from chattocodex.persistence.worker_runtime_presence_store import (
     WorkerRuntimePresenceStore,
@@ -78,6 +77,9 @@ from chattocodex.worker_runtime.wake_delivery_lease_tracker import (
 )
 from chattocodex.worker_runtime.worker_assignment_lease_reconciler import (
     WorkerAssignmentLeaseReconciler,
+)
+from chattocodex.worker_runtime.worker_runtime_coordinator import (
+    WorkerRuntimeCoordinator,
 )
 from chattocodex.worker_runtime.worker_runtime_presence_tracker import (
     WorkerRuntimePresenceTracker,
@@ -208,8 +210,8 @@ def _build_runtime_boundaries(
         wake_target_service=wake_target_service,
         lock_registry=lock_registry,
     )
-    consumer_group_coordinator = ConsumerGroupCoordinator(
-        state_store=ConsumerGroupStateStore(state_root=execution_root),
+    worker_runtime_coordinator = WorkerRuntimeCoordinator(
+        state_store=WorkerRuntimeGroupStateStore(state_root=execution_root),
         wake_target_repository=wake_target_repository,
         wake_presence_service=wake_presence_service,
         runtime_presence_tracker=runtime_presence_tracker,
@@ -220,8 +222,8 @@ def _build_runtime_boundaries(
         pending_provisioning_count=worker_provisioning_service.pending_provisioning_count,
         on_capacity_decision=worker_provisioning_service.on_capacity_decision,
     )
-    worker_provisioning_service.attach_consumer_group_coordinator(
-        consumer_group_coordinator
+    worker_provisioning_service.attach_worker_runtime_coordinator(
+        worker_runtime_coordinator
     )
     wake_service = WakeControlService(
         runtime_config_repository=runtime_config_repository,
@@ -230,7 +232,7 @@ def _build_runtime_boundaries(
         runtime_presence_tracker=runtime_presence_tracker,
         ready_capacity_projection=ready_capacity_projection,
         assignment_lease_reconciler=assignment_lease_reconciler,
-        consumer_group_coordinator=consumer_group_coordinator,
+        worker_runtime_coordinator=worker_runtime_coordinator,
         worker_provisioning_service=worker_provisioning_service,
         lock_registry=lock_registry,
     )

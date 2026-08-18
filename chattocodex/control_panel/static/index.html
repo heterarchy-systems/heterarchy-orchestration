@@ -95,9 +95,9 @@
               <small id="database-runtime-detail">PostgreSQL read model</small>
             </div>
             <div class="runtime-cell">
-              <span>Consumer groups</span>
+              <span>Runtime groups</span>
               <strong id="group-total-value">0</strong>
-              <small>Project-scoped groups</small>
+              <small>Orchestration topology</small>
             </div>
             <div class="runtime-cell">
               <span>Workers</span>
@@ -174,7 +174,7 @@
           <div class="section-intro">
             <div>
               <h2>Shared Broker Cluster</h2>
-              <p>Projects are broker namespaces. Consumer Groups are coordinated independently from provider runtimes, so the same Broker can route work across GPT, CLI, or future agent adapters.</p>
+              <p>Consumer Groups are Broker-authoritative Agent Companies. Provider runtimes remain an orchestration concern, so GPT, CLI, and future agents can participate without changing Broker identity semantics.</p>
             </div>
           </div>
           <div id="broker-summary" class="broker-summary-grid"></div>
@@ -196,16 +196,16 @@
 
           <div class="section-intro compact broker-subsection-heading">
             <div>
-              <h2>Group coordinators</h2>
-              <p>Stable logical coordinator ownership. Today's embedded node owns every group; the directory already supports multiple broker nodes.</p>
+              <h2>Consumer groups</h2>
+              <p>Authoritative Broker groups managed by the Broker-side GroupCoordinator.</p>
             </div>
           </div>
           <div class="table-shell">
             <table>
               <thead>
-                <tr><th>Consumer group</th><th>Project</th><th>Coordinator</th><th>Generation</th><th>Members</th></tr>
+                <tr><th>Consumer group</th><th>Namespace</th><th>Generation</th><th>Revision</th><th>Consumers</th></tr>
               </thead>
-              <tbody id="broker-coordinator-body"></tbody>
+              <tbody id="broker-group-body"></tbody>
             </table>
           </div>
         </section>
@@ -213,8 +213,8 @@
         <section class="page-section" data-section="workers">
           <div class="section-intro">
             <div>
-              <h2>Consumer groups & workers</h2>
-              <p>Read the pool like a Kafka consumer group: membership first, then current Worker state.</p>
+              <h2>Worker runtimes</h2>
+              <p>Orchestration-owned runtime topology: reusable Worker targets, wake state, and capacity. Broker Consumer Group authority is shown separately.</p>
             </div>
           </div>
           <div id="worker-groups" class="worker-groups"></div>

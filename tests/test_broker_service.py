@@ -28,6 +28,7 @@ from chattocodex.persistence.orchestration_state_repository import (
     WorkerStateRepository,
 )
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from tests.broker_support import FakeWorkBrokerGateway
 
 
 class _Runtime:
@@ -63,6 +64,7 @@ class _Runtime:
         self.task_repository = TaskStateRepository(state_root=self.state_root)
         self.broker_task_repository = BrokerTaskRepository(state_root=self.state_root)
         self.slot_repository = WorkerSlotRepository(state_root=self.state_root)
+        self.work_broker_gateway = FakeWorkBrokerGateway()
         locks = EntityLockRegistry()
         self.run_service = RunOrchestrationService(
             run_repository=self.run_repository,
@@ -76,6 +78,7 @@ class _Runtime:
             lock_registry=locks,
         )
         self.broker_service = BrokerService(
+            work_broker_gateway=self.work_broker_gateway,
             run_repository=self.run_repository,
             worker_repository=self.worker_repository,
             task_repository=self.task_repository,
@@ -105,7 +108,7 @@ def _complete_assignment(runtime: _Runtime, *, assignment) -> None:
     )
 
 
-def test_generic_slot_reuses_same_physical_consumer_for_dynamic_roles(
+def test_generic_slot_reuses_same_logical_broker_consumer_for_dynamic_roles(
     tmp_path: Path,
 ) -> None:
     runtime = _Runtime(tmp_path=tmp_path)
@@ -132,6 +135,14 @@ def test_generic_slot_reuses_same_physical_consumer_for_dynamic_roles(
     assert assignment_one.worker.status is WorkerStatus.ACTIVE
     assert assignment_one.task.status is TaskStatus.IN_PROGRESS
     assert assignment_one.slot.status is WorkerSlotStatus.BUSY
+    assert created_slot.state.broker_consumer_id != created_slot.state.slot_id
+    assert (
+        runtime.work_broker_gateway.lease_member_id(
+            run_id=run.state.run_id,
+            task_id=first.broker_task_id,
+        )
+        == created_slot.state.broker_consumer_id
+    )
 
     _complete_assignment(runtime, assignment=assignment_one)
     released_one = runtime.broker_service.finish_assignment(
@@ -155,6 +166,11 @@ def test_generic_slot_reuses_same_physical_consumer_for_dynamic_roles(
     assert assignment_two is not None
     assert assignment_two.broker_task.broker_task_id == second.broker_task_id
     assert assignment_two.slot.slot_id == assignment_one.slot.slot_id
+    assert (
+        assignment_two.slot.broker_consumer_id
+        == assignment_one.slot.broker_consumer_id
+        == created_slot.state.broker_consumer_id
+    )
     assert assignment_two.worker.worker_id != assignment_one.worker.worker_id
     assert assignment_two.worker.role == "backend"
 
@@ -545,6 +561,10 @@ def test_recover_abandoned_assignment_requeues_nonterminal_work(tmp_path: Path) 
     assert broker_task.assigned_worker_id is None
     assert broker_task.assigned_task_id is None
     assert recovered_slot.status is WorkerSlotStatus.IDLE
+    runtime.work_broker_gateway.expire_task(
+        run_id=run.state.run_id,
+        task_id=published.broker_task_id,
+    )
 
     replacement_slot = runtime.broker_service.register_slot(
         project_id=runtime.project_id,
@@ -640,6 +660,10 @@ def test_recover_abandoned_assignment_converges_after_partial_write_failure(
     assert recovered_broker_task.assigned_worker_id is None
     assert recovered_broker_task.assigned_task_id is None
     assert recovered_slot.status is WorkerSlotStatus.IDLE
+    runtime.work_broker_gateway.expire_task(
+        run_id=run.state.run_id,
+        task_id=published.broker_task_id,
+    )
 
     replacement_slot = runtime.broker_service.register_slot(
         project_id=runtime.project_id,

@@ -17,6 +17,7 @@ from chattocodex.broker.broker_dto import (
     WorkerSlotState,
     WorkerSlotStatus,
 )
+from chattocodex.broker_client.external_broker_gateway import WorkBrokerGateway
 from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
 from chattocodex.orchestration.orchestration_dto import (
     RunStatus,
@@ -49,6 +50,13 @@ from chattocodex.workspace.workspace_project_service import WorkspaceProjectServ
 
 
 class BrokerService:
+    """Coordinate orchestration projections with the external work Broker.
+
+    The historical class name is retained for compatibility. This service no
+    longer implements Broker authority: it owns Run/DAG readiness, Worker-slot
+    projection, and translation through `WorkBrokerGateway` only.
+    """
+
     def __init__(
         self,
         *,
@@ -57,6 +65,7 @@ class BrokerService:
         task_repository: TaskStateRepository,
         broker_task_repository: BrokerTaskRepository,
         slot_repository: WorkerSlotRepository,
+        work_broker_gateway: WorkBrokerGateway,
         workspace_project_service: WorkspaceProjectService,
         lock_registry: EntityLockRegistry,
         now_provider: Callable[[], datetime] | None = None,
@@ -66,6 +75,7 @@ class BrokerService:
         self._task_repository = task_repository
         self._broker_task_repository = broker_task_repository
         self._slot_repository = slot_repository
+        self._work_broker_gateway = work_broker_gateway
         self._workspace_project_service = workspace_project_service
         self._lock_registry = lock_registry
         self._now_provider = now_provider or _utc_now
@@ -86,6 +96,7 @@ class BrokerService:
                 schema_version=1,
                 slot_id=_new_slot_id(),
                 project_id=project.project_id,
+                broker_consumer_id=_new_broker_consumer_id(),
                 slot_handle_digest=digest_capability(slot_handle),
                 label=label,
                 status=WorkerSlotStatus.IDLE,
@@ -140,6 +151,7 @@ class BrokerService:
                     schema_version=slot.schema_version,
                     slot_id=slot.slot_id,
                     project_id=slot.project_id,
+                    broker_consumer_id=slot.broker_consumer_id,
                     slot_handle_digest=digest_capability(slot_handle),
                     label=slot.label,
                     status=slot.status,
@@ -206,7 +218,7 @@ class BrokerService:
                 )
 
         now = self._now_provider()
-        return self._broker_task_repository.create(
+        broker_task = self._broker_task_repository.create(
             state=BrokerTaskState(
                 schema_version=1,
                 broker_task_id=_new_broker_task_id(),
@@ -223,6 +235,7 @@ class BrokerService:
                 updated_at=now,
             )
         )
+        return self._publish_if_ready(broker_task=broker_task)
 
     def claim_task(
         self,
@@ -273,15 +286,37 @@ class BrokerService:
                 resource_id=slot.slot_id,
                 message="Worker Slot is already busy with an assignment.",
             )
-        broker_task = (
+        self._publish_ready_tasks(project_id=slot.project_id, run_id=run_id)
+        candidate = (
             self._next_ready_task(project_id=slot.project_id)
             if run_id is None
             else self._next_ready_task(project_id=slot.project_id, run_id=run_id)
         )
-        if broker_task is None:
+        if candidate is None:
             return None
+        target_run_id = candidate.run_id if run_id is None else run_id
+        claim = self._work_broker_gateway.claim_task(
+            project_id=slot.project_id,
+            run_id=target_run_id,
+            member_id=slot.broker_consumer_id,
+        )
+        if claim is None:
+            return None
+        broker_task = self._broker_task_repository.read(broker_task_id=claim.task_id)
+        if (
+            broker_task.run_id != target_run_id
+            or broker_task.status is not BrokerTaskStatus.QUEUED
+            or not broker_task.external_published
+            or not self._dependencies_completed(broker_task=broker_task)
+            or broker_task.objective != claim.objective
+        ):
+            raise InvalidTransitionError(
+                operation="worker_claim_task",
+                resource_id=claim.task_id,
+                message="External Broker claim does not match the local orchestration DAG projection.",
+            )
 
-        run = self._run_repository.read(run_id=broker_task.run_id)
+        run = self._run_repository.read(run_id=target_run_id)
         now = self._now_provider()
         worker_handle = new_worker_handle()
         worker = self._worker_repository.create(
@@ -327,6 +362,7 @@ class BrokerService:
                 revision=broker_task.revision + 1,
                 created_at=broker_task.created_at,
                 updated_at=now,
+                external_published=broker_task.external_published,
             )
         )
         busy_slot = self._slot_repository.write(
@@ -334,6 +370,7 @@ class BrokerService:
                 schema_version=slot.schema_version,
                 slot_id=slot.slot_id,
                 project_id=slot.project_id,
+                broker_consumer_id=slot.broker_consumer_id,
                 slot_handle_digest=slot.slot_handle_digest,
                 label=slot.label,
                 status=WorkerSlotStatus.BUSY,
@@ -344,6 +381,11 @@ class BrokerService:
                 revision=slot.revision + 1,
                 created_at=slot.created_at,
                 updated_at=now,
+                broker_term=claim.term,
+                broker_group_generation=claim.generation,
+                broker_lease_id=claim.lease_id,
+                broker_lease_epoch=claim.lease_epoch,
+                broker_lease_expires_at_ms=claim.lease_expires_at_ms,
             )
         )
         return BrokerAssignment(
@@ -469,6 +511,7 @@ class BrokerService:
                 if task.status is TaskStatus.COMPLETED
                 else BrokerTaskStatus.FAILED
             )
+            self._complete_external_assignment(slot=slot, task=task)
             finished_task = self._broker_task_repository.write(
                 state=BrokerTaskState(
                     schema_version=broker_task.schema_version,
@@ -484,6 +527,7 @@ class BrokerService:
                     revision=broker_task.revision + 1,
                     created_at=broker_task.created_at,
                     updated_at=now,
+                    external_published=broker_task.external_published,
                 )
             )
             idle_slot = self._slot_repository.write(
@@ -491,6 +535,7 @@ class BrokerService:
                     schema_version=slot.schema_version,
                     slot_id=slot.slot_id,
                     project_id=slot.project_id,
+                    broker_consumer_id=slot.broker_consumer_id,
                     slot_handle_digest=slot.slot_handle_digest,
                     label=slot.label,
                     status=WorkerSlotStatus.IDLE,
@@ -503,6 +548,11 @@ class BrokerService:
                     updated_at=now,
                 )
             )
+            if broker_status is BrokerTaskStatus.COMPLETED:
+                self._publish_ready_tasks(
+                    project_id=slot.project_id,
+                    run_id=broker_task.run_id,
+                )
             return FinishedAssignment(
                 broker_task=finished_task,
                 slot=idle_slot,
@@ -591,7 +641,7 @@ class BrokerService:
             (
                 task
                 for task in self._broker_task_repository.list_all()
-                if task.status is BrokerTaskStatus.QUEUED
+                if task.status is BrokerTaskStatus.QUEUED and task.external_published
             ),
             key=lambda task: (task.created_at, task.broker_task_id),
         )
@@ -652,6 +702,7 @@ class BrokerService:
                 run_id=slot.current_run_id,
                 worker_id=slot.current_worker_id,
             )
+            renewed_slot = self._renew_external_assignment(slot=slot)
             worker_handle = new_worker_handle()
             now = self._now_provider()
             refreshed_worker = self._worker_repository.write(
@@ -669,7 +720,7 @@ class BrokerService:
             )
             return BrokerAssignment(
                 broker_task=broker_task,
-                slot=slot,
+                slot=renewed_slot,
                 run=run,
                 worker=refreshed_worker,
                 task=task,
@@ -681,6 +732,154 @@ class BrokerService:
             self._broker_task_repository.read(broker_task_id=dependency_id).status
             is BrokerTaskStatus.COMPLETED
             for dependency_id in broker_task.depends_on
+        )
+
+    def renew_assignment_lease(self, *, slot_id: str) -> WorkerSlotState:
+        with self._lock_registry.hold(entity_key=f"broker:slot:{slot_id}"):
+            slot = self._slot_repository.read(slot_id=slot_id)
+            if slot.status is not WorkerSlotStatus.BUSY:
+                return slot
+            return self._renew_external_assignment(slot=slot)
+
+    def _publish_ready_tasks(
+        self,
+        *,
+        project_id: str,
+        run_id: str | None,
+    ) -> None:
+        for broker_task in sorted(
+            self._broker_task_repository.list_all(),
+            key=lambda task: (task.created_at, task.broker_task_id),
+        ):
+            if broker_task.status is not BrokerTaskStatus.QUEUED:
+                continue
+            if run_id is not None and broker_task.run_id != run_id:
+                continue
+            run = self._run_repository.read(run_id=broker_task.run_id)
+            if run.project_id != project_id or run.status is not RunStatus.ACTIVE:
+                continue
+            self._publish_if_ready(broker_task=broker_task)
+
+    def _publish_if_ready(self, *, broker_task: BrokerTaskState) -> BrokerTaskState:
+        if (
+            broker_task.status is not BrokerTaskStatus.QUEUED
+            or broker_task.external_published
+            or not self._dependencies_completed(broker_task=broker_task)
+        ):
+            return broker_task
+        run = self._run_repository.read(run_id=broker_task.run_id)
+        if run.status is not RunStatus.ACTIVE:
+            return broker_task
+        self._work_broker_gateway.publish_task(
+            project_id=run.project_id,
+            run_id=run.run_id,
+            task_id=broker_task.broker_task_id,
+            objective=broker_task.objective,
+        )
+        now = self._now_provider()
+        return self._broker_task_repository.write(
+            state=BrokerTaskState(
+                schema_version=broker_task.schema_version,
+                broker_task_id=broker_task.broker_task_id,
+                run_id=broker_task.run_id,
+                objective=broker_task.objective,
+                role=broker_task.role,
+                depends_on=broker_task.depends_on,
+                status=broker_task.status,
+                assigned_slot_id=broker_task.assigned_slot_id,
+                assigned_worker_id=broker_task.assigned_worker_id,
+                assigned_task_id=broker_task.assigned_task_id,
+                revision=broker_task.revision + 1,
+                created_at=broker_task.created_at,
+                updated_at=now,
+                external_published=True,
+            )
+        )
+
+    def _renew_external_assignment(self, *, slot: WorkerSlotState) -> WorkerSlotState:
+        task_id, run_id, term, generation, lease_id, lease_epoch = (
+            self._require_external_lease(slot=slot)
+        )
+        renewed = self._work_broker_gateway.renew_task(
+            project_id=slot.project_id,
+            run_id=run_id,
+            member_id=slot.broker_consumer_id,
+            task_id=task_id,
+            term=term,
+            generation=generation,
+            lease_id=lease_id,
+            lease_epoch=lease_epoch,
+        )
+        return self._slot_repository.write(
+            state=WorkerSlotState(
+                schema_version=slot.schema_version,
+                slot_id=slot.slot_id,
+                project_id=slot.project_id,
+                broker_consumer_id=slot.broker_consumer_id,
+                slot_handle_digest=slot.slot_handle_digest,
+                label=slot.label,
+                status=slot.status,
+                current_broker_task_id=slot.current_broker_task_id,
+                current_run_id=slot.current_run_id,
+                current_worker_id=slot.current_worker_id,
+                current_task_id=slot.current_task_id,
+                revision=slot.revision + 1,
+                created_at=slot.created_at,
+                updated_at=self._now_provider(),
+                broker_term=renewed.term,
+                broker_group_generation=renewed.generation,
+                broker_lease_id=renewed.lease_id,
+                broker_lease_epoch=renewed.lease_epoch,
+                broker_lease_expires_at_ms=renewed.lease_expires_at_ms,
+            )
+        )
+
+    def _complete_external_assignment(
+        self,
+        *,
+        slot: WorkerSlotState,
+        task: TaskState,
+    ) -> None:
+        task_id, run_id, term, generation, lease_id, lease_epoch = (
+            self._require_external_lease(slot=slot)
+        )
+        result = task.result or task.progress_summary or task.status.value
+        self._work_broker_gateway.complete_task(
+            project_id=slot.project_id,
+            run_id=run_id,
+            member_id=slot.broker_consumer_id,
+            task_id=task_id,
+            term=term,
+            generation=generation,
+            lease_id=lease_id,
+            lease_epoch=lease_epoch,
+            result=result,
+        )
+
+    @staticmethod
+    def _require_external_lease(
+        *, slot: WorkerSlotState
+    ) -> tuple[str, str, int, int, str, int]:
+        if (
+            slot.current_broker_task_id is None
+            or slot.current_run_id is None
+            or slot.broker_term is None
+            or slot.broker_group_generation is None
+            or slot.broker_lease_id is None
+            or slot.broker_lease_epoch is None
+        ):
+            raise InvalidTransitionError(
+                operation="external_broker_lease",
+                resource_id=slot.slot_id,
+                message="Busy Worker Slot is missing external Broker lease metadata.",
+            )
+        return (
+            slot.current_broker_task_id,
+            slot.current_run_id,
+            slot.broker_term,
+            slot.broker_group_generation,
+            slot.broker_lease_id,
+            slot.broker_lease_epoch,
         )
 
     def _require_slot_capability(
@@ -707,6 +906,10 @@ def _new_broker_task_id() -> str:
 
 def _new_slot_id() -> str:
     return f"slot_{uuid4().hex[:24]}"
+
+
+def _new_broker_consumer_id() -> str:
+    return f"consumer_{uuid4().hex[:24]}"
 
 
 def _new_slot_handle() -> str:

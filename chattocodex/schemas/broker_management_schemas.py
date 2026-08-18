@@ -1,25 +1,14 @@
 from pydantic import Field
 
-from chattocodex.broker.broker_management_dto import (
-    BrokerClusterTopology,
-    BrokerNodeRole,
-    BrokerNodeStatus,
-)
 from chattocodex.schemas.control_panel_schemas import ControlPanelBoundaryModel
 
 
-class BrokerNodeOperationsView(ControlPanelBoundaryModel):
-    node_id: str
-    roles: tuple[BrokerNodeRole, ...]
-    status: BrokerNodeStatus
-
-
-class GroupCoordinatorOperationsView(ControlPanelBoundaryModel):
+class BrokerConsumerGroupOperationsView(ControlPanelBoundaryModel):
     group_id: str
-    project_id: str
-    coordinator_node_id: str
-    generation: int = Field(ge=0)
-    member_count: int = Field(ge=0)
+    namespace_id: str
+    generation: int = Field(ge=1)
+    group_revision: int = Field(ge=1)
+    consumer_count: int = Field(ge=0)
 
 
 class BrokerNamespaceOperationsView(ControlPanelBoundaryModel):
@@ -31,16 +20,13 @@ class BrokerNamespaceOperationsView(ControlPanelBoundaryModel):
     failed_count: int = Field(ge=0)
     idle_slot_count: int = Field(ge=0)
     busy_slot_count: int = Field(ge=0)
-    consumer_group_count: int = Field(ge=0)
 
 
-class BrokerClusterOperationsView(ControlPanelBoundaryModel):
-    cluster_id: str
-    topology: BrokerClusterTopology
-    controller_node_id: str
-    nodes: tuple[BrokerNodeOperationsView, ...]
+class BrokerOperationsView(ControlPanelBoundaryModel):
+    term: int = Field(ge=1)
+    revision: int = Field(ge=0)
     namespaces: tuple[BrokerNamespaceOperationsView, ...]
-    group_coordinators: tuple[GroupCoordinatorOperationsView, ...]
+    consumer_groups: tuple[BrokerConsumerGroupOperationsView, ...]
     queued_count: int = Field(ge=0)
     ready_count: int = Field(ge=0)
     claimed_count: int = Field(ge=0)

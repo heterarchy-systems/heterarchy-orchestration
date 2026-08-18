@@ -9,7 +9,6 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
-from chattocodex.consumer_group.consumer_group_state import ConsumerGroupState
 from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
 from chattocodex.orchestration.orchestration_exceptions import (
     OrchestrationError,
@@ -50,16 +49,19 @@ from chattocodex.provisioning.provisioning_state_sync import (
 )
 from chattocodex.schemas.project_binding_schemas import ProjectBindingAdapterMetadata
 from chattocodex.wake.wake_target_service import WakeTargetService
+from chattocodex.worker_runtime.worker_runtime_group_state import (
+    WorkerRuntimeGroupState,
+)
 
 if TYPE_CHECKING:
-    from chattocodex.consumer_group.capacity_decision import CapacityDecision
+    from chattocodex.worker_runtime.capacity_decision import CapacityDecision
 
 
 class ConsumerGroupMembershipCoordinator(Protocol):
-    """Minimal membership seam used after automatic wake-target registration."""
+    """Minimal runtime-topology seam used after automatic wake-target registration."""
 
-    def reconcile_membership(self, *, project_id: str) -> ConsumerGroupState:
-        """Reconcile and return the canonical project's Consumer Group state."""
+    def reconcile_runtime_topology(self, *, project_id: str) -> WorkerRuntimeGroupState:
+        """Reconcile and return the project's recoverable Worker runtime topology."""
 
     def reconcile_project(self, *, project_id: str) -> object:
         """Reconcile READY capacity after a new recoverable member appears."""
@@ -84,7 +86,7 @@ class WorkerProvisioningService:
         repository: WorkerProvisioningRepository,
         project_binding_service: ProjectBindingService | None = None,
         wake_target_service: WakeTargetService | None = None,
-        consumer_group_coordinator: ConsumerGroupMembershipCoordinator | None = None,
+        worker_runtime_coordinator: ConsumerGroupMembershipCoordinator | None = None,
         lock_registry: EntityLockRegistry | None = None,
         now_provider: Callable[[], datetime] | None = None,
         minimum_admission_interval: timedelta = timedelta(seconds=12),
@@ -102,7 +104,7 @@ class WorkerProvisioningService:
             repository: Atomic filesystem provisioning state repository.
             project_binding_service: Canonical local project binding authority.
             wake_target_service: Runtime target registration boundary.
-            consumer_group_coordinator: Membership confirmation boundary.
+            worker_runtime_coordinator: Runtime-topology confirmation boundary.
             lock_registry: Optional in-process scheduler lock registry.
             now_provider: Time provider used by tests and rate-limit policy.
             minimum_admission_interval: Minimum interval between browser admissions.
@@ -127,7 +129,7 @@ class WorkerProvisioningService:
         self._repository = repository
         self._project_binding_service = project_binding_service
         self._wake_target_service = wake_target_service
-        self._consumer_group_coordinator = consumer_group_coordinator
+        self._worker_runtime_coordinator = worker_runtime_coordinator
         self._lock_registry = lock_registry or EntityLockRegistry()
         self._now_provider = now_provider or _utc_now
         self._minimum_admission_interval = minimum_admission_interval
@@ -146,19 +148,19 @@ class WorkerProvisioningService:
                 )
             )
 
-    def attach_consumer_group_coordinator(
+    def attach_worker_runtime_coordinator(
         self, coordinator: ConsumerGroupMembershipCoordinator
     ) -> None:
-        """Attach the membership confirmer after coordinator construction.
+        """Attach the runtime-topology coordinator after construction.
 
-        The Control Panel constructs provisioning before the Consumer Group to let
-        the coordinator receive the non-reentrant capacity callbacks. Registration
+        The Control Panel constructs provisioning before the Worker runtime coordinator so
+        the coordinator can receive non-reentrant capacity callbacks. Registration
         callbacks use this one-way attachment only after construction is complete.
 
         Args:
-            coordinator: Canonical Consumer Group membership coordinator.
+            coordinator: Canonical Worker runtime coordinator.
         """
-        self._consumer_group_coordinator = coordinator
+        self._worker_runtime_coordinator = coordinator
 
     def pending_provisioning_count(self, project_id: str | None = None) -> int:
         """Return outstanding reservations for the capacity reconciliation seam.
@@ -224,11 +226,11 @@ class WorkerProvisioningService:
     def on_capacity_decision(self, decision: CapacityDecision) -> None:
         """Atomically reserve the remaining deficit from capacity_core.
 
-        This callback is synchronous and never re-enters Consumer Group
+        This callback is synchronous and never re-enters Worker runtime
         reconciliation. The caller owns scheduler locks while invoking it.
 
         Args:
-            decision: Immutable capacity decision from the Consumer Group seam.
+            decision: Immutable capacity decision from the Worker runtime seam.
 
         Raises:
             ValueError: If the decision contains invalid capacity values.
@@ -512,7 +514,7 @@ class WorkerProvisioningService:
         admission_revision: int,
         adapter_metadata: ProjectBindingAdapterMetadata | None = None,
     ) -> ProvisioningRequestState:
-        """Register a persistent Worker target and confirm group membership.
+        """Register a persistent Worker target and confirm runtime topology.
 
         Args:
             request_id: Opaque admitted request identifier.
@@ -526,7 +528,7 @@ class WorkerProvisioningService:
 
         Raises:
             ProvisioningStaleCallbackError: If admission or binding revision is stale.
-            ProvisioningConflictError: If identities or membership conflict.
+            ProvisioningConflictError: If identities or runtime topology conflict.
             OrchestrationError: If the wake boundary rejects registration.
         """
         if not conversation_id.strip():
@@ -575,15 +577,17 @@ class WorkerProvisioningService:
         else:
             provisional_target = None
         try:
-            if self._consumer_group_coordinator is not None:
-                membership = self._consumer_group_coordinator.reconcile_membership(
-                    project_id=initial_request.project_id
+            if self._worker_runtime_coordinator is not None:
+                runtime_topology = (
+                    self._worker_runtime_coordinator.reconcile_runtime_topology(
+                        project_id=initial_request.project_id
+                    )
                 )
-                if wake_target_id not in membership.member_ids:
+                if wake_target_id not in runtime_topology.wake_target_ids:
                     raise ProvisioningConflictError(
                         request_id=request_id,
                         message=(
-                            "Registered Worker is not a recoverable Consumer Group member yet."
+                            "Registered Worker is not part of the recoverable runtime topology yet."
                         ),
                     )
             current_binding = self._binding_for(project_id=initial_request.project_id)
@@ -602,9 +606,9 @@ class WorkerProvisioningService:
                     target=provisional_target
                 )
             reason = (
-                "registration_membership_confirmation_failed"
-                if self._consumer_group_coordinator is not None
-                and "recoverable Consumer Group member" in error.message
+                "registration_runtime_topology_confirmation_failed"
+                if self._worker_runtime_coordinator is not None
+                and "recoverable runtime topology" in error.message
                 else "project_binding_changed_during_registration"
             )
             self._cancel_registration_failure(
@@ -682,8 +686,8 @@ class WorkerProvisioningService:
 
         persisted = self._repository.update(updater=register)
         result = _require_request(state=persisted, request_id=request_id)
-        if self._consumer_group_coordinator is not None:
-            self._consumer_group_coordinator.reconcile_project(
+        if self._worker_runtime_coordinator is not None:
+            self._worker_runtime_coordinator.reconcile_project(
                 project_id=initial_request.project_id
             )
         return result
@@ -1121,16 +1125,18 @@ class WorkerProvisioningService:
                             "project."
                         ),
                     )
-            if self._consumer_group_coordinator is not None:
-                membership = self._consumer_group_coordinator.reconcile_membership(
-                    project_id=request.project_id
+            if self._worker_runtime_coordinator is not None:
+                runtime_topology = (
+                    self._worker_runtime_coordinator.reconcile_runtime_topology(
+                        project_id=request.project_id
+                    )
                 )
-                if request.wake_target_id not in membership.member_ids:
+                if request.wake_target_id not in runtime_topology.wake_target_ids:
                     raise ProvisioningConflictError(
                         request_id=request.request_id,
                         message=(
                             "Active registration is no longer a recoverable Consumer "
-                            "Group member."
+                            "runtime topology."
                         ),
                     )
         except OrchestrationError as error:

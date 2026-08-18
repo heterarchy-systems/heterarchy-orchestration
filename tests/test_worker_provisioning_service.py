@@ -6,8 +6,6 @@ from typing import cast
 
 import pytest
 
-from chattocodex.consumer_group.capacity_decision import CapacityDecision
-from chattocodex.consumer_group.consumer_group_state import ConsumerGroupState
 from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
 from chattocodex.orchestration.orchestration_exceptions import (
     OrchestrationError,
@@ -29,6 +27,10 @@ from chattocodex.provisioning.worker_provisioning_service import (
 )
 from chattocodex.schemas.project_binding_schemas import ProjectBindingAdapterMetadata
 from chattocodex.wake.wake_target_service import WakeTargetService
+from chattocodex.worker_runtime.capacity_decision import CapacityDecision
+from chattocodex.worker_runtime.worker_runtime_group_state import (
+    WorkerRuntimeGroupState,
+)
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
 
 
@@ -38,14 +40,14 @@ class _MembershipCoordinator:
         self.membership_calls = 0
         self.project_calls = 0
 
-    def reconcile_membership(self, *, project_id: str) -> ConsumerGroupState:
+    def reconcile_runtime_topology(self, *, project_id: str) -> WorkerRuntimeGroupState:
         self.membership_calls += 1
         now = datetime.now(UTC)
-        return ConsumerGroupState(
+        return WorkerRuntimeGroupState(
             schema_version=1,
             project_id=project_id,
-            generation=1,
-            member_ids=(self.wake_target_id,),
+            topology_generation=1,
+            wake_target_ids=(self.wake_target_id,),
             revision=0,
             created_at=now,
             updated_at=now,
@@ -898,11 +900,11 @@ def test_registration_missing_binding_after_side_effect_cancels_exact_request(
     assert cleaned_targets == [(admitted.wake_target_id, project_id)]
 
 
-def test_membership_failure_compensates_target_before_registration_retry(
+def test_runtime_topology_failure_compensates_target_before_registration_retry(
     tmp_path: Path,
 ) -> None:
-    membership_started = Event()
-    release_membership = Event()
+    topology_started = Event()
+    release_topology = Event()
 
     class TrackingWakeTargetService:
         def __init__(self) -> None:
@@ -933,17 +935,19 @@ def test_membership_failure_compensates_target_before_registration_retry(
             self.accept = False
             self.calls = 0
 
-        def reconcile_membership(self, *, project_id: str) -> ConsumerGroupState:
+        def reconcile_runtime_topology(
+            self, *, project_id: str
+        ) -> WorkerRuntimeGroupState:
             self.calls += 1
             if self.calls == 1:
-                membership_started.set()
-                assert release_membership.wait(timeout=2)
+                topology_started.set()
+                assert release_topology.wait(timeout=2)
             now = datetime.now(UTC)
-            return ConsumerGroupState(
+            return WorkerRuntimeGroupState(
                 schema_version=1,
                 project_id=project_id,
-                generation=self.calls,
-                member_ids=(self.target_id,) if self.accept else (),
+                topology_generation=self.calls,
+                wake_target_ids=(self.target_id,) if self.accept else (),
                 revision=self.calls - 1,
                 created_at=now,
                 updated_at=now,
@@ -961,7 +965,7 @@ def test_membership_failure_compensates_target_before_registration_retry(
     admitted = service.admit_next()
     assert admitted is not None
     coordinator = RacingMembershipCoordinator(target_id=admitted.wake_target_id or "")
-    service.attach_consumer_group_coordinator(coordinator)
+    service.attach_worker_runtime_coordinator(coordinator)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         registration = pool.submit(
@@ -971,15 +975,15 @@ def test_membership_failure_compensates_target_before_registration_retry(
             wake_target_id=admitted.wake_target_id or "",
             admission_revision=admitted.admission_revision or 0,
         )
-        assert membership_started.wait(timeout=2)
+        assert topology_started.wait(timeout=2)
         assert len(wake_service.targets) == 1
-        release_membership.set()
+        release_topology.set()
         with pytest.raises(ProvisioningConflictError):
             registration.result(timeout=2)
 
     failed = repository.read_request(request_id=admitted.request_id)
     assert failed.status is ProvisioningRequestStatus.CANCELLED
-    assert failed.failure_reason == "registration_membership_confirmation_failed"
+    assert failed.failure_reason == "registration_runtime_topology_confirmation_failed"
     assert repository.read_admission().in_flight_request_id is None
     assert wake_service.targets == set()
 
@@ -1068,7 +1072,7 @@ def test_exact_duplicate_registration_revalidates_membership_without_capacity_re
     admitted = service.admit_next()
     assert admitted is not None
     coordinator = _MembershipCoordinator(wake_target_id=admitted.wake_target_id or "")
-    service.attach_consumer_group_coordinator(coordinator)
+    service.attach_worker_runtime_coordinator(coordinator)
 
     first = service.register_callback(
         request_id=admitted.request_id,
@@ -1153,7 +1157,9 @@ def test_registration_membership_callback_can_publish_capacity_without_deadlock(
     assert admitted is not None
 
     class ReentrantCoordinator(_MembershipCoordinator):
-        def reconcile_membership(self, *, project_id: str) -> ConsumerGroupState:
+        def reconcile_runtime_topology(
+            self, *, project_id: str
+        ) -> WorkerRuntimeGroupState:
             service.on_capacity_decision(
                 _decision(
                     project_id=project_id,
@@ -1162,9 +1168,9 @@ def test_registration_membership_callback_can_publish_capacity_without_deadlock(
                     global_pending=1,
                 )
             )
-            return super().reconcile_membership(project_id=project_id)
+            return super().reconcile_runtime_topology(project_id=project_id)
 
-    service.attach_consumer_group_coordinator(
+    service.attach_worker_runtime_coordinator(
         ReentrantCoordinator(wake_target_id=admitted.wake_target_id or "")
     )
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -1214,7 +1220,7 @@ def test_concurrent_registration_and_capacity_reconciliation_do_not_duplicate(
     admitted = service.admit_next()
     assert admitted is not None
     coordinator = _MembershipCoordinator(wake_target_id=admitted.wake_target_id or "")
-    service.attach_consumer_group_coordinator(coordinator)
+    service.attach_worker_runtime_coordinator(coordinator)
 
     def reconcile_capacity() -> None:
         try:

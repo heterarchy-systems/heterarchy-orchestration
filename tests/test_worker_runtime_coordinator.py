@@ -11,10 +11,6 @@ from chattocodex.broker.abandoned_assignment_recovery import (
 )
 from chattocodex.broker.broker_dto import BrokerTaskStatus, WorkerSlotStatus
 from chattocodex.broker.broker_service import BrokerService
-from chattocodex.consumer_group.capacity_decision import CapacityLimits
-from chattocodex.consumer_group.consumer_group_coordinator import (
-    ConsumerGroupCoordinator,
-)
 from chattocodex.facade.facade_service import ChatFacadeService
 from chattocodex.git.git_command_runner import GitCommandRunner
 from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
@@ -25,7 +21,6 @@ from chattocodex.persistence.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.consumer_group_state_store import ConsumerGroupStateStore
 from chattocodex.persistence.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
@@ -33,6 +28,9 @@ from chattocodex.persistence.orchestration_state_repository import (
 )
 from chattocodex.persistence.wake_presence_repository import WakePresenceRepository
 from chattocodex.persistence.wake_target_repository import WakeTargetRepository
+from chattocodex.persistence.worker_runtime_group_state_store import (
+    WorkerRuntimeGroupStateStore,
+)
 from chattocodex.persistence.worker_runtime_presence_store import (
     WorkerRuntimePresenceStore,
 )
@@ -42,13 +40,18 @@ from chattocodex.wake.wake_target_service import WakeTargetService
 from chattocodex.worker_runtime.broker_ready_capacity_projection import (
     BrokerReadyCapacityProjection,
 )
+from chattocodex.worker_runtime.capacity_decision import CapacityLimits
 from chattocodex.worker_runtime.worker_assignment_lease_reconciler import (
     WorkerAssignmentLeaseReconciler,
+)
+from chattocodex.worker_runtime.worker_runtime_coordinator import (
+    WorkerRuntimeCoordinator,
 )
 from chattocodex.worker_runtime.worker_runtime_presence_tracker import (
     WorkerRuntimePresenceTracker,
 )
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from tests.broker_support import FakeWorkBrokerGateway
 
 
 class _Clock:
@@ -96,6 +99,7 @@ class _Runtime:
         self.task_repository = TaskStateRepository(state_root=self.state_root)
         self.broker_task_repository = BrokerTaskRepository(state_root=self.state_root)
         self.slot_repository = WorkerSlotRepository(state_root=self.state_root)
+        self.work_broker_gateway = FakeWorkBrokerGateway()
         self.wake_target_repository = WakeTargetRepository(state_root=self.state_root)
         self.wake_presence_repository = WakePresenceRepository(
             state_root=self.state_root
@@ -106,6 +110,7 @@ class _Runtime:
             command_runner=GitCommandRunner(),
         )
         self.broker_service = BrokerService(
+            work_broker_gateway=self.work_broker_gateway,
             run_repository=self.run_repository,
             worker_repository=self.worker_repository,
             task_repository=self.task_repository,
@@ -140,12 +145,15 @@ class _Runtime:
                 lock_registry=self.locks,
                 now_provider=self.clock,
             ),
+            assignment_lease_renewer=lambda slot_id: (
+                self.broker_service.renew_assignment_lease(slot_id=slot_id)
+            ),
             wake_target_service=self.wake_service,
             lock_registry=self.locks,
             now_provider=self.clock,
         )
-        self.group = ConsumerGroupCoordinator(
-            state_store=ConsumerGroupStateStore(state_root=self.state_root),
+        self.group = WorkerRuntimeCoordinator(
+            state_store=WorkerRuntimeGroupStateStore(state_root=self.state_root),
             wake_target_repository=self.wake_target_repository,
             wake_presence_service=self.wake_presence,
             runtime_presence_tracker=self.runtime_presence,
@@ -163,7 +171,7 @@ class _Runtime:
             broker_service=self.broker_service,
             wake_target_service=self.wake_service,
             workspace_project_service=self.workspace,
-            consumer_group_coordinator=self.group,
+            worker_runtime_coordinator=self.group,
         )
 
     def register_target(self, number: int, *, runtime_heartbeat: bool = False) -> str:
@@ -208,8 +216,8 @@ class _Runtime:
         pending_provisioning_count=None,
         on_capacity_decision=None,
     ) -> None:
-        self.group = ConsumerGroupCoordinator(
-            state_store=ConsumerGroupStateStore(state_root=self.state_root),
+        self.group = WorkerRuntimeCoordinator(
+            state_store=WorkerRuntimeGroupStateStore(state_root=self.state_root),
             wake_target_repository=self.wake_target_repository,
             wake_presence_service=self.wake_presence,
             runtime_presence_tracker=self.runtime_presence,
@@ -230,44 +238,52 @@ class _Runtime:
             broker_service=self.broker_service,
             wake_target_service=self.wake_service,
             workspace_project_service=self.workspace,
-            consumer_group_coordinator=self.group,
+            worker_runtime_coordinator=self.group,
         )
 
 
-def test_generation_changes_only_when_recoverable_membership_changes(
+def test_topology_generation_changes_only_when_recoverable_runtime_targets_change(
     tmp_path: Path,
 ) -> None:
     runtime = _Runtime(tmp_path=tmp_path)
     target_a = runtime.register_target(1, runtime_heartbeat=True)
 
-    generation_one = runtime.group.reconcile_membership(project_id=runtime.project_id)
-    assert generation_one.generation == 1
-    assert generation_one.member_ids == (target_a,)
-
-    runtime.clock.advance(seconds=31)
-    dormant_same_generation = runtime.group.reconcile_membership(
+    generation_one = runtime.group.reconcile_runtime_topology(
         project_id=runtime.project_id
     )
-    assert dormant_same_generation.generation == 1
-    assert dormant_same_generation.member_ids == (target_a,)
+    assert generation_one.topology_generation == 1
+    assert generation_one.wake_target_ids == (target_a,)
+
+    runtime.clock.advance(seconds=31)
+    dormant_same_generation = runtime.group.reconcile_runtime_topology(
+        project_id=runtime.project_id
+    )
+    assert dormant_same_generation.topology_generation == 1
+    assert dormant_same_generation.wake_target_ids == (target_a,)
 
     target_b = runtime.register_target(2, runtime_heartbeat=True)
-    generation_two = runtime.group.reconcile_membership(project_id=runtime.project_id)
-    assert generation_two.generation == 2
-    assert generation_two.member_ids == (target_a, target_b)
+    generation_two = runtime.group.reconcile_runtime_topology(
+        project_id=runtime.project_id
+    )
+    assert generation_two.topology_generation == 2
+    assert generation_two.wake_target_ids == (target_a, target_b)
 
     runtime.clock.advance(seconds=45)
-    generation_three = runtime.group.reconcile_membership(project_id=runtime.project_id)
-    assert generation_three.generation == 3
-    assert generation_three.member_ids == (target_b,)
+    generation_three = runtime.group.reconcile_runtime_topology(
+        project_id=runtime.project_id
+    )
+    assert generation_three.topology_generation == 3
+    assert generation_three.wake_target_ids == (target_b,)
 
     runtime.runtime_presence.heartbeat(wake_target_id=target_a)
-    generation_four = runtime.group.reconcile_membership(project_id=runtime.project_id)
-    assert generation_four.generation == 4
-    assert generation_four.member_ids == (target_a, target_b)
+    generation_four = runtime.group.reconcile_runtime_topology(
+        project_id=runtime.project_id
+    )
+    assert generation_four.topology_generation == 4
+    assert generation_four.wake_target_ids == (target_a, target_b)
 
 
-def test_cooperative_rebalance_keeps_busy_assignment_sticky_when_member_joins(
+def test_runtime_topology_change_keeps_busy_assignment_sticky_when_target_joins(
     tmp_path: Path,
 ) -> None:
     runtime = _Runtime(tmp_path=tmp_path)
@@ -275,7 +291,7 @@ def test_cooperative_rebalance_keeps_busy_assignment_sticky_when_member_joins(
     _run, published = runtime.publish_tasks(count=2)
 
     initial = runtime.group.reconcile_project(project_id=runtime.project_id)
-    assert initial.group.generation == 1
+    assert initial.group.topology_generation == 1
     waking_a = runtime.wake_service.get_target(wake_target_id=target_a)
     assert waking_a.status is WakeTargetStatus.WAKING
 
@@ -294,8 +310,8 @@ def test_cooperative_rebalance_keeps_busy_assignment_sticky_when_member_joins(
     target_b = runtime.register_target(11, runtime_heartbeat=True)
     rebalanced = runtime.group.reconcile_project(project_id=runtime.project_id)
 
-    assert rebalanced.group.generation == 2
-    assert rebalanced.group.member_ids == (target_a, target_b)
+    assert rebalanced.group.topology_generation == 2
+    assert rebalanced.group.wake_target_ids == (target_a, target_b)
     still_claimed = runtime.broker_task_repository.read(
         broker_task_id=first_broker_task_id
     )
@@ -309,13 +325,13 @@ def test_cooperative_rebalance_keeps_busy_assignment_sticky_when_member_joins(
     assert target_b_state.status is WakeTargetStatus.WAKING
 
 
-def test_dead_busy_member_is_recovered_then_remaining_member_gets_requeued_work(
+def test_dead_busy_target_is_recovered_then_remaining_target_gets_requeued_work(
     tmp_path: Path,
 ) -> None:
     runtime = _Runtime(tmp_path=tmp_path)
     target_a = runtime.register_target(20)
     target_b = runtime.register_target(21)
-    _run, published = runtime.publish_tasks(count=1)
+    run, published = runtime.publish_tasks(count=1)
     runtime.group.reconcile_project(project_id=runtime.project_id)
     waking_a = runtime.wake_service.get_target(wake_target_id=target_a)
     assert waking_a.status is WakeTargetStatus.WAKING
@@ -333,10 +349,14 @@ def test_dead_busy_member_is_recovered_then_remaining_member_gets_requeued_work(
     runtime.clock.advance(seconds=60)
     runtime.runtime_presence.heartbeat(wake_target_id=target_b)
     runtime.clock.advance(seconds=61)
+    runtime.work_broker_gateway.expire_task(
+        run_id=run.state.run_id,
+        task_id=published[0].broker_task_id,
+    )
     recovered = runtime.group.reconcile_project(project_id=runtime.project_id)
 
-    assert recovered.group.member_ids == (target_b,)
-    assert recovered.group.generation == 2
+    assert recovered.group.wake_target_ids == (target_b,)
+    assert recovered.group.topology_generation == 2
     assert recovered.recovered_slot_ids == (first.slot.slot_id,)
     broker_task = runtime.broker_task_repository.read(
         broker_task_id=published[0].broker_task_id
@@ -362,19 +382,19 @@ def test_dead_busy_member_is_recovered_then_remaining_member_gets_requeued_work(
     assert replacement.assignment.task.task_id != first.assignment.task.task_id
 
 
-def test_offline_target_cannot_claim_current_group_generation(tmp_path: Path) -> None:
+def test_offline_target_cannot_claim_current_runtime_topology(tmp_path: Path) -> None:
     runtime = _Runtime(tmp_path=tmp_path)
     target = runtime.register_target(30)
-    first = runtime.group.reconcile_membership(project_id=runtime.project_id)
-    assert first.member_ids == (target,)
+    first = runtime.group.reconcile_runtime_topology(project_id=runtime.project_id)
+    assert first.wake_target_ids == (target,)
 
     runtime.clock.advance(seconds=31)
-    offline = runtime.group.reconcile_membership(project_id=runtime.project_id)
-    assert offline.member_ids == ()
-    assert offline.generation == 2
+    offline = runtime.group.reconcile_runtime_topology(project_id=runtime.project_id)
+    assert offline.wake_target_ids == ()
+    assert offline.topology_generation == 2
 
-    with pytest.raises(InvalidTransitionError, match="not a recoverable member"):
-        runtime.group.require_member(
+    with pytest.raises(InvalidTransitionError, match="recoverable runtime topology"):
+        runtime.group.require_wake_target(
             project_id=runtime.project_id,
             wake_target_id=target,
         )
@@ -526,6 +546,7 @@ def test_claimed_task_keeps_parallel_run_capacity_for_remaining_ready_task(
     runtime.publish_tasks(count=2, requested_parallelism=2)
 
     initial = runtime.group.reconcile_project(project_id=runtime.project_id)
+    assert initial.capacity_decision is not None
     assert initial.capacity_decision.desired_capacity == 2
     assert initial.capacity_decision.spawn_needed == 1
 
@@ -542,6 +563,7 @@ def test_claimed_task_keeps_parallel_run_capacity_for_remaining_ready_task(
 
     while_first_is_busy = runtime.group.reconcile_project(project_id=runtime.project_id)
 
+    assert while_first_is_busy.capacity_decision is not None
     assert while_first_is_busy.capacity_decision.ready_task_count == 1
     assert while_first_is_busy.capacity_decision.busy_consumer_count == 1
     assert while_first_is_busy.capacity_decision.desired_capacity == 2
@@ -733,7 +755,7 @@ def test_capacity_decision_never_uses_other_project_consumers_as_local_capacity(
 
     own = runtime.group.reconcile_project(project_id=runtime.project_id)
     assert own.capacity_decision is not None
-    assert own.group.member_ids == ()
+    assert own.group.wake_target_ids == ()
     assert own.capacity_decision.recoverable_consumer_count == 0
     assert own.capacity_decision.global_headroom == 0
     assert own.capacity_decision.spawn_needed == 0

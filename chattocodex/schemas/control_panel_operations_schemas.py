@@ -4,7 +4,7 @@ from typing import Literal
 from pydantic import Field
 
 from chattocodex.orchestration.orchestration_dto import RunStatus
-from chattocodex.schemas.broker_management_schemas import BrokerClusterOperationsView
+from chattocodex.schemas.broker_management_schemas import BrokerOperationsView
 from chattocodex.schemas.control_panel_schemas import ControlPanelBoundaryModel
 from chattocodex.wake.wake_dto import WakeTargetStatus
 from chattocodex.wake.worker_browser_runtime_dto import WorkerBrowserRuntimeMode
@@ -39,10 +39,10 @@ class ConsumerWorkerOperationsView(ControlPanelBoundaryModel):
     updated_at: datetime
 
 
-class ConsumerGroupOperationsView(ControlPanelBoundaryModel):
+class WorkerRuntimeGroupOperationsView(ControlPanelBoundaryModel):
     topology: Literal["project_default"] = "project_default"
     initialized: bool
-    generation: int = Field(ge=0)
+    topology_generation: int = Field(ge=0)
     revision: int = Field(ge=0)
     workers: tuple[ConsumerWorkerOperationsView, ...]
     idle: int = Field(ge=0)
@@ -56,7 +56,7 @@ class ProjectOperationsView(ControlPanelBoundaryModel):
     name: str
     root: str
     binding: ProviderBindingOperationsView | None
-    consumer_group: ConsumerGroupOperationsView
+    worker_runtime: WorkerRuntimeGroupOperationsView
     desired_capacity: int = Field(ge=0)
     spawn_needed: int = Field(ge=0)
     provisioning_pending: int = Field(ge=0)
@@ -74,7 +74,7 @@ class RecentRunOperationsView(ControlPanelBoundaryModel):
 
 class OperationsTotalsView(ControlPanelBoundaryModel):
     project_count: int = Field(ge=0)
-    consumer_group_count: int = Field(ge=0)
+    runtime_group_count: int = Field(ge=0)
     worker_count: int = Field(ge=0)
     idle: int = Field(ge=0)
     waking: int = Field(ge=0)
@@ -88,7 +88,7 @@ class ControlPanelOperationsResponse(ControlPanelBoundaryModel):
     ok: Literal[True] = True
     browser: WorkerBrowserOperationsView
     database: DatabaseOperationsView
-    broker: BrokerClusterOperationsView | None = None
+    broker: BrokerOperationsView | None = None
     totals: OperationsTotalsView
     projects: tuple[ProjectOperationsView, ...]
     recent_runs: tuple[RecentRunOperationsView, ...]

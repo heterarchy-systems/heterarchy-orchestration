@@ -23,6 +23,12 @@ class WorkerSlotStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class BrokerTaskState:
+    """Local orchestration projection for a task published to the external Broker.
+
+    DAG dependency readiness and Run mapping belong to orchestration. Claim, lease,
+    fencing, and completion authority belong to `herterarchy-broker`.
+    """
+
     schema_version: int
     broker_task_id: str
     run_id: str
@@ -36,13 +42,17 @@ class BrokerTaskState:
     revision: int
     created_at: datetime
     updated_at: datetime
+    external_published: bool = False
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WorkerSlotState:
+    """Physical Worker-slot projection plus the current external Broker lease."""
+
     schema_version: int
     slot_id: str
     project_id: str
+    broker_consumer_id: str
     slot_handle_digest: str
     label: str | None
     status: WorkerSlotStatus
@@ -53,6 +63,11 @@ class WorkerSlotState:
     revision: int
     created_at: datetime
     updated_at: datetime
+    broker_term: int | None = None
+    broker_group_generation: int | None = None
+    broker_lease_id: str | None = None
+    broker_lease_epoch: int | None = None
+    broker_lease_expires_at_ms: int | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

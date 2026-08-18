@@ -59,7 +59,7 @@ def _running_server(
     environment["CHATTOCODEX_WORKSPACE_ROOT"] = str(workspace_root)
     environment["CHATTOCODEX_PORT"] = str(port)
     process = subprocess.Popen(
-        [sys.executable, "-m", "chattocodex.mcp_server"],
+        [sys.executable, "-m", "tests.mcp_test_server"],
         env=environment,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

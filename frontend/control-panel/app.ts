@@ -21,10 +21,10 @@ const API = {
 };
 
 const SECTION_COPY = {
-  overview: ["Operations", "Project companies, broker namespaces, consumer groups, workers and current runs."],
+  overview: ["Operations", "Project companies, broker namespaces, Worker runtimes, consumers and current runs."],
   projects: ["Projects", "Bind local projects to their exact ChatGPT Project identity."],
-  broker: ["Broker", "Inspect the shared Broker Cluster, project namespaces and Group Coordinator ownership."],
-  workers: ["Workers", "Inspect project-scoped consumer groups and persistent Worker chats."],
+  broker: ["Broker", "Inspect Broker-authoritative Consumer Groups and project namespace pressure."],
+  workers: ["Workers", "Inspect orchestration-owned Worker runtime topology and persistent Worker chats."],
   runs: ["Runs", "Read recent orchestration activity without leaving the control plane."],
   settings: ["Settings", "Configure the local MCP runtime, profile and connection details."],
 };
@@ -130,12 +130,12 @@ function toneForRun(status) {
   return status === "active" ? "accent" : status === "completed" ? "success" : "neutral";
 }
 
-function workerStateSummary(group) {
+function workerStateSummary(runtime) {
   const values = [
-    ["idle", group.idle || 0],
-    ["waking", group.waking || 0],
-    ["claiming", group.claiming || 0],
-    ["busy", group.busy || 0],
+    ["idle", runtime.idle || 0],
+    ["waking", runtime.waking || 0],
+    ["claiming", runtime.claiming || 0],
+    ["busy", runtime.busy || 0],
   ];
   return values
     .map(
@@ -182,7 +182,7 @@ function renderStatus(status) {
 function renderOperations(operations) {
   state.operations = operations;
   const totals = operations?.totals || {
-    consumer_group_count: 0,
+    runtime_group_count: 0,
     worker_count: 0,
     idle: 0,
     waking: 0,
@@ -192,7 +192,7 @@ function renderOperations(operations) {
     active_runs: 0,
   };
 
-  q("#group-total-value").textContent = String(totals.consumer_group_count || 0);
+  q("#group-total-value").textContent = String(totals.runtime_group_count || 0);
   q("#worker-total-value").textContent = String(totals.worker_count || 0);
   q("#worker-total-detail").textContent = totals.worker_count
     ? `${totals.busy || 0} busy · ${totals.idle || 0} idle`
@@ -253,21 +253,18 @@ function renderOperations(operations) {
 function renderBroker(broker, projects) {
   const summary = q("#broker-summary");
   const namespaceBody = q("#broker-namespace-body");
-  const coordinatorBody = q("#broker-coordinator-body");
-  if (!summary || !namespaceBody || !coordinatorBody) return;
+  const groupBody = q("#broker-group-body");
+  if (!summary || !namespaceBody || !groupBody) return;
   if (!broker) {
     summary.innerHTML = emptyState("Broker metadata unavailable", "Refresh after the local runtime has initialized its broker management view.");
     namespaceBody.innerHTML = `<tr><td colspan="8" class="empty-table-cell">No broker namespace data.</td></tr>`;
-    coordinatorBody.innerHTML = `<tr><td colspan="5" class="empty-table-cell">No Group Coordinator data.</td></tr>`;
+    groupBody.innerHTML = `<tr><td colspan="5" class="empty-table-cell">No authoritative Consumer Group data.</td></tr>`;
     return;
   }
 
-  const topologyLabel = broker.topology === "embedded_single_node"
-    ? "Embedded single node"
-    : "Multi-node cluster";
   summary.innerHTML = [
-    ["Cluster", broker.cluster_id, topologyLabel],
-    ["Controller", broker.controller_node_id, `${broker.nodes.length} broker node${broker.nodes.length === 1 ? "" : "s"}`],
+    ["Broker term", String(broker.term), `Committed revision ${broker.revision}`],
+    ["Consumer groups", String(broker.consumer_groups.length), "Broker-authoritative companies"],
     ["Queue", String(broker.ready_count || 0), `${broker.queued_count || 0} queued · ${broker.claimed_count || 0} claimed`],
     ["Worker slots", String((broker.idle_slot_count || 0) + (broker.busy_slot_count || 0)), `${broker.idle_slot_count || 0} idle · ${broker.busy_slot_count || 0} busy`],
   ]
@@ -290,20 +287,20 @@ function renderBroker(broker, projects) {
           <td>${namespace.completed_count}</td>
           <td>${namespace.failed_count}</td>
           <td>${namespace.idle_slot_count} idle · ${namespace.busy_slot_count} busy</td>
-          <td>${namespace.consumer_group_count}</td>
+          <td>${broker.consumer_groups.filter((group) => group.namespace_id === namespace.project_id).length}</td>
         </tr>`).join("")
     : `<tr><td colspan="8" class="empty-table-cell">No broker namespaces.</td></tr>`;
 
-  coordinatorBody.innerHTML = broker.group_coordinators.length
-    ? broker.group_coordinators.map((group) => `
+  groupBody.innerHTML = broker.consumer_groups.length
+    ? broker.consumer_groups.map((group) => `
         <tr>
           <td><strong>${escapeHtml(group.group_id)}</strong></td>
-          <td>${escapeHtml(projectNames.get(group.project_id) || shortId(group.project_id))}</td>
-          <td><span class="mini-chip" data-tone="success">${escapeHtml(group.coordinator_node_id)}</span></td>
+          <td>${escapeHtml(projectNames.get(group.namespace_id) || shortId(group.namespace_id))}</td>
           <td>${group.generation}</td>
-          <td>${group.member_count}</td>
+          <td>${group.group_revision}</td>
+          <td>${group.consumer_count}</td>
         </tr>`).join("")
-    : `<tr><td colspan="5" class="empty-table-cell">No initialized Consumer Groups.</td></tr>`;
+    : `<tr><td colspan="5" class="empty-table-cell">No Broker Consumer Groups.</td></tr>`;
 }
 
 function renderOverviewProjects(projects) {
@@ -317,8 +314,8 @@ function renderOverviewProjects(projects) {
       const binding = project.binding;
       const bindingLabel = !binding ? "Unbound" : binding.connector_ready ? "Connected" : "Bound";
       const bindingTone = !binding ? "neutral" : binding.connector_ready ? "success" : "warning";
-      const group = project.consumer_group;
-      const groupLabel = group.initialized ? `Generation ${group.generation}` : "Not initialized";
+      const runtime = project.worker_runtime;
+      const runtimeLabel = runtime.initialized ? `Topology ${runtime.topology_generation}` : "Not initialized";
       return `
         <article class="project-row">
           <div class="project-identity">
@@ -331,9 +328,9 @@ function renderOverviewProjects(projects) {
           <div>
             <div class="project-title-line">
               <strong>Consumer group</strong>
-              <span class="mini-chip" data-tone="${group.initialized ? "accent" : "neutral"}">${escapeHtml(groupLabel)}</span>
+              <span class="mini-chip" data-tone="${runtime.initialized ? "accent" : "neutral"}">${escapeHtml(runtimeLabel)}</span>
             </div>
-            <div class="worker-state-inline">${workerStateSummary(group)}</div>
+            <div class="worker-state-inline">${workerStateSummary(runtime)}</div>
           </div>
           <div class="capacity-line">
             <div><span>Desired</span><strong>${project.desired_capacity}</strong></div>
@@ -395,25 +392,25 @@ function renderProjectManagement(projects) {
 function renderWorkerGroups(projects) {
   const container = q("#worker-groups");
   if (!projects.length) {
-    container.innerHTML = emptyState("No consumer groups", "Consumer groups appear after a project is discovered by the local runtime.");
+    container.innerHTML = emptyState("No Worker runtimes", "Runtime topology appears after a project is discovered by orchestration.");
     return;
   }
   container.innerHTML = projects.map((project) => {
-    const group = project.consumer_group;
-    const workers = group.workers || [];
+    const runtime = project.worker_runtime;
+    const workers = runtime.workers || [];
     return `
       <article class="worker-group">
         <div class="worker-group-header">
           <div>
             <div class="project-title-line">
               <h3>${escapeHtml(project.name)}</h3>
-              <span class="mini-chip" data-tone="${group.initialized ? "accent" : "neutral"}">
-                ${group.initialized ? `Generation ${group.generation}` : "Not initialized"}
+              <span class="mini-chip" data-tone="${runtime.initialized ? "accent" : "neutral"}">
+                ${runtime.initialized ? `Topology ${runtime.topology_generation}` : "Not initialized"}
               </span>
             </div>
             <p>${workers.length} reusable Worker Chat${workers.length === 1 ? "" : "s"} · desired capacity ${project.desired_capacity}</p>
           </div>
-          <div class="worker-state-inline">${workerStateSummary(group)}</div>
+          <div class="worker-state-inline">${workerStateSummary(runtime)}</div>
         </div>
         <div class="table-shell">
           ${workers.length ? `
@@ -428,7 +425,7 @@ function renderWorkerGroups(projects) {
                     <td>${formatTime(worker.updated_at)}</td>
                   </tr>`).join("")}
               </tbody>
-            </table>` : emptyState("No registered Workers", project.spawn_needed ? `${project.spawn_needed} Worker${project.spawn_needed === 1 ? "" : "s"} need provisioning.` : "The group is ready to grow when work arrives.")}
+            </table>` : emptyState("No registered Workers", project.spawn_needed ? `${project.spawn_needed} Worker${project.spawn_needed === 1 ? "" : "s"} need provisioning.` : "The runtime is ready to grow when work arrives.")}
         </div>
       </article>`;
   }).join("");

@@ -10,6 +10,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
+from chattocodex.broker_client.broker_operations_gateway import BrokerOperationsGateway
 from chattocodex.control_panel.control_panel_exceptions import (
     ControlPanelError,
     RuntimeLifecycleError,
@@ -89,6 +90,7 @@ def create_control_panel_app(
     project_binding_service: ProjectBindingService | None = None,
     worker_provisioning_service: WorkerProvisioningService | None = None,
     runtime_boundary_provider: RuntimeBoundaryProvider | None = None,
+    broker_operations: BrokerOperationsGateway | None = None,
 ) -> Starlette:
     """Create the loopback Control Panel application and local runtime routes.
 
@@ -216,7 +218,8 @@ def create_control_panel_app(
             _current_project_binding_service().list_bindings
         )
         operations_service = ControlPanelOperationsService(
-            execution_root=boundaries.execution_root
+            execution_root=boundaries.execution_root,
+            broker_operations=broker_operations,
         )
         source_snapshot = await asyncio.to_thread(
             operations_service.snapshot,

@@ -2,27 +2,29 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TypeVar
 
-from chattocodex.consumer_group.capacity_decision import (
-    CapacityDecision,
-    CapacityLimits,
-)
-from chattocodex.consumer_group.consumer_group_state import (
-    ConsumerGroupMember,
-    ConsumerGroupSnapshot,
-    ConsumerGroupState,
-)
 from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
 from chattocodex.orchestration.orchestration_exceptions import InvalidTransitionError
-from chattocodex.persistence.consumer_group_state_store import ConsumerGroupStateStore
 from chattocodex.persistence.wake_target_repository import WakeTargetRepository
+from chattocodex.persistence.worker_runtime_group_state_store import (
+    WorkerRuntimeGroupStateStore,
+)
 from chattocodex.wake.wake_dto import WakeTargetStatus
 from chattocodex.wake.wake_presence_service import WakePresenceService
 from chattocodex.wake.wake_target_service import WakeTargetService
 from chattocodex.worker_runtime.broker_ready_capacity_projection import (
     BrokerReadyCapacityProjection,
 )
+from chattocodex.worker_runtime.capacity_decision import (
+    CapacityDecision,
+    CapacityLimits,
+)
 from chattocodex.worker_runtime.worker_assignment_lease_reconciler import (
     WorkerAssignmentLeaseReconciler,
+)
+from chattocodex.worker_runtime.worker_runtime_group_state import (
+    WorkerRuntimeGroupState,
+    WorkerRuntimeMember,
+    WorkerRuntimeSnapshot,
 )
 from chattocodex.worker_runtime.worker_runtime_presence_state import (
     WorkerRuntimeAvailability,
@@ -34,13 +36,17 @@ from chattocodex.worker_runtime.worker_runtime_presence_tracker import (
 _MutationResult = TypeVar("_MutationResult")
 
 
-class ConsumerGroupCoordinator:
-    """Owns recoverable Worker membership, generations, and cooperative rebalance ticks."""
+class WorkerRuntimeCoordinator:
+    """Coordinates recoverable physical Worker runtime topology for orchestration.
+
+    This class is not the Broker GroupCoordinator and owns no Broker ConsumerGroup generation,
+    Broker Consumer identity, Task lease, or fencing authority.
+    """
 
     def __init__(
         self,
         *,
-        state_store: ConsumerGroupStateStore,
+        state_store: WorkerRuntimeGroupStateStore,
         wake_target_repository: WakeTargetRepository,
         wake_presence_service: WakePresenceService,
         runtime_presence_tracker: WorkerRuntimePresenceTracker,
@@ -56,7 +62,7 @@ class ConsumerGroupCoordinator:
         """Create a coordinator and its capacity-decision publication seam.
 
         Args:
-            state_store: Durable Consumer Group membership/generation store.
+            state_store: Durable Worker runtime-topology projection store.
             wake_target_repository: Project-bound physical Worker target store.
             wake_presence_service: Active Chat presence reader.
             runtime_presence_tracker: Recoverable dormant-runtime presence reader.
@@ -89,25 +95,27 @@ class ConsumerGroupCoordinator:
         self._on_capacity_decision = on_capacity_decision
         self._now_provider = now_provider or _utc_now
 
-    def reconcile_membership(self, *, project_id: str) -> ConsumerGroupState:
-        """Refresh the durable recoverable-member generation for one project.
+    def reconcile_runtime_topology(self, *, project_id: str) -> WorkerRuntimeGroupState:
+        """Refresh the recoverable Worker-target topology for one project.
 
         Args:
             project_id: Canonical project identity.
 
         Returns:
-            Persisted Consumer Group membership state.
+            Persisted Worker runtime-topology state.
         """
-        with self._lock_registry.hold(entity_key=f"consumer-group:{project_id}"):
-            state, _changed = self._reconcile_membership_locked(project_id=project_id)
+        with self._lock_registry.hold(entity_key=f"worker-runtime:{project_id}"):
+            state, _changed = self._reconcile_runtime_topology_locked(
+                project_id=project_id
+            )
             return state
 
-    def require_member(
+    def require_wake_target(
         self,
         *,
         project_id: str,
         wake_target_id: str,
-    ) -> ConsumerGroupState:
+    ) -> WorkerRuntimeGroupState:
         """Require a Worker target to belong to the current recoverable group.
 
         Args:
@@ -115,25 +123,27 @@ class ConsumerGroupCoordinator:
             wake_target_id: Opaque physical Worker routing target.
 
         Returns:
-            Current durable Consumer Group state.
+            Current durable Worker runtime-topology state.
 
         Raises:
             InvalidTransitionError: If the target is no longer recoverable.
         """
-        with self._lock_registry.hold(entity_key=f"consumer-group:{project_id}"):
-            state, _changed = self._reconcile_membership_locked(project_id=project_id)
-            if wake_target_id not in state.member_ids:
+        with self._lock_registry.hold(entity_key=f"worker-runtime:{project_id}"):
+            state, _changed = self._reconcile_runtime_topology_locked(
+                project_id=project_id
+            )
+            if wake_target_id not in state.wake_target_ids:
                 raise InvalidTransitionError(
-                    operation="consumer_group_claim",
+                    operation="worker_runtime_claim",
                     resource_id=wake_target_id,
                     message=(
-                        "Worker is not a recoverable member of the current Consumer Group "
-                        "generation. Wait for runtime membership to recover before claiming work."
+                        "Worker is not part of the current recoverable runtime topology. "
+                        "Wait for runtime presence to recover before claiming work."
                     ),
                 )
             return state
 
-    def reconcile_project(self, *, project_id: str) -> ConsumerGroupSnapshot:
+    def reconcile_project(self, *, project_id: str) -> WorkerRuntimeSnapshot:
         """Reconcile membership, leases, wake reuse, and provisioning demand.
 
         Reconciliation is the scheduler choke point: it calculates the immutable
@@ -150,8 +160,8 @@ class ConsumerGroupCoordinator:
         # reservation write serializable across projects. The project lock retains
         # cooperative rebalance/assignment behavior within the group.
         with (
-            self._lock_registry.hold(entity_key="consumer-group:capacity"),
-            self._lock_registry.hold(entity_key=f"consumer-group:{project_id}"),
+            self._lock_registry.hold(entity_key="worker-runtime:capacity"),
+            self._lock_registry.hold(entity_key=f"worker-runtime:{project_id}"),
         ):
             return self._reconcile_project_locked(project_id=project_id)
 
@@ -176,15 +186,15 @@ class ConsumerGroupCoordinator:
             The callback result after the single locked reconcile completes.
         """
         with (
-            self._lock_registry.hold(entity_key="consumer-group:capacity"),
-            self._lock_registry.hold(entity_key=f"consumer-group:{project_id}"),
+            self._lock_registry.hold(entity_key="worker-runtime:capacity"),
+            self._lock_registry.hold(entity_key=f"worker-runtime:{project_id}"),
         ):
             result, _ = mutation()
             self._reconcile_project_locked(project_id=project_id)
             return result
 
-    def _reconcile_project_locked(self, *, project_id: str) -> ConsumerGroupSnapshot:
-        group, membership_changed = self._reconcile_membership_locked(
+    def _reconcile_project_locked(self, *, project_id: str) -> WorkerRuntimeSnapshot:
+        group, topology_changed = self._reconcile_runtime_topology_locked(
             project_id=project_id
         )
         recovered_slot_ids = self._assignment_lease_reconciler.reconcile_project(
@@ -206,14 +216,17 @@ class ConsumerGroupCoordinator:
         )
         if self._on_capacity_decision is not None:
             self._on_capacity_decision(decision)
-        members = self._member_views(project_id=project_id, member_ids=group.member_ids)
-        return ConsumerGroupSnapshot(
+        members = self._member_views(
+            project_id=project_id,
+            wake_target_ids=group.wake_target_ids,
+        )
+        return WorkerRuntimeSnapshot(
             group=group,
             members=members,
             ready_count=decision.ready_task_count,
             recovered_slot_ids=recovered_slot_ids,
             wake_transition_count=len(wake_updates),
-            membership_changed=membership_changed,
+            topology_changed=topology_changed,
             capacity_decision=decision,
         )
 
@@ -221,7 +234,7 @@ class ConsumerGroupCoordinator:
         self,
         *,
         project_id: str,
-        group: ConsumerGroupState,
+        group: WorkerRuntimeGroupState,
         ready_task_count: int,
         requested_parallelism: int,
         engaged_task_count: int,
@@ -239,7 +252,7 @@ class ConsumerGroupCoordinator:
             )
             for target in all_targets
         }
-        recoverable_consumer_count = len(group.member_ids)
+        recoverable_consumer_count = len(group.wake_target_ids)
         busy_consumer_count = sum(
             target.status is WakeTargetStatus.BUSY
             and self._wake_target_service.is_connector_compatible(target=target)
@@ -329,12 +342,12 @@ class ConsumerGroupCoordinator:
             )
         return pending
 
-    def _reconcile_membership_locked(
+    def _reconcile_runtime_topology_locked(
         self,
         *,
         project_id: str,
-    ) -> tuple[ConsumerGroupState, bool]:
-        member_ids = tuple(
+    ) -> tuple[WorkerRuntimeGroupState, bool]:
+        wake_target_ids = tuple(
             target.wake_target_id
             for target in self._project_targets(project_id=project_id)
             if self._availability(wake_target_id=target.wake_target_id)
@@ -344,27 +357,27 @@ class ConsumerGroupCoordinator:
         now = self._now_provider()
         if not self._state_store.exists(project_id=project_id):
             state = self._state_store.write(
-                state=ConsumerGroupState(
+                state=WorkerRuntimeGroupState(
                     schema_version=1,
                     project_id=project_id,
-                    generation=1 if member_ids else 0,
-                    member_ids=member_ids,
+                    topology_generation=1 if wake_target_ids else 0,
+                    wake_target_ids=wake_target_ids,
                     revision=0,
                     created_at=now,
                     updated_at=now,
                 )
             )
-            return state, bool(member_ids)
+            return state, bool(wake_target_ids)
 
         current = self._state_store.read(project_id=project_id)
-        if current.member_ids == member_ids:
+        if current.wake_target_ids == wake_target_ids:
             return current, False
         state = self._state_store.write(
-            state=ConsumerGroupState(
+            state=WorkerRuntimeGroupState(
                 schema_version=current.schema_version,
                 project_id=current.project_id,
-                generation=current.generation + 1,
-                member_ids=member_ids,
+                topology_generation=current.topology_generation + 1,
+                wake_target_ids=wake_target_ids,
                 revision=current.revision + 1,
                 created_at=current.created_at,
                 updated_at=now,
@@ -376,18 +389,18 @@ class ConsumerGroupCoordinator:
         self,
         *,
         project_id: str,
-        member_ids: tuple[str, ...],
-    ) -> tuple[ConsumerGroupMember, ...]:
-        member_id_set = set(member_ids)
+        wake_target_ids: tuple[str, ...],
+    ) -> tuple[WorkerRuntimeMember, ...]:
+        wake_target_id_set = set(wake_target_ids)
         return tuple(
-            ConsumerGroupMember(
+            WorkerRuntimeMember(
                 wake_target_id=target.wake_target_id,
                 availability=self._availability(wake_target_id=target.wake_target_id),
                 wake_status=target.status,
                 bound_slot_id=target.bound_slot_id,
             )
             for target in self._project_targets(project_id=project_id)
-            if target.wake_target_id in member_id_set
+            if target.wake_target_id in wake_target_id_set
         )
 
     def _project_targets(self, *, project_id: str):
@@ -421,6 +434,6 @@ def _no_pending_provisioning(_project_id: str | None) -> int:
         _project_id: Project scope, or ``None`` for the global scope.
 
     Returns:
-        Zero, because this compatibility default has no reservation store.
+        Zero when no reservation store is configured.
     """
     return 0

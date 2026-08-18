@@ -11,13 +11,13 @@ WakeTargetId = Annotated[
 ]
 
 
-class ConsumerGroupRecord(BaseModel):
+class WorkerRuntimeGroupRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, validate_default=True)
 
     schema_version: Literal[1] = 1
     project_id: ProjectId
-    generation: int = Field(ge=0)
-    member_ids: tuple[WakeTargetId, ...]
+    topology_generation: int = Field(ge=0)
+    wake_target_ids: tuple[WakeTargetId, ...]
     revision: int = Field(ge=0)
     created_at: datetime
     updated_at: datetime

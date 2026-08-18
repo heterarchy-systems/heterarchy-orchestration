@@ -14,10 +14,6 @@ from chattocodex.broker.abandoned_assignment_recovery import (
 )
 from chattocodex.broker.broker_dto import BrokerTaskStatus, WorkerSlotStatus
 from chattocodex.broker.broker_service import BrokerService
-from chattocodex.consumer_group.capacity_decision import CapacityLimits
-from chattocodex.consumer_group.consumer_group_coordinator import (
-    ConsumerGroupCoordinator,
-)
 from chattocodex.control_panel.control_panel_routes import create_control_panel_app
 from chattocodex.control_panel.control_panel_service import ControlPanelService
 from chattocodex.facade.facade_dto import DelegationTaskSpec, WorkerWork
@@ -34,7 +30,6 @@ from chattocodex.persistence.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.consumer_group_state_store import ConsumerGroupStateStore
 from chattocodex.persistence.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
@@ -48,6 +43,9 @@ from chattocodex.persistence.wake_presence_repository import WakePresenceReposit
 from chattocodex.persistence.wake_target_repository import WakeTargetRepository
 from chattocodex.persistence.worker_provisioning_repository import (
     WorkerProvisioningRepository,
+)
+from chattocodex.persistence.worker_runtime_group_state_store import (
+    WorkerRuntimeGroupStateStore,
 )
 from chattocodex.persistence.worker_runtime_presence_store import (
     WorkerRuntimePresenceStore,
@@ -74,13 +72,18 @@ from chattocodex.wake.wake_target_service import WakeTargetService
 from chattocodex.worker_runtime.broker_ready_capacity_projection import (
     BrokerReadyCapacityProjection,
 )
+from chattocodex.worker_runtime.capacity_decision import CapacityLimits
 from chattocodex.worker_runtime.worker_assignment_lease_reconciler import (
     WorkerAssignmentLeaseReconciler,
+)
+from chattocodex.worker_runtime.worker_runtime_coordinator import (
+    WorkerRuntimeCoordinator,
 )
 from chattocodex.worker_runtime.worker_runtime_presence_tracker import (
     WorkerRuntimePresenceTracker,
 )
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from tests.broker_support import FakeWorkBrokerGateway
 
 
 class _Clock:
@@ -197,6 +200,7 @@ class _Runtime:
             command_runner=GitCommandRunner(),
         )
         broker_service = BrokerService(
+            work_broker_gateway=FakeWorkBrokerGateway(),
             run_repository=self.run_repository,
             worker_repository=self.worker_repository,
             task_repository=self.task_repository,
@@ -226,8 +230,8 @@ class _Runtime:
             lock_registry=self.locks,
             now_provider=self.clock,
         )
-        self.group = ConsumerGroupCoordinator(
-            state_store=ConsumerGroupStateStore(state_root=self.state_root),
+        self.group = WorkerRuntimeCoordinator(
+            state_store=WorkerRuntimeGroupStateStore(state_root=self.state_root),
             wake_target_repository=self.wake_target_repository,
             wake_presence_service=self.wake_presence,
             runtime_presence_tracker=self.runtime_presence,
@@ -246,16 +250,16 @@ class _Runtime:
             on_capacity_decision=self.provisioning.on_capacity_decision,
             now_provider=self.clock,
         )
-        self.provisioning.attach_consumer_group_coordinator(self.group)
+        self.provisioning.attach_worker_runtime_coordinator(self.group)
         self.facade = ChatFacadeService(
             run_service=run_service,
             broker_service=broker_service,
             wake_target_service=self.wake_service,
             workspace_project_service=self.workspace,
-            consumer_group_coordinator=self.group,
+            worker_runtime_coordinator=self.group,
         )
 
-    def delegate(self, *, roles: tuple[str, str]) -> None:
+    def delegate(self, *, roles: tuple[str, ...]) -> None:
         self.facade.delegate_work(
             goal="Two independent reviews",
             tasks=tuple(
@@ -286,7 +290,9 @@ class _Runtime:
         assert active.wake_target_id is not None
         assert (
             active.wake_target_id
-            in self.group.reconcile_membership(project_id=self.project_id).member_ids
+            in self.group.reconcile_runtime_topology(
+                project_id=self.project_id
+            ).wake_target_ids
         )
         return active.wake_target_id
 
@@ -354,7 +360,9 @@ def test_n2_provisioning_then_second_run_reuses_the_same_consumers(
 ) -> None:
     runtime = _Runtime(tmp_path=tmp_path)
     assert (
-        runtime.group.reconcile_membership(project_id=runtime.project_id).member_ids
+        runtime.group.reconcile_runtime_topology(
+            project_id=runtime.project_id
+        ).wake_target_ids
         == ()
     )
     assert runtime.wake_target_repository.list_all() == ()
@@ -373,9 +381,9 @@ def test_n2_provisioning_then_second_run_reuses_the_same_consumers(
     target_b = runtime.register_admitted_worker(conversation_id="conversation-b")
 
     assert target_a != target_b
-    assert runtime.group.reconcile_membership(
+    assert runtime.group.reconcile_runtime_topology(
         project_id=runtime.project_id
-    ).member_ids == (target_a, target_b)
+    ).wake_target_ids == (target_a, target_b)
     first_work = {
         target_id: runtime.claim(wake_target_id=target_id, label=label)
         for target_id, label in ((target_a, "worker-a"), (target_b, "worker-b"))
@@ -459,7 +467,7 @@ def test_retiring_unbound_unclaimed_workers_reserves_exact_replacements(
         wake_presence_service=runtime.wake_presence,
         runtime_presence_tracker=runtime.runtime_presence,
         assignment_lease_reconciler=runtime.assignment_reconciler,
-        consumer_group_coordinator=runtime.group,
+        worker_runtime_coordinator=runtime.group,
         worker_provisioning_service=runtime.provisioning,
         lock_registry=runtime.locks,
     )
@@ -480,7 +488,8 @@ def test_retiring_unbound_unclaimed_workers_reserves_exact_replacements(
         request for request in requests if request.request_id not in before_request_ids
     ]
 
-    assert snapshot.group.member_ids == ()
+    assert snapshot.group.wake_target_ids == ()
+    assert snapshot.capacity_decision is not None
     assert snapshot.capacity_decision.recoverable_consumer_count == 0
     assert snapshot.capacity_decision.capacity_deficit == 2
     assert snapshot.capacity_decision.pending_provisioning_count == 2
@@ -537,7 +546,7 @@ def test_batch_retirement_of_two_active_idle_targets_reconciles_once_and_reserve
         wake_presence_service=runtime.wake_presence,
         runtime_presence_tracker=runtime.runtime_presence,
         assignment_lease_reconciler=runtime.assignment_reconciler,
-        consumer_group_coordinator=runtime.group,
+        worker_runtime_coordinator=runtime.group,
         worker_provisioning_service=runtime.provisioning,
         lock_registry=runtime.locks,
     )
@@ -575,9 +584,9 @@ def test_batch_retirement_of_two_active_idle_targets_reconciles_once_and_reserve
     } == {(ProvisioningRequestStatus.CANCELLED, "runtime_ownership_lost")}
 
     provisioning_before_replay = runtime.provisioning_repository.read_state()
-    group_before_replay = ConsumerGroupStateStore(state_root=runtime.state_root).read(
-        project_id=runtime.project_id
-    )
+    group_before_replay = WorkerRuntimeGroupStateStore(
+        state_root=runtime.state_root
+    ).read(project_id=runtime.project_id)
     replayed_ids = control.retire_unclaimed_targets_batch(
         project_id=runtime.project_id,
         targets=retirements,
@@ -586,7 +595,7 @@ def test_batch_retirement_of_two_active_idle_targets_reconciles_once_and_reserve
     assert replayed_ids == target_ids
     assert runtime.provisioning_repository.read_state() == provisioning_before_replay
     assert (
-        ConsumerGroupStateStore(state_root=runtime.state_root).read(
+        WorkerRuntimeGroupStateStore(state_root=runtime.state_root).read(
             project_id=runtime.project_id
         )
         == group_before_replay
@@ -668,9 +677,12 @@ def test_batch_retirement_prevalidates_every_target_before_any_mutation(
         retirements = (retirements[0], retirements[0])
     provisioning_before = runtime.provisioning_repository.read_state()
     reconcile_calls: list[str] = []
-    runtime.group.reconcile_project = (  # type: ignore[method-assign]
-        lambda *, project_id: reconcile_calls.append(project_id)
-    )
+
+    def unexpected_reconcile(*, project_id: str):
+        reconcile_calls.append(project_id)
+        raise AssertionError("invalid batch must not reconcile runtime topology")
+
+    runtime.group.reconcile_project = unexpected_reconcile  # type: ignore[method-assign]
     control = WakeControlService(
         runtime_config_repository=RuntimeConfigRepository(
             state_root=runtime.state_root
@@ -678,7 +690,7 @@ def test_batch_retirement_prevalidates_every_target_before_any_mutation(
         wake_target_service=runtime.wake_service,
         wake_presence_service=runtime.wake_presence,
         runtime_presence_tracker=runtime.runtime_presence,
-        consumer_group_coordinator=runtime.group,
+        worker_runtime_coordinator=runtime.group,
         worker_provisioning_service=runtime.provisioning,
         lock_registry=runtime.locks,
     )
@@ -717,7 +729,7 @@ def test_retirement_wins_post_membership_pre_active_gap_without_resurrection(
         wake_presence_service=runtime.wake_presence,
         runtime_presence_tracker=runtime.runtime_presence,
         assignment_lease_reconciler=runtime.assignment_reconciler,
-        consumer_group_coordinator=runtime.group,
+        worker_runtime_coordinator=runtime.group,
         worker_provisioning_service=runtime.provisioning,
         lock_registry=runtime.locks,
     )
@@ -784,7 +796,7 @@ def test_batch_retirement_wins_post_membership_pre_active_gap_without_resurrecti
         wake_presence_service=runtime.wake_presence,
         runtime_presence_tracker=runtime.runtime_presence,
         assignment_lease_reconciler=runtime.assignment_reconciler,
-        consumer_group_coordinator=runtime.group,
+        worker_runtime_coordinator=runtime.group,
         worker_provisioning_service=runtime.provisioning,
         lock_registry=runtime.locks,
     )
@@ -889,7 +901,7 @@ def test_failed_provisioning_retirement_keeps_wake_target_retryable(
         wake_target_service=runtime.wake_service,
         wake_presence_service=runtime.wake_presence,
         runtime_presence_tracker=runtime.runtime_presence,
-        consumer_group_coordinator=runtime.group,
+        worker_runtime_coordinator=runtime.group,
         worker_provisioning_service=_FailingProvisioningService(),  # type: ignore[arg-type]
         lock_registry=runtime.locks,
     )
@@ -924,9 +936,11 @@ def test_app_ref_rebind_excludes_old_consumers_from_membership(
         app_ref="plugin_replacement", app_label="Replacement Connector"
     )
 
-    membership = runtime.group.reconcile_membership(project_id=runtime.project_id)
+    runtime_topology = runtime.group.reconcile_runtime_topology(
+        project_id=runtime.project_id
+    )
 
-    assert membership.member_ids == ()
+    assert runtime_topology.wake_target_ids == ()
 
 
 def test_app_ref_rebind_reports_zero_recoverable_consumers(tmp_path: Path) -> None:
@@ -939,6 +953,7 @@ def test_app_ref_rebind_reports_zero_recoverable_consumers(tmp_path: Path) -> No
 
     snapshot = runtime.group.reconcile_project(project_id=runtime.project_id)
 
+    assert snapshot.capacity_decision is not None
     assert snapshot.capacity_decision.recoverable_consumer_count == 0
 
 
@@ -1039,7 +1054,7 @@ def test_register_route_rejects_stale_epoch_renewal_and_recovers_busy_assignment
         runtime_presence_tracker=runtime.runtime_presence,
         lock_registry=runtime.locks,
         assignment_lease_reconciler=runtime.assignment_reconciler,
-        consumer_group_coordinator=runtime.group,
+        worker_runtime_coordinator=runtime.group,
     )
     app = create_control_panel_app(
         service=ControlPanelService(state_root=runtime.state_root),
@@ -1098,9 +1113,13 @@ def test_app_ref_rebind_reserves_replacement_spawn_deficit(tmp_path: Path) -> No
         request for request in requests if request.request_id not in old_request_ids
     )
     assert len(replacement_requests) == 2
-    assert {request.adapter_metadata.app_ref for request in replacement_requests} == {
-        "plugin_replacement"
-    }
+    replacement_metadata = tuple(
+        request.adapter_metadata for request in replacement_requests
+    )
+    assert all(metadata is not None for metadata in replacement_metadata)
+    assert {
+        metadata.app_ref for metadata in replacement_metadata if metadata is not None
+    } == {"plugin_replacement"}
 
 
 def test_app_label_change_with_same_app_ref_keeps_consumers_reusable(

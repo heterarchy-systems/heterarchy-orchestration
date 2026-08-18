@@ -7,25 +7,28 @@ from chattocodex.broker.broker_dto import (
     WorkerSlotState,
     WorkerSlotStatus,
 )
-from chattocodex.broker.broker_management_dto import (
-    BrokerClusterTopology,
-    BrokerNodeRole,
-    BrokerNodeState,
-    BrokerNodeStatus,
-)
 from chattocodex.broker.broker_management_service import BrokerManagementService
-from chattocodex.broker.group_coordinator_directory import GroupCoordinatorDirectory
-from chattocodex.consumer_group.consumer_group_state import ConsumerGroupState
+from chattocodex.broker_client.broker_operations_gateway import (
+    BrokerConsumerGroupDirectory,
+    BrokerConsumerGroupView,
+)
 from chattocodex.orchestration.orchestration_dto import RunState, RunStatus
 from chattocodex.persistence.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.consumer_group_state_store import ConsumerGroupStateStore
 from chattocodex.persistence.orchestration_state_repository import RunStateRepository
 
 
-def test_broker_management_aggregates_projects_as_one_shared_cluster(
+class _FakeBrokerOperationsGateway:
+    def __init__(self, *, directory: BrokerConsumerGroupDirectory) -> None:
+        self._directory = directory
+
+    def group_directory(self) -> BrokerConsumerGroupDirectory:
+        return self._directory
+
+
+def test_broker_management_combines_authoritative_groups_with_local_runtime_projection(
     tmp_path: Path,
 ) -> None:
     now = datetime.now(UTC)
@@ -33,7 +36,6 @@ def test_broker_management_aggregates_projects_as_one_shared_cluster(
     runs = RunStateRepository(state_root=execution_root)
     tasks = BrokerTaskRepository(state_root=execution_root)
     slots = WorkerSlotRepository(state_root=execution_root)
-    groups = ConsumerGroupStateStore(state_root=execution_root)
     project_a = "prj_frontend_1234abcd"
     project_b = "prj_backend_1234abcd"
     run_a = _run(
@@ -95,35 +97,43 @@ def test_broker_management_aggregates_projects_as_one_shared_cluster(
             status=WorkerSlotStatus.BUSY,
         )
     )
-    for project_id, generation in ((project_a, 4), (project_b, 7)):
-        groups.write(
-            state=ConsumerGroupState(
-                schema_version=1,
-                project_id=project_id,
-                generation=generation,
-                member_ids=(),
-                revision=0,
-                created_at=now,
-                updated_at=now,
-            )
+    broker_operations = _FakeBrokerOperationsGateway(
+        directory=BrokerConsumerGroupDirectory(
+            term=6,
+            revision=42,
+            groups=(
+                BrokerConsumerGroupView(
+                    group_id="frontend-company",
+                    namespace_id=project_a,
+                    generation=4,
+                    group_revision=19,
+                    consumer_count=2,
+                ),
+                BrokerConsumerGroupView(
+                    group_id="backend-company",
+                    namespace_id=project_b,
+                    generation=7,
+                    group_revision=31,
+                    consumer_count=3,
+                ),
+            ),
         )
+    )
 
     snapshot = BrokerManagementService(
         broker_task_repository=tasks,
         slot_repository=slots,
         run_repository=runs,
-        consumer_group_store=groups,
+        broker_operations=broker_operations,
     ).snapshot(project_ids=(project_a, project_b))
 
-    assert snapshot.cluster_id == "local-broker-cluster"
-    assert snapshot.topology is BrokerClusterTopology.EMBEDDED_SINGLE_NODE
-    assert snapshot.controller_node_id == "broker-0"
-    assert len(snapshot.nodes) == 1
-    assert len(snapshot.namespaces) == 2
-    assert len(snapshot.group_coordinators) == 2
-    assert {item.coordinator_node_id for item in snapshot.group_coordinators} == {
-        "broker-0"
+    assert snapshot.term == 6
+    assert snapshot.revision == 42
+    assert {item.group_id for item in snapshot.consumer_groups} == {
+        "frontend-company",
+        "backend-company",
     }
+    assert {item.consumer_count for item in snapshot.consumer_groups} == {2, 3}
     namespace_a = next(
         item for item in snapshot.namespaces if item.project_id == project_a
     )
@@ -137,33 +147,6 @@ def test_broker_management_aggregates_projects_as_one_shared_cluster(
     assert namespace_b.busy_slot_count == 1
     assert snapshot.ready_count == 1
     assert snapshot.claimed_count == 1
-
-
-def test_group_coordinator_assignment_is_stable_and_uses_broker_nodes() -> None:
-    nodes = (
-        BrokerNodeState(
-            node_id="broker-a",
-            roles=(BrokerNodeRole.BROKER,),
-            status=BrokerNodeStatus.ONLINE,
-        ),
-        BrokerNodeState(
-            node_id="broker-b",
-            roles=(BrokerNodeRole.BROKER,),
-            status=BrokerNodeStatus.ONLINE,
-        ),
-        BrokerNodeState(
-            node_id="controller-only",
-            roles=(BrokerNodeRole.CONTROLLER,),
-            status=BrokerNodeStatus.ONLINE,
-        ),
-    )
-    directory = GroupCoordinatorDirectory(nodes=nodes)
-
-    first = directory.coordinator_node_id(group_id="project-a:research")
-    second = directory.coordinator_node_id(group_id="project-a:research")
-
-    assert first == second
-    assert first in {"broker-a", "broker-b"}
 
 
 def _run(
@@ -230,6 +213,7 @@ def _slot(
         schema_version=1,
         slot_id=slot_id,
         project_id=project_id,
+        broker_consumer_id=f"consumer_{slot_id.removeprefix('slot_')}",
         slot_handle_digest="b" * 64,
         label=None,
         status=status,

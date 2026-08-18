@@ -2,6 +2,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 
 from chattocodex.broker.abandoned_assignment_recovery import AbandonedAssignmentRecovery
+from chattocodex.broker.broker_dto import WorkerSlotState
 from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
 from chattocodex.persistence.wake_presence_repository import WakePresenceRepository
 from chattocodex.persistence.wake_target_repository import WakeTargetRepository
@@ -20,6 +21,7 @@ class WorkerAssignmentLeaseReconciler:
         wake_target_repository: WakeTargetRepository,
         wake_presence_repository: WakePresenceRepository,
         abandoned_assignment_recovery: AbandonedAssignmentRecovery,
+        assignment_lease_renewer: Callable[[str], WorkerSlotState] | None = None,
         wake_target_service: WakeTargetService,
         lock_registry: EntityLockRegistry | None = None,
         now_provider: Callable[[], datetime] | None = None,
@@ -27,6 +29,7 @@ class WorkerAssignmentLeaseReconciler:
         self._wake_target_repository = wake_target_repository
         self._wake_presence_repository = wake_presence_repository
         self._abandoned_assignment_recovery = abandoned_assignment_recovery
+        self._assignment_lease_renewer = assignment_lease_renewer
         self._wake_target_service = wake_target_service
         self._lock_registry = lock_registry or EntityLockRegistry()
         self._now_provider = now_provider or _utc_now
@@ -52,6 +55,8 @@ class WorkerAssignmentLeaseReconciler:
                 target=target
             )
             if not incompatible and now - last_seen_at <= _ASSIGNMENT_RECOVERY_WINDOW:
+                if self._assignment_lease_renewer is not None:
+                    self._assignment_lease_renewer(target.bound_slot_id)
                 continue
             slot_id = target.bound_slot_id
             did_recover = False

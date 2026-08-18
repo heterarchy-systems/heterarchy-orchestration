@@ -3,9 +3,6 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from chattocodex.broker.broker_service import BrokerService
-from chattocodex.consumer_group.consumer_group_coordinator import (
-    ConsumerGroupCoordinator,
-)
 from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
 from chattocodex.orchestration.orchestration_exceptions import (
     CapabilityDeniedError,
@@ -34,6 +31,9 @@ from chattocodex.run_control.run_control_state import (
     WorkflowTaskSpec,
 )
 from chattocodex.wake.wake_target_service import WakeTargetService
+from chattocodex.worker_runtime.worker_runtime_coordinator import (
+    WorkerRuntimeCoordinator,
+)
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
 
 
@@ -47,7 +47,7 @@ class RunControlCoordinator:
         wake_target_service: WakeTargetService,
         workspace_project_service: WorkspaceProjectService,
         lock_registry: EntityLockRegistry,
-        consumer_group_coordinator: ConsumerGroupCoordinator | None = None,
+        worker_runtime_coordinator: WorkerRuntimeCoordinator | None = None,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         """Create the Main-only workflow coordinator.
@@ -60,7 +60,7 @@ class RunControlCoordinator:
                 do not yet provide a Consumer Group coordinator.
             workspace_project_service: Canonical project resolver.
             lock_registry: Shared workflow synchronization registry.
-            consumer_group_coordinator: Scheduler choke point for capacity/reuse.
+            worker_runtime_coordinator: Worker runtime-topology choke point for capacity/reuse.
             now_provider: UTC clock override for deterministic tests.
         """
         self._repository = repository
@@ -69,7 +69,7 @@ class RunControlCoordinator:
         self._wake_target_service = wake_target_service
         self._workspace_project_service = workspace_project_service
         self._lock_registry = lock_registry
-        self._consumer_group_coordinator = consumer_group_coordinator
+        self._worker_runtime_coordinator = worker_runtime_coordinator
         self._now_provider = now_provider or _utc_now
 
     def start_workflow(
@@ -365,8 +365,8 @@ class RunControlCoordinator:
             )
             created_by_key[spec.key] = broker_task.broker_task_id
         snapshot = self._broker_service.get_run_status(run_id=created_run.state.run_id)
-        if self._consumer_group_coordinator is not None:
-            self._consumer_group_coordinator.reconcile_project(project_id=project_id)
+        if self._worker_runtime_coordinator is not None:
+            self._worker_runtime_coordinator.reconcile_project(project_id=project_id)
         else:
             self._wake_target_service.sync_ready_capacity(
                 project_id=project_id,

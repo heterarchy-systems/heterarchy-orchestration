@@ -51,7 +51,7 @@ def _running_oauth_server(*, state_root: Path, port: int) -> Iterator[None]:
     environment["CHATTOCODEX_STATE_ROOT"] = str(state_root)
     environment["CHATTOCODEX_PORT"] = str(port)
     process = subprocess.Popen(
-        [sys.executable, "-m", "chattocodex.mcp_server"],
+        [sys.executable, "-m", "tests.mcp_test_server"],
         env=environment,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,

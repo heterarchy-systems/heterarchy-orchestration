@@ -12,7 +12,7 @@ from chattocodex.schemas.control_panel_operations_schemas import (
     DatabaseOperationsView,
 )
 
-_DEFAULT_GROUP_KEY = "project_default"
+_DEFAULT_RUNTIME_GROUP_KEY = "project_default"
 
 
 class OperationsReadModelRepository:
@@ -117,12 +117,11 @@ class OperationsReadModelRepository:
         snapshot: ControlPanelOperationsResponse,
         projected_at: datetime,
     ) -> None:
-        cursor.execute("DELETE FROM operations_group_coordinators")
+        cursor.execute("DELETE FROM operations_broker_consumer_groups")
         cursor.execute("DELETE FROM operations_broker_namespaces")
-        cursor.execute("DELETE FROM operations_broker_nodes")
-        cursor.execute("DELETE FROM operations_broker_cluster")
+        cursor.execute("DELETE FROM operations_broker_state")
         cursor.execute("DELETE FROM operations_workers")
-        cursor.execute("DELETE FROM operations_consumer_groups")
+        cursor.execute("DELETE FROM operations_runtime_groups")
         cursor.execute("DELETE FROM operations_projects")
         cursor.execute("DELETE FROM operations_runs")
 
@@ -153,39 +152,39 @@ class OperationsReadModelRepository:
                     projected_at,
                 ),
             )
-            group = project.consumer_group
+            runtime_group = project.worker_runtime
             cursor.execute(
                 """
-                INSERT INTO operations_consumer_groups(
-                    project_id, group_key, initialized, generation, revision,
+                INSERT INTO operations_runtime_groups(
+                    project_id, runtime_group_key, initialized, topology_generation, revision,
                     idle, waking, claiming, busy, projected_at
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     project.project_id,
-                    _DEFAULT_GROUP_KEY,
-                    group.initialized,
-                    group.generation,
-                    group.revision,
-                    group.idle,
-                    group.waking,
-                    group.claiming,
-                    group.busy,
+                    _DEFAULT_RUNTIME_GROUP_KEY,
+                    runtime_group.initialized,
+                    runtime_group.topology_generation,
+                    runtime_group.revision,
+                    runtime_group.idle,
+                    runtime_group.waking,
+                    runtime_group.claiming,
+                    runtime_group.busy,
                     projected_at,
                 ),
             )
-            for worker in group.workers:
+            for worker in runtime_group.workers:
                 cursor.execute(
                     """
                     INSERT INTO operations_workers(
-                        wake_target_id, project_id, group_key, status, wake_revision,
+                        wake_target_id, project_id, runtime_group_key, status, wake_revision,
                         worker_updated_at, projected_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         worker.wake_target_id,
                         project.project_id,
-                        _DEFAULT_GROUP_KEY,
+                        _DEFAULT_RUNTIME_GROUP_KEY,
                         worker.status.value,
                         worker.wake_revision,
                         worker.updated_at,
@@ -197,16 +196,15 @@ class OperationsReadModelRepository:
         if broker is not None:
             cursor.execute(
                 """
-                INSERT INTO operations_broker_cluster(
-                    singleton_id, cluster_id, topology, controller_node_id,
-                    queued_count, ready_count, claimed_count, completed_count,
+                INSERT INTO operations_broker_state(
+                    singleton_id, term, revision, queued_count, ready_count,
+                    claimed_count, completed_count,
                     failed_count, idle_slot_count, busy_slot_count, projected_at
-                ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (1, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    broker.cluster_id,
-                    broker.topology.value,
-                    broker.controller_node_id,
+                    broker.term,
+                    broker.revision,
                     broker.queued_count,
                     broker.ready_count,
                     broker.claimed_count,
@@ -217,28 +215,14 @@ class OperationsReadModelRepository:
                     projected_at,
                 ),
             )
-            for node in broker.nodes:
-                cursor.execute(
-                    """
-                    INSERT INTO operations_broker_nodes(
-                        node_id, roles, status, projected_at
-                    ) VALUES (%s, %s::jsonb, %s, %s)
-                    """,
-                    (
-                        node.node_id,
-                        json.dumps([role.value for role in node.roles]),
-                        node.status.value,
-                        projected_at,
-                    ),
-                )
             for namespace in broker.namespaces:
                 cursor.execute(
                     """
                     INSERT INTO operations_broker_namespaces(
                         project_id, queued_count, ready_count, claimed_count,
                         completed_count, failed_count, idle_slot_count,
-                        busy_slot_count, consumer_group_count, projected_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        busy_slot_count, projected_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         namespace.project_id,
@@ -249,24 +233,23 @@ class OperationsReadModelRepository:
                         namespace.failed_count,
                         namespace.idle_slot_count,
                         namespace.busy_slot_count,
-                        namespace.consumer_group_count,
                         projected_at,
                     ),
                 )
-            for group in broker.group_coordinators:
+            for group in broker.consumer_groups:
                 cursor.execute(
                     """
-                    INSERT INTO operations_group_coordinators(
-                        group_id, project_id, coordinator_node_id, generation,
-                        member_count, projected_at
+                    INSERT INTO operations_broker_consumer_groups(
+                        group_id, namespace_id, generation, group_revision,
+                        consumer_count, projected_at
                     ) VALUES (%s, %s, %s, %s, %s, %s)
                     """,
                     (
                         group.group_id,
-                        group.project_id,
-                        group.coordinator_node_id,
+                        group.namespace_id,
                         group.generation,
-                        group.member_count,
+                        group.group_revision,
+                        group.consumer_count,
                         projected_at,
                     ),
                 )

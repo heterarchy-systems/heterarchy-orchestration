@@ -2,9 +2,6 @@ from collections import deque
 
 from chattocodex.broker.broker_dto import WorkerSlotStatus
 from chattocodex.broker.broker_service import BrokerService
-from chattocodex.consumer_group.consumer_group_coordinator import (
-    ConsumerGroupCoordinator,
-)
 from chattocodex.facade.facade_dto import (
     DelegatedTask,
     DelegationStarted,
@@ -22,6 +19,9 @@ from chattocodex.orchestration.run_orchestration_service import RunOrchestration
 from chattocodex.run_control.run_control_coordinator import RunControlCoordinator
 from chattocodex.wake.wake_target_service import WakeTargetService
 from chattocodex.wake.worker_wake_capability_service import WorkerWakeCapabilityService
+from chattocodex.worker_runtime.worker_runtime_coordinator import (
+    WorkerRuntimeCoordinator,
+)
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
 
 
@@ -34,7 +34,7 @@ class ChatFacadeService:
         wake_target_service: WakeTargetService,
         workspace_project_service: WorkspaceProjectService,
         run_control_coordinator: RunControlCoordinator | None = None,
-        consumer_group_coordinator: ConsumerGroupCoordinator | None = None,
+        worker_runtime_coordinator: WorkerRuntimeCoordinator | None = None,
         worker_wake_capability_service: WorkerWakeCapabilityService | None = None,
     ) -> None:
         self._run_service = run_service
@@ -42,7 +42,7 @@ class ChatFacadeService:
         self._wake_target_service = wake_target_service
         self._workspace_project_service = workspace_project_service
         self._run_control_coordinator = run_control_coordinator
-        self._consumer_group_coordinator = consumer_group_coordinator
+        self._worker_runtime_coordinator = worker_runtime_coordinator
         self._worker_wake_capability_service = worker_wake_capability_service
 
     def delegate_work(
@@ -101,8 +101,8 @@ class ChatFacadeService:
             )
 
         snapshot = self._broker_service.get_run_status(run_id=created_run.state.run_id)
-        if self._consumer_group_coordinator is not None:
-            self._consumer_group_coordinator.reconcile_project(
+        if self._worker_runtime_coordinator is not None:
+            self._worker_runtime_coordinator.reconcile_project(
                 project_id=created_run.state.project_id
             )
         else:
@@ -307,8 +307,8 @@ class ChatFacadeService:
         acquired = None
         try:
             wake_project_id = wake_target.project_id
-            if self._consumer_group_coordinator is not None:
-                self._consumer_group_coordinator.require_member(
+            if self._worker_runtime_coordinator is not None:
+                self._worker_runtime_coordinator.require_wake_target(
                     project_id=wake_project_id,
                     wake_target_id=wake_target_id,
                 )
@@ -467,8 +467,8 @@ class ChatFacadeService:
         if active_run_id is not None:
             snapshot = self._broker_service.get_run_status(run_id=active_run_id)
             if not scheduled_slot:
-                if self._consumer_group_coordinator is not None:
-                    self._consumer_group_coordinator.reconcile_project(
+                if self._worker_runtime_coordinator is not None:
+                    self._worker_runtime_coordinator.reconcile_project(
                         project_id=finished.slot.project_id
                     )
                 else:

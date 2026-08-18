@@ -32,6 +32,7 @@ from chattocodex.worker_runtime.worker_assignment_lease_reconciler import (
     WorkerAssignmentLeaseReconciler,
 )
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from tests.broker_support import FakeWorkBrokerGateway
 
 
 class _Clock:
@@ -94,7 +95,9 @@ def test_assignment_lease_requeues_work_when_busy_chat_never_returns(
     run = run_service.create_run(
         goal="Assignment lease recovery", project_id=project_id
     )
+    work_broker_gateway = FakeWorkBrokerGateway()
     broker_service = BrokerService(
+        work_broker_gateway=work_broker_gateway,
         run_repository=run_repository,
         worker_repository=worker_repository,
         task_repository=task_repository,
@@ -229,6 +232,10 @@ def test_assignment_lease_requeues_work_when_busy_chat_never_returns(
     assert broker_task.status is BrokerTaskStatus.QUEUED
     assert recovered_slot.status is WorkerSlotStatus.IDLE
     assert recovered_target.status is WakeTargetStatus.IDLE
+    work_broker_gateway.expire_task(
+        run_id=run.state.run_id,
+        task_id=published.broker_task_id,
+    )
 
     replacement_slot = broker_service.register_slot(
         project_id=project_id,

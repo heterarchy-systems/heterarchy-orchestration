@@ -41,6 +41,7 @@ from chattocodex.wake.worker_wake_capability_service import (
     WorkerWakeCapabilityService,
 )
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from tests.broker_support import FakeWorkBrokerGateway
 
 
 class _Runtime:
@@ -87,6 +88,7 @@ class _Runtime:
             lock_registry=locks,
         )
         self.broker_service = BrokerService(
+            work_broker_gateway=FakeWorkBrokerGateway(),
             run_repository=self.run_repository,
             worker_repository=self.worker_repository,
             task_repository=self.task_repository,

@@ -163,6 +163,7 @@ class AbandonedAssignmentRecovery:
                     revision=broker_task.revision + 1,
                     created_at=broker_task.created_at,
                     updated_at=now,
+                    external_published=broker_task.external_published,
                 )
             )
 
@@ -171,6 +172,7 @@ class AbandonedAssignmentRecovery:
                 schema_version=slot.schema_version,
                 slot_id=slot.slot_id,
                 project_id=slot.project_id,
+                broker_consumer_id=slot.broker_consumer_id,
                 slot_handle_digest=slot.slot_handle_digest,
                 label=slot.label,
                 status=WorkerSlotStatus.IDLE,

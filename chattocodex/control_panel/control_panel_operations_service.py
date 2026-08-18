@@ -1,30 +1,32 @@
 from collections import Counter
 from pathlib import Path
 
-from chattocodex.broker.broker_management_dto import BrokerClusterSnapshot
+from agent_broker import AgentBrokerError
+
+from chattocodex.broker.broker_management_dto import BrokerManagementSnapshot
 from chattocodex.broker.broker_management_service import BrokerManagementService
-from chattocodex.consumer_group.consumer_group_state import ConsumerGroupState
+from chattocodex.broker_client.broker_operations_gateway import BrokerOperationsGateway
 from chattocodex.orchestration.orchestration_dto import RunStatus
 from chattocodex.persistence.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.consumer_group_state_store import ConsumerGroupStateStore
 from chattocodex.persistence.orchestration_state_repository import RunStateRepository
 from chattocodex.persistence.wake_target_repository import WakeTargetRepository
 from chattocodex.persistence.worker_provisioning_repository import (
     WorkerProvisioningRepository,
 )
+from chattocodex.persistence.worker_runtime_group_state_store import (
+    WorkerRuntimeGroupStateStore,
+)
 from chattocodex.project_runtime.project_binding_dto import ProjectBindingState
 from chattocodex.provisioning.provisioning_state_sync import PENDING_REQUEST_STATUSES
 from chattocodex.schemas.broker_management_schemas import (
-    BrokerClusterOperationsView,
+    BrokerConsumerGroupOperationsView,
     BrokerNamespaceOperationsView,
-    BrokerNodeOperationsView,
-    GroupCoordinatorOperationsView,
+    BrokerOperationsView,
 )
 from chattocodex.schemas.control_panel_operations_schemas import (
-    ConsumerGroupOperationsView,
     ConsumerWorkerOperationsView,
     ControlPanelOperationsResponse,
     DatabaseOperationsView,
@@ -33,9 +35,13 @@ from chattocodex.schemas.control_panel_operations_schemas import (
     ProviderBindingOperationsView,
     RecentRunOperationsView,
     WorkerBrowserOperationsView,
+    WorkerRuntimeGroupOperationsView,
 )
 from chattocodex.wake.wake_dto import WakeTargetStatus
 from chattocodex.wake.worker_browser_runtime_dto import WorkerBrowserRuntimeMode
+from chattocodex.worker_runtime.worker_runtime_group_state import (
+    WorkerRuntimeGroupState,
+)
 from chattocodex.workspace.workspace_project_dto import WorkspaceProject
 
 _RECENT_RUN_LIMIT = 8
@@ -44,16 +50,25 @@ _RECENT_RUN_LIMIT = 8
 class ControlPanelOperationsService:
     """Build one read-only operations snapshot from durable runtime state."""
 
-    def __init__(self, *, execution_root: Path) -> None:
-        self._group_store = ConsumerGroupStateStore(state_root=execution_root)
+    def __init__(
+        self,
+        *,
+        execution_root: Path,
+        broker_operations: BrokerOperationsGateway | None = None,
+    ) -> None:
+        self._group_store = WorkerRuntimeGroupStateStore(state_root=execution_root)
         self._wake_targets = WakeTargetRepository(state_root=execution_root)
         self._provisioning = WorkerProvisioningRepository(state_root=execution_root)
         self._runs = RunStateRepository(state_root=execution_root)
-        self._broker_management = BrokerManagementService(
-            broker_task_repository=BrokerTaskRepository(state_root=execution_root),
-            slot_repository=WorkerSlotRepository(state_root=execution_root),
-            run_repository=self._runs,
-            consumer_group_store=self._group_store,
+        self._broker_management = (
+            BrokerManagementService(
+                broker_task_repository=BrokerTaskRepository(state_root=execution_root),
+                slot_repository=WorkerSlotRepository(state_root=execution_root),
+                run_repository=self._runs,
+                broker_operations=broker_operations,
+            )
+            if broker_operations is not None
+            else None
         )
 
     def snapshot(
@@ -81,13 +96,13 @@ class ControlPanelOperationsService:
 
         project_views: list[ProjectOperationsView] = []
         status_totals: Counter[WakeTargetStatus] = Counter()
-        consumer_group_count = 0
+        runtime_group_count = 0
         worker_count = 0
         for project in sorted(
             projects, key=lambda item: (item.name.lower(), item.project_id)
         ):
             group = self._read_group(project_id=project.project_id)
-            member_ids = group.member_ids if group is not None else ()
+            member_ids = group.wake_target_ids if group is not None else ()
             workers = tuple(
                 ConsumerWorkerOperationsView(
                     wake_target_id=target.wake_target_id,
@@ -100,7 +115,7 @@ class ControlPanelOperationsService:
             )
             status_counts = Counter(worker.status for worker in workers)
             if group is not None:
-                consumer_group_count += 1
+                runtime_group_count += 1
                 worker_count += len(workers)
                 status_totals.update(worker.status for worker in workers)
             demand = demands.get(project.project_id)
@@ -112,9 +127,11 @@ class ControlPanelOperationsService:
                     binding=self._binding_view(
                         state=binding_by_project.get(project.project_id)
                     ),
-                    consumer_group=ConsumerGroupOperationsView(
+                    worker_runtime=WorkerRuntimeGroupOperationsView(
                         initialized=group is not None,
-                        generation=group.generation if group is not None else 0,
+                        topology_generation=group.topology_generation
+                        if group is not None
+                        else 0,
                         revision=group.revision if group is not None else 0,
                         workers=workers,
                         idle=status_counts[WakeTargetStatus.IDLE],
@@ -147,7 +164,7 @@ class ControlPanelOperationsService:
             )
             for run in runs
         )
-        broker_snapshot = self._broker_management.snapshot(
+        broker_snapshot = self._broker_snapshot(
             project_ids=tuple(project.project_id for project in projects)
         )
         return ControlPanelOperationsResponse(
@@ -162,10 +179,12 @@ class ControlPanelOperationsService:
                 projected_at=None,
                 message="PostgreSQL read model is not configured.",
             ),
-            broker=self._broker_view(snapshot=broker_snapshot),
+            broker=self._broker_view(snapshot=broker_snapshot)
+            if broker_snapshot is not None
+            else None,
             totals=OperationsTotalsView(
                 project_count=len(project_views),
-                consumer_group_count=consumer_group_count,
+                runtime_group_count=runtime_group_count,
                 worker_count=worker_count,
                 idle=status_totals[WakeTargetStatus.IDLE],
                 waking=status_totals[WakeTargetStatus.WAKING],
@@ -178,25 +197,26 @@ class ControlPanelOperationsService:
             recent_runs=recent_runs,
         )
 
-    def _read_group(self, *, project_id: str) -> ConsumerGroupState | None:
+    def _read_group(self, *, project_id: str) -> WorkerRuntimeGroupState | None:
         if not self._group_store.exists(project_id=project_id):
             return None
         return self._group_store.read(project_id=project_id)
 
+    def _broker_snapshot(
+        self, *, project_ids: tuple[str, ...]
+    ) -> BrokerManagementSnapshot | None:
+        if self._broker_management is None:
+            return None
+        try:
+            return self._broker_management.snapshot(project_ids=project_ids)
+        except AgentBrokerError, RuntimeError:
+            return None
+
     @staticmethod
-    def _broker_view(*, snapshot: BrokerClusterSnapshot) -> BrokerClusterOperationsView:
-        return BrokerClusterOperationsView(
-            cluster_id=snapshot.cluster_id,
-            topology=snapshot.topology,
-            controller_node_id=snapshot.controller_node_id,
-            nodes=tuple(
-                BrokerNodeOperationsView(
-                    node_id=node.node_id,
-                    roles=node.roles,
-                    status=node.status,
-                )
-                for node in snapshot.nodes
-            ),
+    def _broker_view(*, snapshot: BrokerManagementSnapshot) -> BrokerOperationsView:
+        return BrokerOperationsView(
+            term=snapshot.term,
+            revision=snapshot.revision,
             namespaces=tuple(
                 BrokerNamespaceOperationsView(
                     project_id=namespace.project_id,
@@ -207,19 +227,18 @@ class ControlPanelOperationsService:
                     failed_count=namespace.failed_count,
                     idle_slot_count=namespace.idle_slot_count,
                     busy_slot_count=namespace.busy_slot_count,
-                    consumer_group_count=namespace.consumer_group_count,
                 )
                 for namespace in snapshot.namespaces
             ),
-            group_coordinators=tuple(
-                GroupCoordinatorOperationsView(
+            consumer_groups=tuple(
+                BrokerConsumerGroupOperationsView(
                     group_id=group.group_id,
-                    project_id=group.project_id,
-                    coordinator_node_id=group.coordinator_node_id,
+                    namespace_id=group.namespace_id,
                     generation=group.generation,
-                    member_count=group.member_count,
+                    group_revision=group.group_revision,
+                    consumer_count=group.consumer_count,
                 )
-                for group in snapshot.group_coordinators
+                for group in snapshot.consumer_groups
             ),
             queued_count=snapshot.queued_count,
             ready_count=snapshot.ready_count,

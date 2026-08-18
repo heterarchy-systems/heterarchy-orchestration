@@ -17,6 +17,7 @@ from chattocodex.persistence.orchestration_state_repository import (
     WorkerStateRepository,
 )
 from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from tests.broker_support import FakeWorkBrokerGateway
 
 
 def test_broker_run_status_tracks_ready_dag_and_consumer_group(tmp_path: Path) -> None:
@@ -60,6 +61,7 @@ def test_broker_run_status_tracks_ready_dag_and_consumer_group(tmp_path: Path) -
         lock_registry=locks,
     )
     broker_service = BrokerService(
+        work_broker_gateway=FakeWorkBrokerGateway(),
         run_repository=run_repository,
         worker_repository=worker_repository,
         task_repository=task_repository,

@@ -1,3 +1,4 @@
+from hashlib import sha256
 from pathlib import Path
 
 from chattocodex.broker.broker_dto import BrokerTaskState, WorkerSlotState
@@ -29,6 +30,7 @@ def _broker_task_record_from_state(*, state: BrokerTaskState) -> BrokerTaskRecor
         revision=state.revision,
         created_at=state.created_at,
         updated_at=state.updated_at,
+        external_published=state.external_published,
     )
 
 
@@ -47,6 +49,7 @@ def _broker_task_state_from_record(*, record: BrokerTaskRecord) -> BrokerTaskSta
         revision=record.revision,
         created_at=record.created_at,
         updated_at=record.updated_at,
+        external_published=record.external_published,
     )
 
 
@@ -55,6 +58,7 @@ def _worker_slot_record_from_state(*, state: WorkerSlotState) -> WorkerSlotRecor
         schema_version=1,
         slot_id=state.slot_id,
         project_id=state.project_id,
+        broker_consumer_id=state.broker_consumer_id,
         slot_handle_digest=state.slot_handle_digest,
         label=state.label,
         status=state.status,
@@ -65,6 +69,11 @@ def _worker_slot_record_from_state(*, state: WorkerSlotState) -> WorkerSlotRecor
         revision=state.revision,
         created_at=state.created_at,
         updated_at=state.updated_at,
+        broker_term=state.broker_term,
+        broker_group_generation=state.broker_group_generation,
+        broker_lease_id=state.broker_lease_id,
+        broker_lease_epoch=state.broker_lease_epoch,
+        broker_lease_expires_at_ms=state.broker_lease_expires_at_ms,
     )
 
 
@@ -73,6 +82,10 @@ def _worker_slot_state_from_record(*, record: WorkerSlotRecord) -> WorkerSlotSta
         schema_version=record.schema_version,
         slot_id=record.slot_id,
         project_id=record.project_id,
+        broker_consumer_id=(
+            record.broker_consumer_id
+            or _legacy_broker_consumer_id(slot_id=record.slot_id)
+        ),
         slot_handle_digest=record.slot_handle_digest,
         label=record.label,
         status=record.status,
@@ -83,10 +96,27 @@ def _worker_slot_state_from_record(*, record: WorkerSlotRecord) -> WorkerSlotSta
         revision=record.revision,
         created_at=record.created_at,
         updated_at=record.updated_at,
+        broker_term=record.broker_term,
+        broker_group_generation=record.broker_group_generation,
+        broker_lease_id=record.broker_lease_id,
+        broker_lease_epoch=record.broker_lease_epoch,
+        broker_lease_expires_at_ms=record.broker_lease_expires_at_ms,
     )
 
 
+def _legacy_broker_consumer_id(*, slot_id: str) -> str:
+    """Recover a stable Consumer ID for pre-migration Slot records only.
+
+    New Slots always receive an independently generated Consumer ID. This deterministic
+    surrogate exists solely so previously persisted schema-v1 records remain readable.
+    """
+    digest = sha256(f"legacy-broker-consumer:{slot_id}".encode()).hexdigest()
+    return f"consumer_{digest[:24]}"
+
+
 class BrokerTaskRepository:
+    """Persist the orchestration-side DAG/task projection, not Broker authority."""
+
     def __init__(self, *, state_root: Path) -> None:
         self._root = state_root / "broker" / "tasks"
 
@@ -148,6 +178,8 @@ class BrokerTaskRepository:
 
 
 class WorkerSlotRepository:
+    """Persist physical Worker-slot and external-lease projection state."""
+
     def __init__(self, *, state_root: Path) -> None:
         self._root = state_root / "broker" / "slots"
 

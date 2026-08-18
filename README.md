@@ -60,7 +60,7 @@ Ask for delegated work naturally:
 보안 / 백엔드 / 제품 관점으로 보고 마지막에 종합해줘.
 ```
 
-For simple fire-and-report delegation, ChatToCodex can still use `delegate_work`. When the user asks the Main Chat to inspect Worker results, approve completion, or request corrective work, the Main Chat uses `orchestrate_work`. The durable Run Control Coordinator owns the execution round, Main Review Gate, and bounded rework loop while the Broker continues to own logical Task readiness.
+For simple fire-and-report delegation, ChatToCodex can still use `delegate_work`. When the user asks the Main Chat to inspect Worker results, approve completion, or request corrective work, the Main Chat uses `orchestrate_work`. The durable Run Control Coordinator owns the execution round, DAG dependencies, Main Review Gate, and bounded rework loop. Only tasks whose prerequisites are complete are published to the external `herterarchy-broker`, which then owns claim, lease, fencing, and completion authority.
 
 Worker completion automatically refreshes the coordinated Run. When every Worker Task in the current execution round is terminal, the workflow moves to `WAITING_MAIN_REVIEW`. The Main Chat checks `workflow_status`, inspects reports/results/diffs/tests, then calls `review_workflow` with `approve`, `rework`, or `fail`. A rework decision creates a new execution round with a new corrective Worker DAG. Rework rounds are bounded by `max_rework_rounds`.
 
@@ -149,7 +149,7 @@ Worker execution primitives used internally by the Chat:
 - `integration_preview`
 - `integration_apply`
 
-Low-level Broker actions and Wake actions are deliberately not registered as public MCP actions. Broker state, Task dependencies, reusable Slot identity, temporary capabilities, and browser routing stay behind the facade.
+Low-level Broker actions and Wake actions are deliberately not registered as public MCP actions. External Broker authority, local DAG projection, reusable Slot identity, temporary capabilities, and browser routing stay behind the facade.
 
 ## Internal architecture
 
@@ -168,23 +168,33 @@ Low-level Broker actions and Wake actions are deliberately not registered as pub
                 │ Main Review Gate    │
                 │ approve/rework/fail │
                 └─────────┬───────────┘
-                          │ publish round DAG
+                          │ round DAG
                           ▼
                  ┌──────────────────┐
-                 │ Durable Broker   │
-                 │ Task DAG         │
-                 │ Slot ownership   │
-                 └────────┬─────────┘
-                          │ READY projection
-                          ▼
-                 ┌──────────────────┐
-                 │ Consumer Group   │
-                 │ Coordinator      │
+                 │ Local DAG        │
+                 │ Projection       │
                  │                  │
-                 │ membership       │
-                 │ generation       │
-                 │ lease recovery   │
-                 │ coop rebalance   │
+                 │ dependency READY │
+                 │ Run / Slot view  │
+                 └────────┬─────────┘
+                          │ publish READY tasks
+                          ▼
+                 ┌──────────────────┐
+                 │ herterarchy-     │
+                 │ broker           │
+                 │                  │
+                 │ Consumer Groups  │
+                 │ claim / lease    │
+                 │ fencing/complete │
+                 └────────┬─────────┘
+                          │ claimable work
+                          ▼
+                 ┌──────────────────┐
+                 │ Worker Capacity  │
+                 │ / Wake Runtime   │
+                 │                  │
+                 │ reuse / wake     │
+                 │ spawn / presence │
                  └────────┬─────────┘
                           │ opaque wake state only
                           ▼
@@ -217,43 +227,30 @@ Low-level Broker actions and Wake actions are deliberately not registered as pub
                  complete    new round DAG
 ```
 
-A logical role belongs to the assignment, not to the physical Chat. A task is claimable only after every prerequisite completes. Claiming work creates a temporary run-scoped Worker identity for existing repository/report/Git capability checks.
+A logical role belongs to the assignment, not to the physical Chat. Orchestration keeps the dependency DAG because the Broker intentionally has no DAG semantics. Once every prerequisite completes, orchestration publishes that task to the run-scoped Broker namespace; a Worker can execute it only after the external Broker grants the claim and lease. Claiming work also creates a temporary run-scoped Worker identity for existing repository/report/Git capability checks.
 
-Each project has one internal Worker Consumer Group. `ACTIVE` and recoverable `DORMANT` Worker targets are members; `OFFLINE` targets are removed. A change to that recoverable member set advances the durable group generation. ACTIVE-to-DORMANT transitions do not create a new generation because the same physical Consumer is still recoverable.
+The local Worker-capacity coordinator tracks `ACTIVE`, recoverable `DORMANT`, and `OFFLINE` Chat targets only for reuse/wake/spawn decisions. It is not the assignment authority. When a Worker actually claims work, the Broker adapter joins that physical Slot to the run-scoped external Consumer Group and stores the returned Broker term, group generation, lease ID, lease epoch, and expiry as a local projection.
 
-Rebalancing is cooperative rather than stop-the-world. A generation change never steals an in-flight Broker assignment from a healthy BUSY Worker. New or recovered members participate in subsequent READY work. Only the existing assignment lease can revoke a dead BUSY attempt; recovery then re-queues the logical Broker Task so a current group member can claim a fresh temporary execution. Broker Task/Slot state remains the sole source of truth for assignment ownership; Consumer Group state persists only membership and generation.
+Healthy BUSY Workers renew the external Broker lease while their physical Chat remains recoverable. If a Worker disappears, local wake/slot recovery does not grant another Worker ownership by itself; a replacement can execute the task only after the authoritative Broker lease is no longer valid and the Broker grants a new claim. Local task/slot files are therefore recovery and UI projections, not a second Broker authority.
 
 If a Worker calls `work` again while an assignment is active, ChatToCodex safely resumes it and rotates the temporary Worker capability. If the underlying task is already terminal but `work_done` was skipped, the next `work` releases the old assignment before claiming new work.
 
 Completing a task can unlock DAG successors. `work_done` recalculates READY capacity, reuses or wakes an eligible recoverable target, and records a project-bound provisioning deficit only when existing capacity is insufficient.
 
-### Shared Broker Cluster management
+### External Broker boundary
 
-The management model follows Kafka's separation of cluster, broker, namespace-like ownership, and Consumer Group coordination without copying Kafka topic/partition/offset semantics. ChatToCodex has one provider-independent Broker Cluster over the configured execution root. Every local Project is isolated as a Broker namespace, while provider adapters remain outside this layer.
+`heterarchy-orchestration` consumes [`herterarchy-broker`](https://github.com/heterarchy-systems/herterarchy-broker) through its Python SDK. The dependency is pinned in `pyproject.toml`/`uv.lock`; orchestration does not carry a second Broker implementation.
+
+The current production adapter targets one standalone Broker endpoint:
 
 ```text
-Shared Broker Cluster
-├── Controller: broker-0
-├── Broker node: broker-0
-│
-├── Project namespace A
-│   ├── Broker Tasks / Worker Slots / Runs
-│   └── Consumer Group(s)
-│
-├── Project namespace B
-│   ├── Broker Tasks / Worker Slots / Runs
-│   └── Consumer Group(s)
-│
-└── Group Coordinator Directory
-    ├── group-A -> broker-0
-    └── group-B -> broker-0
+CHATTOCODEX_BROKER_HOST=127.0.0.1
+CHATTOCODEX_BROKER_PORT=8811
+CHATTOCODEX_BROKER_TIMEOUT_SECONDS=5.0
+CHATTOCODEX_BROKER_LEASE_DURATION_MS=90000
 ```
 
-The current MVP is an embedded single-node cluster, so `broker-0` combines the Broker and Controller roles. Group Coordinator ownership is nevertheless resolved through a stable group-id hash over eligible Broker nodes. This keeps coordinator ownership independent from ChatGPT, Chrome, or any future provider runtime and leaves a direct seam for multiple Broker nodes later.
-
-Today's persisted Consumer Group topology is still one default Group per Project. Broker management exposes it as `<project_id>:default`; this is a compatibility identity, not a long-term requirement that Project and Consumer Group remain 1:1. Future multiple Consumer Groups per Project can replace that persistence shape without changing Broker namespace management or provider adapters.
-
-The Runtime Console exposes the cluster, Controller, per-Project namespace queue pressure, reusable Worker Slot pressure, and Group Coordinator ownership. PostgreSQL mirrors the same management view as a read model; the file-backed Broker state remains the execution source of truth.
+Each Run receives an isolated Broker namespace and Worker Consumer Group. Static three-node Broker support is intentionally not faked through a direct node: the Broker's cluster SDK requires durable owner/command identity and sequence handling. Orchestration will add that durability boundary explicitly before claiming cluster-aware production support.
 
 ## Durable state
 
@@ -265,9 +262,9 @@ The current PoC separates global control-plane state from project execution stat
 └── auth / owner-control state
 
 <configured-project>/.chattocodex/
-├── broker/
-│   ├── tasks/<broker_task_id>.json
-│   └── slots/<slot_id>.json
+├── broker/                         # local orchestration projections only
+│   ├── tasks/<broker_task_id>.json # Run/DAG/publish projection
+│   └── slots/<slot_id>.json        # physical Slot + Broker lease projection
 ├── consumer_groups/
 │   └── <project_id>.json
 ├── run_control/
@@ -297,7 +294,7 @@ ChatToCodex adds `/.chattocodex/` to the project's local `.git/info/exclude` bef
 
 Plaintext mutation capabilities are returned only to the relevant Chat; only SHA-256 digests are persisted. Task mutations use compare-and-swap revisions and in-process coordination locks. State writes use atomic replace and read-back validation.
 
-`integration_apply` remains Broker-gated for simple delegation. If a Run belongs to a coordinated workflow, integration is additionally hard-gated by the Main Review Gate: the workflow must be `COMPLETED` before integration can proceed. Main-review approval is therefore enforced by the server rather than only by prompting instructions.
+`integration_apply` remains execution-terminal-gated for simple delegation. If a Run belongs to a coordinated workflow, integration is additionally hard-gated by the Main Review Gate: the workflow must be `COMPLETED` before integration can proceed. Main-review approval is therefore enforced by the server rather than only by prompting instructions.
 
 ## Settings Control Panel
 
@@ -330,7 +327,7 @@ Create the ChatGPT Custom MCP App in Developer Mode with the Connector URL shown
 
 ### PostgreSQL operations read model
 
-The Broker, Consumer Group coordinator, wake leases, and Run Control state remain file-backed execution authorities. PostgreSQL is deliberately a **management read model**, not a second assignment authority. The Runtime Console projects the current durable file snapshot into PostgreSQL and reads that projection back for the UI. If PostgreSQL or its Python driver is unavailable, Worker execution continues from the file-backed state and the Runtime Console reports the database as degraded instead of changing assignment semantics.
+Run/DAG projection, physical Worker capacity, wake leases, and Run Control state remain file-backed orchestration authorities. Work assignment itself is authoritative in the external `herterarchy-broker`. PostgreSQL is deliberately a **management read model**, not a second assignment authority. The Runtime Console projects the current orchestration snapshot into PostgreSQL and reads that projection back for the UI. If PostgreSQL or its Python driver is unavailable, Worker execution continues without changing Broker assignment semantics.
 
 The local development database is defined in `compose.yaml` and binds only to loopback. Copy `.env.example` if you want to override the development database name, credentials, or port, then start PostgreSQL:
 

@@ -24,6 +24,11 @@ class RuntimeSettings(BaseSettings):
     workspace_root: Path = Path(".")
     host: Host = "127.0.0.1"
     port: int = Field(default=8765, ge=1, le=65_535)
+    broker_host: Host = "127.0.0.1"
+    broker_port: int = Field(default=8811, ge=1, le=65_535)
+    broker_operations_port: int = Field(default=8812, ge=1, le=65_535)
+    broker_timeout_seconds: float = Field(default=5.0, gt=0.0, le=60.0)
+    broker_lease_duration_ms: int = Field(default=90_000, ge=10_000, le=600_000)
     mcp_path: McpPath = "/mcp"
     oauth_access_token_ttl_seconds: int = Field(default=3600, ge=60)
     oauth_refresh_token_ttl_seconds: int = Field(default=2_592_000, ge=3600)

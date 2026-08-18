@@ -1,8 +1,5 @@
 from pathlib import Path
 
-from chattocodex.consumer_group.consumer_group_coordinator import (
-    ConsumerGroupCoordinator,
-)
 from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
 from chattocodex.persistence.atomic_json_file import AtomicJsonFileError
 from chattocodex.persistence.runtime_config_repository import RuntimeConfigRepository
@@ -22,6 +19,9 @@ from chattocodex.worker_runtime.broker_ready_capacity_projection import (
 from chattocodex.worker_runtime.worker_assignment_lease_reconciler import (
     WorkerAssignmentLeaseReconciler,
 )
+from chattocodex.worker_runtime.worker_runtime_coordinator import (
+    WorkerRuntimeCoordinator,
+)
 from chattocodex.worker_runtime.worker_runtime_presence_tracker import (
     WorkerRuntimePresenceTracker,
 )
@@ -39,7 +39,7 @@ class WakeControlService:
         runtime_presence_tracker: WorkerRuntimePresenceTracker,
         ready_capacity_projection: BrokerReadyCapacityProjection | None = None,
         assignment_lease_reconciler: WorkerAssignmentLeaseReconciler | None = None,
-        consumer_group_coordinator: ConsumerGroupCoordinator | None = None,
+        worker_runtime_coordinator: WorkerRuntimeCoordinator | None = None,
         worker_provisioning_service: WorkerProvisioningService | None = None,
         lock_registry: EntityLockRegistry | None = None,
     ) -> None:
@@ -49,7 +49,7 @@ class WakeControlService:
         self._runtime_presence_tracker = runtime_presence_tracker
         self._ready_capacity_projection = ready_capacity_projection
         self._assignment_lease_reconciler = assignment_lease_reconciler
-        self._consumer_group_coordinator = consumer_group_coordinator
+        self._worker_runtime_coordinator = worker_runtime_coordinator
         self._worker_provisioning_service = worker_provisioning_service
         self._lock_registry = lock_registry
 
@@ -73,13 +73,13 @@ class WakeControlService:
                 self._assignment_lease_reconciler.reconcile_project(
                     project_id=project.project_id
                 )
-            if self._consumer_group_coordinator is not None:
-                self._consumer_group_coordinator.reconcile_project(
+            if self._worker_runtime_coordinator is not None:
+                self._worker_runtime_coordinator.reconcile_project(
                     project_id=project.project_id
                 )
             return self._wake_target_service.get_target(wake_target_id=wake_target_id)
-        if self._consumer_group_coordinator is not None:
-            self._consumer_group_coordinator.reconcile_membership(
+        if self._worker_runtime_coordinator is not None:
+            self._worker_runtime_coordinator.reconcile_runtime_topology(
                 project_id=project.project_id
             )
         return target
@@ -88,8 +88,8 @@ class WakeControlService:
         target = self._wake_target_service.get_target(wake_target_id=wake_target_id)
         self._require_connector_compatible(target=target)
         self._wake_presence_service.heartbeat(wake_target_id=wake_target_id)
-        if self._consumer_group_coordinator is not None:
-            self._consumer_group_coordinator.reconcile_membership(
+        if self._worker_runtime_coordinator is not None:
+            self._worker_runtime_coordinator.reconcile_runtime_topology(
                 project_id=target.project_id
             )
         return target
@@ -107,8 +107,8 @@ class WakeControlService:
                 )
             )
         self._runtime_presence_tracker.heartbeat(wake_target_id=wake_target_id)
-        if self._consumer_group_coordinator is not None:
-            self._consumer_group_coordinator.reconcile_project(
+        if self._worker_runtime_coordinator is not None:
+            self._worker_runtime_coordinator.reconcile_project(
                 project_id=target.project_id
             )
             return self._wake_target_service.get_target(wake_target_id=wake_target_id)
@@ -145,8 +145,8 @@ class WakeControlService:
             expected_revision=expected_revision,
             before_delete=self._retire_provisioning_ownership,
         )
-        if self._consumer_group_coordinator is not None:
-            self._consumer_group_coordinator.reconcile_project(
+        if self._worker_runtime_coordinator is not None:
+            self._worker_runtime_coordinator.reconcile_project(
                 project_id=retired.project_id
             )
         elif self._ready_capacity_projection is not None:
@@ -187,8 +187,8 @@ class WakeControlService:
                 ),
             )
 
-        if self._consumer_group_coordinator is not None:
-            return self._consumer_group_coordinator.mutate_project_and_reconcile(
+        if self._worker_runtime_coordinator is not None:
+            return self._worker_runtime_coordinator.mutate_project_and_reconcile(
                 project_id=project_id,
                 mutation=retire,
             )

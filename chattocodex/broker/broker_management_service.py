@@ -1,31 +1,20 @@
 from chattocodex.broker.broker_dto import BrokerTaskStatus, WorkerSlotStatus
 from chattocodex.broker.broker_management_dto import (
-    BrokerClusterSnapshot,
-    BrokerClusterTopology,
+    BrokerConsumerGroupState,
+    BrokerManagementSnapshot,
     BrokerNamespaceState,
-    BrokerNodeRole,
-    BrokerNodeState,
-    BrokerNodeStatus,
-    GroupCoordinatorAssignment,
 )
-from chattocodex.broker.group_coordinator_directory import (
-    GroupCoordinatorDirectory,
-    default_consumer_group_id,
-)
+from chattocodex.broker_client.broker_operations_gateway import BrokerOperationsGateway
 from chattocodex.orchestration.orchestration_dto import RunStatus
 from chattocodex.persistence.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.consumer_group_state_store import ConsumerGroupStateStore
 from chattocodex.persistence.orchestration_state_repository import RunStateRepository
-
-_DEFAULT_CLUSTER_ID = "local-broker-cluster"
-_DEFAULT_NODE_ID = "broker-0"
 
 
 class BrokerManagementService:
-    """Build a provider-independent management view over the shared work broker."""
+    """Combine Broker-authoritative Group state with local orchestration projections."""
 
     def __init__(
         self,
@@ -33,25 +22,15 @@ class BrokerManagementService:
         broker_task_repository: BrokerTaskRepository,
         slot_repository: WorkerSlotRepository,
         run_repository: RunStateRepository,
-        consumer_group_store: ConsumerGroupStateStore,
-        nodes: tuple[BrokerNodeState, ...] | None = None,
-        cluster_id: str = _DEFAULT_CLUSTER_ID,
+        broker_operations: BrokerOperationsGateway,
     ) -> None:
         self._broker_tasks = broker_task_repository
         self._slots = slot_repository
         self._runs = run_repository
-        self._consumer_groups = consumer_group_store
-        self._nodes = nodes or (
-            BrokerNodeState(
-                node_id=_DEFAULT_NODE_ID,
-                roles=(BrokerNodeRole.BROKER, BrokerNodeRole.CONTROLLER),
-                status=BrokerNodeStatus.ONLINE,
-            ),
-        )
-        self._cluster_id = cluster_id
-        self._coordinators = GroupCoordinatorDirectory(nodes=self._nodes)
+        self._broker_operations = broker_operations
 
-    def snapshot(self, *, project_ids: tuple[str, ...]) -> BrokerClusterSnapshot:
+    def snapshot(self, *, project_ids: tuple[str, ...]) -> BrokerManagementSnapshot:
+        directory = self._broker_operations.group_directory()
         tasks = self._broker_tasks.list_all()
         slots = self._slots.list_all()
         task_by_id = {task.broker_task_id: task for task in tasks}
@@ -65,7 +44,6 @@ class BrokerManagementService:
         )
 
         namespaces: list[BrokerNamespaceState] = []
-        coordinators: list[GroupCoordinatorAssignment] = []
         for project_id in sorted(namespace_ids):
             project_tasks = tuple(
                 task
@@ -80,22 +58,6 @@ class BrokerManagementService:
                 self._is_ready(task=task, task_by_id=task_by_id, run_by_id=run_by_id)
                 for task in project_tasks
             )
-            group_count = 0
-            if self._consumer_groups.exists(project_id=project_id):
-                group = self._consumer_groups.read(project_id=project_id)
-                group_id = default_consumer_group_id(project_id=project_id)
-                coordinators.append(
-                    GroupCoordinatorAssignment(
-                        group_id=group_id,
-                        project_id=project_id,
-                        coordinator_node_id=self._coordinators.coordinator_node_id(
-                            group_id=group_id
-                        ),
-                        generation=group.generation,
-                        member_count=len(group.member_ids),
-                    )
-                )
-                group_count = 1
             namespaces.append(
                 BrokerNamespaceState(
                     project_id=project_id,
@@ -118,23 +80,24 @@ class BrokerManagementService:
                     busy_slot_count=_count_slot_status(
                         slots=project_slots, status=WorkerSlotStatus.BUSY
                     ),
-                    consumer_group_count=group_count,
                 )
             )
 
-        controller_node_id = self._controller_node_id()
-        topology = (
-            BrokerClusterTopology.EMBEDDED_SINGLE_NODE
-            if len(self._nodes) == 1
-            else BrokerClusterTopology.MULTI_NODE
+        consumer_groups = tuple(
+            BrokerConsumerGroupState(
+                group_id=group.group_id,
+                namespace_id=group.namespace_id,
+                generation=group.generation,
+                group_revision=group.group_revision,
+                consumer_count=group.consumer_count,
+            )
+            for group in directory.groups
         )
-        return BrokerClusterSnapshot(
-            cluster_id=self._cluster_id,
-            topology=topology,
-            controller_node_id=controller_node_id,
-            nodes=self._nodes,
+        return BrokerManagementSnapshot(
+            term=directory.term,
+            revision=directory.revision,
             namespaces=tuple(namespaces),
-            group_coordinators=tuple(coordinators),
+            consumer_groups=consumer_groups,
             queued_count=sum(namespace.queued_count for namespace in namespaces),
             ready_count=sum(namespace.ready_count for namespace in namespaces),
             claimed_count=sum(namespace.claimed_count for namespace in namespaces),
@@ -156,19 +119,6 @@ class BrokerManagementService:
             and task_by_id[dependency_id].status is BrokerTaskStatus.COMPLETED
             for dependency_id in task.depends_on
         )
-
-    def _controller_node_id(self) -> str:
-        controller_nodes = tuple(
-            node
-            for node in self._nodes
-            if node.status is BrokerNodeStatus.ONLINE
-            and BrokerNodeRole.CONTROLLER in node.roles
-        )
-        if not controller_nodes:
-            raise ValueError(
-                "Broker cluster requires at least one online controller node."
-            )
-        return sorted(controller_nodes, key=lambda node: node.node_id)[0].node_id
 
 
 def _count_task_status(*, tasks, status: BrokerTaskStatus) -> int:
