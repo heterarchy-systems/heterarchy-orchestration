@@ -22,7 +22,7 @@ from chattocodex.orchestrator_mcp.transport.mcp_transport_security import (
 from chattocodex.shared.contracts.broker.broker_gateway_contract import (
     WorkBrokerGateway,
 )
-from chattocodex.shared.security.owner_token_service import OwnerTokenService
+from chattocodex.shared.security.runtime_access_service import OwnerTokenService
 from chattocodex.shared.settings.runtime_config_repository import (
     RuntimeConfigRepository,
 )

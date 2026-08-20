@@ -11,7 +11,7 @@ from chattocodex.orchestrator_mcp.auth.oauth_dto import OAuthServerOptions
 from chattocodex.orchestrator_mcp.auth.single_user_oauth_provider import (
     SingleUserOAuthProvider,
 )
-from chattocodex.shared.security.owner_token_service import OwnerTokenService
+from chattocodex.shared.security.runtime_access_service import OwnerTokenService
 
 _MCP_SCOPE = "chattocodex"
 _OFFLINE_ACCESS_SCOPE = "offline_access"

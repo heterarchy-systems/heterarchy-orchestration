@@ -21,7 +21,7 @@ from chattocodex.orchestrator_backend.wake.browser.worker_browser_runtime_servic
 )
 from chattocodex.orchestrator_mcp.composition.mcp_server import serve_configured
 from chattocodex.shared.contracts.setup_schemas import SetupRequest
-from chattocodex.shared.security.owner_token_service import OwnerTokenService
+from chattocodex.shared.security.runtime_access_service import OwnerTokenService
 from chattocodex.shared.settings.runtime_settings import RuntimeSettings
 
 

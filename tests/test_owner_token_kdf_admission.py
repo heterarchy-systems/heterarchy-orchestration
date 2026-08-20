@@ -3,7 +3,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from chattocodex.auth.owner_token_service import (
+from chattocodex.shared.security.runtime_access_service import (
     OwnerTokenService,
     _derive_digest,
 )
@@ -39,7 +39,7 @@ def test_concurrent_owner_token_verification_bounds_scrypt_execution(
         return service.verify(candidate=candidate)
 
     monkeypatch.setattr(
-        "chattocodex.auth.owner_token_service._derive_digest",
+        "chattocodex.shared.security.runtime_access_service._derive_digest",
         measured_digest,
     )
     with ThreadPoolExecutor(max_workers=caller_count) as executor:

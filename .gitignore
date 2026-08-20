@@ -20,3 +20,8 @@ dist/
 .chatgpt2codex/
 .codex/
 ChatToCodex_Codex_Implementation_Prompt.md
+
+# macOS document-provider conflict copies for generated Control Panel assets
+chattocodex/orchestrator_backend/control_panel/static/* [0-9].*
+chattocodex/orchestrator_backend/control_panel/static/* [0-9]/
+*.tsbuildinfo

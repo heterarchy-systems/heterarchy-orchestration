@@ -10,7 +10,7 @@ from chattocodex.orchestrator_mcp.composition.mcp_server import create_mcp_serve
 from chattocodex.orchestrator_mcp.transport.mcp_transport_security import (
     build_mcp_transport_security,
 )
-from chattocodex.shared.security.owner_token_service import OwnerTokenService
+from chattocodex.shared.security.runtime_access_service import OwnerTokenService
 from tests.broker_support import FakeWorkBrokerGateway
 
 _PUBLIC_ORIGIN = "https://stands-confidence-void-walter.trycloudflare.com"

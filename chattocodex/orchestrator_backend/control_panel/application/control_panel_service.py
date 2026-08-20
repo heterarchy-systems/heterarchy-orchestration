@@ -51,7 +51,7 @@ from chattocodex.shared.contracts.control_panel.control_panel_schemas import (
     normalize_workspace_path,
 )
 from chattocodex.shared.contracts.setup_schemas import SetupRequest
-from chattocodex.shared.security.owner_token_service import (
+from chattocodex.shared.security.runtime_access_service import (
     OwnerTokenRevisionConflictError,
     OwnerTokenService,
 )

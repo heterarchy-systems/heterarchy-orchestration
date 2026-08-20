@@ -12,7 +12,7 @@ from chattocodex.shared.contracts.setup_schemas import (
     SetupOutput,
     SetupRequest,
 )
-from chattocodex.shared.security.owner_token_service import OwnerTokenService
+from chattocodex.shared.security.runtime_access_service import OwnerTokenService
 from chattocodex.shared.settings.runtime_config_repository import (
     RuntimeConfigRepository,
 )

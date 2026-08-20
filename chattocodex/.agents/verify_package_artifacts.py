@@ -34,6 +34,27 @@ def _run(*args: str) -> None:
 
 
 def main() -> int:
+    tracked_paths = subprocess.run(
+        ("git", "ls-files", "-z", "--", CONTROL_PANEL_STATIC_ROOT),
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    ).stdout.split("\0")
+    tracked_root_entries = {
+        relative_path.removeprefix(CONTROL_PANEL_STATIC_ROOT).split("/", 1)[0]
+        for relative_path in tracked_paths
+        if relative_path
+        and (PROJECT_ROOT / relative_path).exists()
+        and relative_path.removeprefix(CONTROL_PANEL_STATIC_ROOT)
+    }
+    errors = [
+        f"tracked source contains unexpected Control Panel root entry: {entry_name}"
+        for entry_name in sorted(
+            tracked_root_entries - ALLOWED_CONTROL_PANEL_ROOT_ENTRIES
+        )
+    ]
     with TemporaryDirectory(prefix="chattocodex-package-check-") as temporary_root:
         output_root = Path(temporary_root)
         _run(
@@ -60,11 +81,11 @@ def main() -> int:
         with ZipFile(wheel) as archive:
             names = tuple(archive.namelist())
 
-    errors = [
+    errors.extend(
         f"wheel is missing required file: {required_file}"
         for required_file in REQUIRED_FILES
         if required_file not in names
-    ]
+    )
     errors.extend(
         f"wheel is missing required content: {required_prefix}"
         for required_prefix in REQUIRED_PREFIXES

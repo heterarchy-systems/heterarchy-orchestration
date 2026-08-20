@@ -4,13 +4,13 @@ import secrets
 from pathlib import Path
 from threading import BoundedSemaphore
 
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.persistence.atomic_json_file import (
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.shared.contracts.auth_schemas import OwnerTokenRecord
+from chattocodex.shared.storage.atomic_json_file import (
     read_json_model,
     write_json_model,
 )
-from chattocodex.persistence.runtime_lock_layout import RuntimeLockLayout
-from chattocodex.schemas.auth_schemas import OwnerTokenRecord
+from chattocodex.shared.storage.runtime_lock_layout import RuntimeLockLayout
 
 _OWNER_TOKEN_LOCK_KEY = "owner-token"
 _VERIFY_KDF_ADMISSION = BoundedSemaphore(1)
@@ -21,7 +21,8 @@ class OwnerTokenRevisionConflictError(RuntimeError):
 
 
 class OwnerTokenService:
-    def __init__(self, *, state_root: Path) -> None:
+    def __init__(self, state_root: Path) -> None:
+        """Initialize this object. Args: state_root. Returns: None."""
         normalized_state_root = state_root.expanduser().resolve()
         self._token_path = normalized_state_root / "auth" / "owner-token.json"
         self._locks = EntityLockRegistry(
@@ -32,9 +33,11 @@ class OwnerTokenService:
         )
 
     def is_configured(self) -> bool:
+        """Is configured. Args: None. Returns: bool."""
         return self._token_path.is_file()
 
     def generate(self) -> str:
+        """Generate. Args: None. Returns: str."""
         with self._locks.hold(entity_key=_OWNER_TOKEN_LOCK_KEY):
             observed_record = self._read_record_if_configured()
 
@@ -49,6 +52,7 @@ class OwnerTokenService:
         return owner_token
 
     def ensure_configured(self) -> str | None:
+        """Ensure configured. Args: None. Returns: str | None."""
         with self._locks.hold(entity_key=_OWNER_TOKEN_LOCK_KEY):
             if self._read_record_if_configured() is not None:
                 return None
@@ -61,7 +65,8 @@ class OwnerTokenService:
             write_json_model(path=self._token_path, record=record)
         return owner_token
 
-    def verify(self, *, candidate: str) -> bool:
+    def verify(self, candidate: str) -> bool:
+        """Verify. Args: candidate. Returns: bool."""
         with self._locks.hold(entity_key=_OWNER_TOKEN_LOCK_KEY):
             observed_record = self._read_record_if_configured()
         if observed_record is None:
@@ -77,6 +82,7 @@ class OwnerTokenService:
             return self._read_record_if_configured() == observed_record
 
     def _prepare_replacement(self) -> tuple[str, OwnerTokenRecord]:
+        """Prepare replacement. Args: None. Returns: tuple[str, OwnerTokenRecord]."""
         owner_token = f"cto_owner_{secrets.token_urlsafe(32)}"
         salt = secrets.token_bytes(16)
         digest = _derive_digest(token=owner_token, salt=salt)
@@ -86,6 +92,7 @@ class OwnerTokenService:
         )
 
     def _read_record_if_configured(self) -> OwnerTokenRecord | None:
+        """Read record if configured. Args: None. Returns: OwnerTokenRecord | None."""
         if not self._token_path.is_file():
             return None
         return read_json_model(
@@ -94,7 +101,8 @@ class OwnerTokenService:
         )
 
 
-def _derive_digest(*, token: str, salt: bytes) -> bytes:
+def _derive_digest(token: str, salt: bytes) -> bytes:
+    """Derive digest. Args: token, salt. Returns: bytes."""
     return hashlib.scrypt(
         token.encode("utf-8"),
         salt=salt,

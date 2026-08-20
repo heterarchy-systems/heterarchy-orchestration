@@ -3,14 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "npm run build:legacy && next dev",
+    "clean": "node scripts/clean-build-artifacts.mjs all",
+    "dev": "npm run clean && npm run build:legacy && next dev",
     "build:legacy": "tsc -p tsconfig.legacy.json",
     "typecheck": "tsc --noEmit",
-    "build:next": "next build",
+    "build:next": "node scripts/clean-build-artifacts.mjs next && next build",
     "verify:sync": "node scripts/verify-export-sync.mjs",
     "verify:lock": "node scripts/verify-lock.mjs",
-    "build": "npm run build:legacy && npm run build:next && node scripts/sync-export.mjs",
-    "check": "npm run build:legacy && npm run typecheck && npm run build:next && npm run verify:sync"
+    "build": "npm run clean && npm run build:legacy && npm run build:next && node scripts/sync-export.mjs",
+    "check": "npm run clean && npm run build:legacy && npm run typecheck && npm run build:next && npm run verify:sync"
   },
   "dependencies": {
     "next": "16.2.12",

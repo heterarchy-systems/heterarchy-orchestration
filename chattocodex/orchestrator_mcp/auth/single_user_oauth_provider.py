@@ -31,7 +31,7 @@ from chattocodex.shared.contracts.auth_schemas import (
     PendingAuthorizationRecord,
     RefreshTokenRecord,
 )
-from chattocodex.shared.security.owner_token_service import OwnerTokenService
+from chattocodex.shared.security.runtime_access_service import OwnerTokenService
 from chattocodex.shared.storage.runtime_lock_layout import RuntimeLockLayout
 
 

@@ -11,6 +11,21 @@ const packagedRoot = resolve(
   "../../chattocodex/orchestrator_backend/control_panel/static",
 );
 
+const allowedRootEntries = new Set([
+  "_next",
+  "app.js",
+  "frontend-source.sha256",
+  "index.html",
+]);
+const unexpectedRootEntries = (await readdir(packagedRoot)).filter(
+  (entry) => !allowedRootEntries.has(entry),
+);
+if (unexpectedRootEntries.length > 0) {
+  throw new Error(
+    `Packaged Control Panel contains unexpected root entries: ${unexpectedRootEntries.join(", ")}`,
+  );
+}
+
 const expectedDigest = await frontendSourceDigest(frontendRoot);
 const packagedDigest = (
   await readFile(resolve(packagedRoot, "frontend-source.sha256"), "utf8")

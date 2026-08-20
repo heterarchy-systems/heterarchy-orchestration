@@ -16,7 +16,7 @@ from pydantic import AnyUrl
 from chattocodex.orchestrator_mcp.auth.single_user_oauth_provider import (
     SingleUserOAuthProvider,
 )
-from chattocodex.shared.security.owner_token_service import OwnerTokenService
+from chattocodex.shared.security.runtime_access_service import OwnerTokenService
 
 _PUBLIC_URL = "https://agent.example.test"
 _RESOURCE_URL = f"{_PUBLIC_URL}/mcp"

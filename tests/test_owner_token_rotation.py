@@ -4,13 +4,17 @@ from pathlib import Path
 
 from starlette.testclient import TestClient
 
-from chattocodex.auth.owner_token_service import (
+from chattocodex.orchestrator_backend.control_panel.application.control_panel_service import (
+    ControlPanelService,
+)
+from chattocodex.orchestrator_backend.control_panel.interface.routes.control_panel_routes import (
+    create_control_panel_app,
+)
+from chattocodex.shared.security.runtime_access_service import (
     OwnerTokenRevisionConflictError,
     OwnerTokenService,
     _derive_digest,
 )
-from chattocodex.control_panel.control_panel_routes import create_control_panel_app
-from chattocodex.control_panel.control_panel_service import ControlPanelService
 
 
 def _race_digest(*, barrier: threading.Barrier):
@@ -34,7 +38,7 @@ def test_independent_owner_token_services_allow_one_concurrent_rotation(
 
     with monkeypatch.context() as context:
         context.setattr(
-            "chattocodex.auth.owner_token_service._derive_digest",
+            "chattocodex.shared.security.runtime_access_service._derive_digest",
             _race_digest(barrier=barrier),
         )
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -77,7 +81,7 @@ def test_verify_rejects_old_token_when_rotation_commits_during_kdf(
 
     with monkeypatch.context() as context:
         context.setattr(
-            "chattocodex.auth.owner_token_service._derive_digest",
+            "chattocodex.shared.security.runtime_access_service._derive_digest",
             paused_old_token_digest,
         )
         with ThreadPoolExecutor(max_workers=1) as executor:
@@ -101,7 +105,7 @@ def test_concurrent_ensure_configured_creates_once_without_rotating(
 
     with monkeypatch.context() as context:
         context.setattr(
-            "chattocodex.auth.owner_token_service._derive_digest",
+            "chattocodex.shared.security.runtime_access_service._derive_digest",
             _race_digest(barrier=barrier),
         )
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -133,7 +137,7 @@ def test_control_panel_returns_one_success_for_concurrent_owner_token_rotation(
 
     with left_client, right_client, monkeypatch.context() as context:
         context.setattr(
-            "chattocodex.auth.owner_token_service._derive_digest",
+            "chattocodex.shared.security.runtime_access_service._derive_digest",
             _race_digest(barrier=barrier),
         )
         with ThreadPoolExecutor(max_workers=2) as executor:
