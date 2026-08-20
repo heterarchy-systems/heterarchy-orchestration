@@ -9,6 +9,7 @@ const extensionRoot = path.resolve(
   __dirname,
   "..",
   "chattocodex",
+  "orchestrator_backend",
   "wake",
   "chrome_extension",
 );

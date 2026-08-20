@@ -5,29 +5,43 @@ from threading import Event
 
 import pytest
 
-import chattocodex.broker.broker_service as broker_service_module
-from chattocodex.broker.broker_dto import BrokerTaskStatus, WorkerSlotStatus
-from chattocodex.broker.broker_service import BrokerService
-from chattocodex.git.git_command_runner import GitCommandRunner
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.orchestration_dto import TaskStatus, WorkerStatus
-from chattocodex.orchestration.orchestration_exceptions import (
+import chattocodex.orchestrator_backend.broker.broker_service as broker_service_module
+from chattocodex.orchestrator_backend.broker.broker_dto import (
+    BrokerTaskStatus,
+    WorkerSlotStatus,
+)
+from chattocodex.orchestrator_backend.broker.broker_service import BrokerService
+from chattocodex.orchestrator_backend.version_control.git_command_runner import (
+    GitCommandRunner,
+)
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.orchestration.orchestration_dto import (
+    TaskStatus,
+    WorkerStatus,
+)
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
     CapabilityDeniedError,
     InvalidTransitionError,
     StatePersistenceError,
 )
-from chattocodex.orchestration.run_orchestration_service import RunOrchestrationService
-from chattocodex.orchestration.worker_execution_service import WorkerExecutionService
-from chattocodex.persistence.broker_repository import (
+from chattocodex.orchestrator_backend.orchestration.run_orchestration_service import (
+    RunOrchestrationService,
+)
+from chattocodex.orchestrator_backend.orchestration.worker_execution_service import (
+    WorkerExecutionService,
+)
+from chattocodex.orchestrator_backend.persistence.broker.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.orchestration_state_repository import (
+from chattocodex.orchestrator_backend.persistence.orchestration.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
     WorkerStateRepository,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 from tests.broker_support import FakeWorkBrokerGateway
 
 
@@ -366,17 +380,18 @@ def test_reclaim_serializes_capability_rotation_before_stale_claim(
     claim_reached_task_selection = Event()
     allow_claim = Event()
     original_new_slot_handle = broker_service_module._new_slot_handle
-    original_next_ready_task = runtime.broker_service._next_ready_task
+    claim_service = runtime.broker_service._assignment_claim_service
+    original_next_ready_task = claim_service._next_ready_task
 
     def paused_new_slot_handle() -> str:
         reclaim_holds_locks.set()
         assert allow_reclaim.wait(timeout=5)
         return original_new_slot_handle()
 
-    def paused_next_ready_task(*, project_id: str):
+    def paused_next_ready_task(*, project_id: str, run_id: str | None = None):
         claim_reached_task_selection.set()
         assert allow_claim.wait(timeout=5)
-        return original_next_ready_task(project_id=project_id)
+        return original_next_ready_task(project_id=project_id, run_id=run_id)
 
     monkeypatch.setattr(
         broker_service_module,
@@ -384,7 +399,7 @@ def test_reclaim_serializes_capability_rotation_before_stale_claim(
         paused_new_slot_handle,
     )
     monkeypatch.setattr(
-        runtime.broker_service,
+        claim_service,
         "_next_ready_task",
         paused_next_ready_task,
     )
@@ -456,12 +471,13 @@ def test_claim_serializes_assignment_before_competing_reclaim(
     claim_holds_locks = Event()
     allow_claim = Event()
     reclaim_started = Event()
-    original_next_ready_task = runtime.broker_service._next_ready_task
+    claim_service = runtime.broker_service._assignment_claim_service
+    original_next_ready_task = claim_service._next_ready_task
 
-    def paused_next_ready_task(*, project_id: str):
+    def paused_next_ready_task(*, project_id: str, run_id: str | None = None):
         claim_holds_locks.set()
         assert allow_claim.wait(timeout=5)
-        return original_next_ready_task(project_id=project_id)
+        return original_next_ready_task(project_id=project_id, run_id=run_id)
 
     def reclaim_after_claim_starts():
         reclaim_started.set()
@@ -471,7 +487,7 @@ def test_claim_serializes_assignment_before_competing_reclaim(
         )
 
     monkeypatch.setattr(
-        runtime.broker_service,
+        claim_service,
         "_next_ready_task",
         paused_next_ready_task,
     )

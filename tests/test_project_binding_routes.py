@@ -2,41 +2,63 @@ from pathlib import Path
 
 from starlette.testclient import TestClient
 
-from chattocodex.control_panel.control_panel_routes import create_control_panel_app
-from chattocodex.control_panel.control_panel_service import ControlPanelService
-from chattocodex.main_runtime.main_review_chat_presence_tracker import (
+from chattocodex.orchestrator_backend.control_panel.interface.routes.control_panel_routes import (
+    create_control_panel_app,
+)
+from chattocodex.orchestrator_backend.control_panel.application.control_panel_service import (
+    ControlPanelService,
+)
+from chattocodex.orchestrator_backend.main_runtime.presence.main_review_chat_presence_tracker import (
     MainReviewChatPresenceTracker,
 )
-from chattocodex.main_runtime.main_review_project_catalog import (
+from chattocodex.orchestrator_backend.main_runtime.application.main_review_project_catalog import (
     MainReviewProjectCatalog,
 )
-from chattocodex.main_runtime.main_review_route_adapter import MainReviewRouteAdapter
-from chattocodex.main_runtime.main_review_target_coordinator import (
+from chattocodex.orchestrator_backend.main_runtime.interface.main_review_route_adapter import (
+    MainReviewRouteAdapter,
+)
+from chattocodex.orchestrator_backend.main_runtime.target.main_review_target_coordinator import (
     MainReviewTargetCoordinator,
 )
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.persistence.main_review_chat_presence_store import (
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.persistence.main_runtime.main_review_chat_presence_store import (
     MainReviewChatPresenceStore,
 )
-from chattocodex.persistence.main_review_target_store import MainReviewTargetStore
-from chattocodex.persistence.project_binding_repository import (
+from chattocodex.orchestrator_backend.persistence.main_runtime.main_review_target_store import (
+    MainReviewTargetStore,
+)
+from chattocodex.orchestrator_backend.persistence.project.project_binding_repository import (
     ProjectBindingRepository,
 )
-from chattocodex.persistence.run_control_state_store import RunControlStateStore
-from chattocodex.persistence.runtime_config_repository import RuntimeConfigRepository
-from chattocodex.persistence.wake_presence_repository import WakePresenceRepository
-from chattocodex.persistence.wake_target_repository import WakeTargetRepository
-from chattocodex.persistence.worker_runtime_presence_store import (
+from chattocodex.orchestrator_backend.persistence.orchestration.run_control_state_store import (
+    RunControlStateStore,
+)
+from chattocodex.shared.settings.runtime_config_repository import (
+    RuntimeConfigRepository,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_presence_repository import (
+    WakePresenceRepository,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_target_repository import (
+    WakeTargetRepository,
+)
+from chattocodex.orchestrator_backend.persistence.worker.worker_runtime_presence_store import (
     WorkerRuntimePresenceStore,
 )
-from chattocodex.project_runtime.project_binding_service import (
+from chattocodex.orchestrator_backend.project_runtime.project_binding_service import (
     ProjectBindingService,
 )
-from chattocodex.schemas.auth_schemas import RuntimeConfigRecord
-from chattocodex.wake.wake_control_service import WakeControlService
-from chattocodex.wake.wake_presence_service import WakePresenceService
-from chattocodex.wake.wake_target_service import WakeTargetService
-from chattocodex.worker_runtime.worker_runtime_presence_tracker import (
+from chattocodex.shared.contracts.auth_schemas import RuntimeConfigRecord
+from chattocodex.orchestrator_backend.wake.wake_control_service import (
+    WakeControlService,
+)
+from chattocodex.orchestrator_backend.wake.presence.wake_presence_service import (
+    WakePresenceService,
+)
+from chattocodex.orchestrator_backend.wake.target.wake_target_service import (
+    WakeTargetService,
+)
+from chattocodex.orchestrator_backend.worker_runtime.presence.worker_runtime_presence_tracker import (
     WorkerRuntimePresenceTracker,
 )
 

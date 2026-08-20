@@ -5,10 +5,12 @@ from urllib.parse import parse_qs, urlparse
 
 from starlette.testclient import TestClient
 
-from chattocodex.auth.oauth_dto import OAuthServerOptions
-from chattocodex.auth.owner_token_service import OwnerTokenService
-from chattocodex.mcp_server import create_mcp_server
-from chattocodex.remote.mcp_transport_security import build_mcp_transport_security
+from chattocodex.orchestrator_mcp.auth.oauth_dto import OAuthServerOptions
+from chattocodex.orchestrator_mcp.composition.mcp_server import create_mcp_server
+from chattocodex.orchestrator_mcp.transport.mcp_transport_security import (
+    build_mcp_transport_security,
+)
+from chattocodex.shared.security.owner_token_service import OwnerTokenService
 from tests.broker_support import FakeWorkBrokerGateway
 
 _PUBLIC_ORIGIN = "https://stands-confidence-void-walter.trycloudflare.com"

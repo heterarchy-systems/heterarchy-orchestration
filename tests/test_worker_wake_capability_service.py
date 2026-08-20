@@ -3,15 +3,17 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.orchestration_exceptions import CapabilityDeniedError
-from chattocodex.persistence.worker_wake_capability_repository import (
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
+    CapabilityDeniedError,
+)
+from chattocodex.orchestrator_backend.persistence.worker.worker_wake_capability_repository import (
     WorkerWakeCapabilityRepository,
 )
-from chattocodex.wake.worker_wake_capability_dto import (
+from chattocodex.orchestrator_backend.wake.capability.worker_wake_capability_dto import (
     WorkerWakeCapabilityStatus,
 )
-from chattocodex.wake.worker_wake_capability_service import (
+from chattocodex.orchestrator_backend.wake.capability.worker_wake_capability_service import (
     WorkerWakeCapabilityService,
 )
 

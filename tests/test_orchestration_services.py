@@ -6,23 +6,31 @@ from threading import Barrier
 
 import pytest
 
-from chattocodex.git.git_command_runner import GitCommandRunner
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.orchestration_dto import TaskStatus
-from chattocodex.orchestration.orchestration_exceptions import (
+from chattocodex.orchestrator_backend.version_control.git_command_runner import (
+    GitCommandRunner,
+)
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.orchestration.orchestration_dto import TaskStatus
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
     AssignmentMismatchError,
     CapabilityDeniedError,
     InvalidTransitionError,
     RevisionConflictError,
 )
-from chattocodex.orchestration.run_orchestration_service import RunOrchestrationService
-from chattocodex.orchestration.worker_execution_service import WorkerExecutionService
-from chattocodex.persistence.orchestration_state_repository import (
+from chattocodex.orchestrator_backend.orchestration.run_orchestration_service import (
+    RunOrchestrationService,
+)
+from chattocodex.orchestrator_backend.orchestration.worker_execution_service import (
+    WorkerExecutionService,
+)
+from chattocodex.orchestrator_backend.persistence.orchestration.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
     WorkerStateRepository,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 from tests.broker_support import build_broker_service, claim_broker_task
 
 

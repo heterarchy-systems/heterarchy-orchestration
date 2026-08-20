@@ -2,10 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.persistence import atomic_json_file
-from chattocodex.persistence.atomic_json_file import (
-    AtomicJsonFileError,
+import chattocodex.shared.storage.atomic_json_file as atomic_json_file
+from chattocodex.shared.contracts.auth_schemas import RuntimeConfigRecord
+from chattocodex.shared.storage.atomic_json_file import (
+    AtomicJsonFileNotFoundError,
     delete_json_file,
+    read_json_model,
 )
 
 
@@ -31,5 +33,13 @@ def test_delete_json_file_has_explicit_missing_semantics(tmp_path: Path) -> None
     path = tmp_path / "missing.json"
 
     assert not delete_json_file(path=path, missing_ok=True)
-    with pytest.raises(AtomicJsonFileError):
+    with pytest.raises(AtomicJsonFileNotFoundError):
         delete_json_file(path=path, missing_ok=False)
+
+
+def test_read_json_model_has_typed_missing_semantics(tmp_path: Path) -> None:
+    with pytest.raises(AtomicJsonFileNotFoundError):
+        read_json_model(
+            path=tmp_path / "missing.json",
+            record_type=RuntimeConfigRecord,
+        )

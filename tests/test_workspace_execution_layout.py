@@ -1,9 +1,13 @@
 import subprocess
 from pathlib import Path
 
-from chattocodex.git.git_command_runner import GitCommandRunner
-from chattocodex.git.git_exceptions import GitWorktreeError
-from chattocodex.project_runtime.workspace_execution_layout import (
+from chattocodex.orchestrator_backend.version_control.git_command_runner import (
+    GitCommandRunner,
+)
+from chattocodex.orchestrator_backend.version_control.git_exceptions import (
+    GitWorktreeError,
+)
+from chattocodex.shared.pathing.workspace_execution_layout import (
     WorkspaceExecutionLayout,
 )
 

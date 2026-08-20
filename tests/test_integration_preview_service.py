@@ -3,12 +3,18 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.git.git_result_dto import WorkerResultCommit
-from chattocodex.integration.integration_preview_service import (
+from chattocodex.orchestrator_backend.version_control.git_result_dto import (
+    WorkerResultCommit,
+)
+from chattocodex.orchestrator_backend.integration.integration_preview_service import (
     IntegrationPreviewService,
 )
-from chattocodex.orchestration.orchestration_exceptions import InvalidTransitionError
-from chattocodex.persistence.worker_result_repository import WorkerResultRepository
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
+    InvalidTransitionError,
+)
+from chattocodex.orchestrator_backend.persistence.worker.worker_result_repository import (
+    WorkerResultRepository,
+)
 
 
 def _save_result(

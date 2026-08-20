@@ -3,19 +3,31 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.broker.broker_service import BrokerService
-from chattocodex.git.git_command_runner import GitCommandRunner
-from chattocodex.git.git_exceptions import GitWorktreeError
-from chattocodex.git.worker_git_worktree_service import WorkerGitWorktreeService
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.run_orchestration_service import RunOrchestrationService
-from chattocodex.persistence.git_worktree_repository import GitWorktreeRepository
-from chattocodex.persistence.orchestration_state_repository import (
+from chattocodex.orchestrator_backend.broker.broker_service import BrokerService
+from chattocodex.orchestrator_backend.version_control.git_command_runner import (
+    GitCommandRunner,
+)
+from chattocodex.orchestrator_backend.version_control.git_exceptions import (
+    GitWorktreeError,
+)
+from chattocodex.orchestrator_backend.version_control.worker_git_worktree_service import (
+    WorkerGitWorktreeService,
+)
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.orchestration.run_orchestration_service import (
+    RunOrchestrationService,
+)
+from chattocodex.orchestrator_backend.persistence.version_control.git_worktree_repository import (
+    GitWorktreeRepository,
+)
+from chattocodex.orchestrator_backend.persistence.orchestration.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
     WorkerStateRepository,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 from tests.broker_support import build_broker_service, claim_broker_task
 
 

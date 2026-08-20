@@ -1,12 +1,16 @@
+import json
+
 import pytest
 from pydantic import ValidationError
 
-from chattocodex.control_panel.control_panel_dto import RemoteMode
-from chattocodex.schemas.control_panel_schemas import (
+from chattocodex.orchestrator_backend.control_panel.domain.control_panel_dto import (
+    RemoteMode,
+)
+from chattocodex.shared.contracts.control_panel.control_panel_schemas import (
     ControlPanelPreferencesRequest,
     normalize_custom_origin,
 )
-from chattocodex.schemas.wake_schemas import WakeTargetRetireBatchRequest
+from chattocodex.shared.contracts.wake.wake_schemas import WakeTargetRetireBatchRequest
 
 
 def test_custom_origin_normalization_accepts_hostname() -> None:
@@ -31,20 +35,37 @@ def test_quick_mode_rejects_custom_origin() -> None:
 
 
 def test_batch_retirement_schema_accepts_nonempty_unique_project_targets() -> None:
-    payload = WakeTargetRetireBatchRequest.model_validate(
-        {
-            "project_id": "prj_sample_12345678",
-            "targets": [
-                {
-                    "wake_target_id": f"wtgt_{index:032x}",
-                    "expected_revision": index,
-                }
-                for index in (1, 2)
-            ],
-        }
+    payload = WakeTargetRetireBatchRequest.model_validate_json(
+        json.dumps(
+            {
+                "project_id": "prj_sample_12345678",
+                "targets": [
+                    {
+                        "wake_target_id": f"wtgt_{index:032x}",
+                        "expected_revision": index,
+                    }
+                    for index in (1, 2)
+                ],
+            }
+        )
     )
 
     assert len(payload.targets) == 2
+
+
+def test_batch_retirement_schema_rejects_python_list_coercion() -> None:
+    with pytest.raises(ValidationError):
+        WakeTargetRetireBatchRequest.model_validate(
+            {
+                "project_id": "prj_sample_12345678",
+                "targets": [
+                    {
+                        "wake_target_id": "wtgt_00000000000000000000000000000001",
+                        "expected_revision": 1,
+                    }
+                ],
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -75,6 +96,6 @@ def test_batch_retirement_schema_rejects_invalid_target_collection(
     targets: list[dict[str, object]],
 ) -> None:
     with pytest.raises(ValidationError):
-        WakeTargetRetireBatchRequest.model_validate(
-            {"project_id": "prj_sample_12345678", "targets": targets}
+        WakeTargetRetireBatchRequest.model_validate_json(
+            json.dumps({"project_id": "prj_sample_12345678", "targets": targets})
         )

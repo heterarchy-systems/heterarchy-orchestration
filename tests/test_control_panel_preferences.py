@@ -1,11 +1,17 @@
 from pathlib import Path
 
-from chattocodex.control_panel.control_panel_dto import RemoteMode
-from chattocodex.control_panel.control_panel_preferences_repository import (
+from chattocodex.orchestrator_backend.control_panel.domain.control_panel_dto import (
+    RemoteMode,
+)
+from chattocodex.orchestrator_backend.control_panel.infrastructure.control_panel_preferences_repository import (
     ControlPanelPreferencesRepository,
 )
-from chattocodex.control_panel.control_panel_service import ControlPanelService
-from chattocodex.schemas.control_panel_schemas import ControlPanelPreferencesRequest
+from chattocodex.orchestrator_backend.control_panel.application.control_panel_service import (
+    ControlPanelService,
+)
+from chattocodex.shared.contracts.control_panel.control_panel_schemas import (
+    ControlPanelPreferencesRequest,
+)
 
 
 def _workspace(tmp_path: Path) -> Path:

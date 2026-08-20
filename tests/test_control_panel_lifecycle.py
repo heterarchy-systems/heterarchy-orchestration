@@ -4,15 +4,27 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.control_panel.cloudflare_process_supervisor import (
+from chattocodex.orchestrator_backend.control_panel.infrastructure.cloudflare_process_supervisor import (
     CloudflareProcessSupervisor,
 )
-from chattocodex.control_panel.control_panel_dto import RemoteMode
-from chattocodex.control_panel.control_panel_exceptions import RuntimeLifecycleError
-from chattocodex.control_panel.control_panel_service import ControlPanelService
-from chattocodex.control_panel.mcp_process_supervisor import McpProcessSupervisor
-from chattocodex.persistence.runtime_config_repository import RuntimeConfigRepository
-from chattocodex.schemas.control_panel_schemas import ControlPanelPreferencesRequest
+from chattocodex.orchestrator_backend.control_panel.domain.control_panel_dto import (
+    RemoteMode,
+)
+from chattocodex.orchestrator_backend.control_panel.domain.control_panel_exceptions import (
+    RuntimeLifecycleError,
+)
+from chattocodex.orchestrator_backend.control_panel.application.control_panel_service import (
+    ControlPanelService,
+)
+from chattocodex.orchestrator_backend.control_panel.infrastructure.mcp_process_supervisor import (
+    McpProcessSupervisor,
+)
+from chattocodex.shared.settings.runtime_config_repository import (
+    RuntimeConfigRepository,
+)
+from chattocodex.shared.contracts.control_panel.control_panel_schemas import (
+    ControlPanelPreferencesRequest,
+)
 
 
 @pytest.fixture(autouse=True)

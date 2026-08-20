@@ -2,8 +2,12 @@ from pathlib import Path
 
 from starlette.testclient import TestClient
 
-from chattocodex.control_panel.control_panel_routes import create_control_panel_app
-from chattocodex.control_panel.control_panel_service import ControlPanelService
+from chattocodex.orchestrator_backend.control_panel.interface.routes.control_panel_routes import (
+    create_control_panel_app,
+)
+from chattocodex.orchestrator_backend.control_panel.application.control_panel_service import (
+    ControlPanelService,
+)
 
 
 def _client(tmp_path: Path) -> TestClient:

@@ -1,7 +1,9 @@
 import pytest
 from pydantic import ValidationError
 
-from chattocodex.schemas.worker_report_schemas import WorkerReportSubmitRequest
+from chattocodex.shared.contracts.worker.worker_report_schemas import (
+    WorkerReportSubmitRequest,
+)
 
 
 def test_worker_report_references_are_bounded() -> None:

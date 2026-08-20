@@ -8,6 +8,7 @@ const vm = require("node:vm");
 const extensionRoot = path.join(
   path.resolve(__dirname, ".."),
   "chattocodex",
+  "orchestrator_backend",
   "wake",
   "chrome_extension",
 );

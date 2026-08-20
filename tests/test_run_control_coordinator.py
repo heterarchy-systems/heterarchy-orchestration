@@ -4,62 +4,92 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.broker.broker_service import BrokerService
-from chattocodex.facade.facade_service import ChatFacadeService
-from chattocodex.git.git_command_runner import GitCommandRunner
-from chattocodex.main_runtime.main_review_chat_presence_tracker import (
+from chattocodex.orchestrator_backend.broker.broker_service import BrokerService
+from chattocodex.orchestrator_backend.facade.facade_service import ChatFacadeService
+from chattocodex.orchestrator_backend.facade.worker_work_service import (
+    WorkerWorkService,
+)
+from chattocodex.orchestrator_backend.version_control.git_command_runner import (
+    GitCommandRunner,
+)
+from chattocodex.orchestrator_backend.main_runtime.presence.main_review_chat_presence_tracker import (
     MainReviewChatPresenceTracker,
 )
-from chattocodex.main_runtime.main_review_delivery_lease_tracker import (
+from chattocodex.orchestrator_backend.main_runtime.delivery.main_review_delivery_lease_tracker import (
     MainReviewDeliveryLeaseTracker,
 )
-from chattocodex.main_runtime.main_review_resume_coordinator import (
+from chattocodex.orchestrator_backend.main_runtime.application.main_review_resume_coordinator import (
     MainReviewResumeCoordinator,
 )
-from chattocodex.main_runtime.main_review_target_coordinator import (
+from chattocodex.orchestrator_backend.main_runtime.target.main_review_target_coordinator import (
     MainReviewTargetCoordinator,
 )
-from chattocodex.main_runtime.main_review_target_state import MainReviewTargetStatus
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.orchestration_dto import TaskStatus
-from chattocodex.orchestration.orchestration_exceptions import (
+from chattocodex.orchestrator_backend.main_runtime.target.main_review_target_state import (
+    MainReviewTargetStatus,
+)
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.orchestration.orchestration_dto import TaskStatus
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
     CapabilityDeniedError,
     InvalidTransitionError,
 )
-from chattocodex.orchestration.run_orchestration_service import RunOrchestrationService
-from chattocodex.orchestration.worker_execution_service import WorkerExecutionService
-from chattocodex.persistence.broker_repository import (
+from chattocodex.orchestrator_backend.orchestration.run_orchestration_service import (
+    RunOrchestrationService,
+)
+from chattocodex.orchestrator_backend.orchestration.worker_execution_service import (
+    WorkerExecutionService,
+)
+from chattocodex.orchestrator_backend.persistence.broker.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.main_review_chat_presence_store import (
+from chattocodex.orchestrator_backend.persistence.main_runtime.main_review_chat_presence_store import (
     MainReviewChatPresenceStore,
 )
-from chattocodex.persistence.main_review_delivery_lease_store import (
+from chattocodex.orchestrator_backend.persistence.main_runtime.main_review_delivery_lease_store import (
     MainReviewDeliveryLeaseStore,
 )
-from chattocodex.persistence.main_review_target_store import MainReviewTargetStore
-from chattocodex.persistence.orchestration_state_repository import (
+from chattocodex.orchestrator_backend.persistence.main_runtime.main_review_target_store import (
+    MainReviewTargetStore,
+)
+from chattocodex.orchestrator_backend.persistence.orchestration.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
     WorkerStateRepository,
 )
-from chattocodex.persistence.run_control_state_store import RunControlStateStore
-from chattocodex.persistence.wake_presence_repository import WakePresenceRepository
-from chattocodex.persistence.wake_target_repository import WakeTargetRepository
-from chattocodex.run_control.run_control_coordinator import RunControlCoordinator
-from chattocodex.run_control.run_control_state import (
+from chattocodex.orchestrator_backend.persistence.orchestration.run_control_state_store import (
+    RunControlStateStore,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_presence_repository import (
+    WakePresenceRepository,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_target_repository import (
+    WakeTargetRepository,
+)
+from chattocodex.orchestrator_backend.run_control.run_control_coordinator import (
+    RunControlCoordinator,
+)
+from chattocodex.orchestrator_backend.run_control.run_control_state import (
     WorkflowDecision,
     WorkflowStatus,
     WorkflowTaskSpec,
 )
-from chattocodex.wake.wake_dto import WakeTargetStatus
-from chattocodex.wake.wake_presence_service import WakePresenceService
-from chattocodex.wake.wake_target_service import WakeTargetService
-from chattocodex.worker_runtime.broker_ready_capacity_projection import (
+from chattocodex.orchestrator_backend.run_control.workflow_refresh_service import (
+    WorkflowRefreshService,
+)
+from chattocodex.orchestrator_backend.wake.wake_dto import WakeTargetStatus
+from chattocodex.orchestrator_backend.wake.presence.wake_presence_service import (
+    WakePresenceService,
+)
+from chattocodex.orchestrator_backend.wake.target.wake_target_service import (
+    WakeTargetService,
+)
+from chattocodex.orchestrator_backend.worker_runtime.capacity.broker_ready_capacity_projection import (
     BrokerReadyCapacityProjection,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 from tests.broker_support import FakeWorkBrokerGateway
 
 
@@ -148,6 +178,11 @@ class _Runtime:
             wake_target_service=self.wake_service,
             workspace_project_service=workspace,
             lock_registry=locks,
+            workflow_refresh_service=WorkflowRefreshService(
+                repository=self.run_control_state_store,
+                broker_service=self.broker_service,
+                lock_registry=locks,
+            ),
         )
         self.main_review_target_coordinator = MainReviewTargetCoordinator(
             target_store=MainReviewTargetStore(state_root=self.state_root),
@@ -172,7 +207,12 @@ class _Runtime:
             broker_service=self.broker_service,
             wake_target_service=self.wake_service,
             workspace_project_service=workspace,
-            run_control_coordinator=self.run_control_coordinator,
+            worker_work_service=WorkerWorkService(
+                broker_service=self.broker_service,
+                wake_target_service=self.wake_service,
+                workspace_project_service=workspace,
+                run_control_coordinator=self.run_control_coordinator,
+            ),
         )
 
     def register_wake_target(self, index: int) -> str:
@@ -597,7 +637,7 @@ def test_expired_main_review_wake_fails_over_to_another_main_target(
         ).status
         is MainReviewTargetStatus.IDLE
     )
-    with pytest.raises(InvalidTransitionError, match="not waiting|stale"):
+    with pytest.raises(InvalidTransitionError, match=r"not waiting|stale"):
         runtime.main_review_target_coordinator.activate_target(
             main_target_id=first_id,
             main_wake_revision=first.wake_revision,

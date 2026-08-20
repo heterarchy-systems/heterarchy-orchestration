@@ -8,26 +8,30 @@ from threading import Barrier
 import pytest
 from pydantic import ValidationError
 
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.orchestration_exceptions import (
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
     ResourceNotFoundError,
     RevisionConflictError,
 )
-from chattocodex.persistence.project_binding_repository import (
+from chattocodex.orchestrator_backend.persistence.project.project_binding_repository import (
     ProjectBindingRepository,
 )
-from chattocodex.project_runtime.project_binding_dto import ProjectBindingState
-from chattocodex.project_runtime.project_binding_exceptions import (
+from chattocodex.orchestrator_backend.project_runtime.project_binding_dto import (
+    ProjectBindingState,
+)
+from chattocodex.orchestrator_backend.project_runtime.project_binding_exceptions import (
     ProjectBindingConfigurationError,
     ProjectBindingConflictError,
 )
-from chattocodex.project_runtime.project_binding_service import (
+from chattocodex.orchestrator_backend.project_runtime.project_binding_service import (
     ProjectBindingService,
 )
-from chattocodex.schemas.project_binding_schemas import (
+from chattocodex.shared.contracts.project.project_binding_schemas import (
     ProjectBindingAdapterMetadata,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 
 
 def _write_project(*, workspace_root: Path, name: str) -> Path:

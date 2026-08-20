@@ -1,3 +1,7 @@
+.next/
+node_modules/
+frontend/control-panel/out/
+frontend/control-panel/public/app.js
 .venv/
 .pytest_cache/
 .ruff_cache/

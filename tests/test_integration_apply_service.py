@@ -4,37 +4,64 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.git.git_command_runner import GitCommandRunner
-from chattocodex.git.git_exceptions import GitWorktreeError
-from chattocodex.git.git_result_dto import WorkerResultCommit
-from chattocodex.integration.git_integration_runner import GitIntegrationRunner
-from chattocodex.integration.integration_apply_service import IntegrationApplyService
-from chattocodex.integration.integration_preview_service import (
+from chattocodex.orchestrator_backend.version_control.git_command_runner import (
+    GitCommandRunner,
+)
+from chattocodex.orchestrator_backend.version_control.git_exceptions import (
+    GitWorktreeError,
+)
+from chattocodex.orchestrator_backend.version_control.git_result_dto import (
+    WorkerResultCommit,
+)
+from chattocodex.orchestrator_backend.integration.git_integration_runner import (
+    GitIntegrationRunner,
+)
+from chattocodex.orchestrator_backend.integration.integration_apply_service import (
+    IntegrationApplyService,
+)
+from chattocodex.orchestrator_backend.integration.integration_preview_service import (
     IntegrationPreviewService,
 )
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.orchestration_dto import RunStatus, TaskStatus
-from chattocodex.orchestration.orchestration_exceptions import (
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.orchestration.orchestration_dto import (
+    RunStatus,
+    TaskStatus,
+)
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
     InvalidTransitionError,
     StatePersistenceError,
 )
-from chattocodex.orchestration.run_orchestration_service import RunOrchestrationService
-from chattocodex.orchestration.worker_execution_service import WorkerExecutionService
-from chattocodex.persistence.broker_repository import BrokerTaskRepository
-from chattocodex.persistence.orchestration_state_repository import (
+from chattocodex.orchestrator_backend.orchestration.run_orchestration_service import (
+    RunOrchestrationService,
+)
+from chattocodex.orchestrator_backend.orchestration.worker_execution_service import (
+    WorkerExecutionService,
+)
+from chattocodex.orchestrator_backend.persistence.broker.broker_repository import (
+    BrokerTaskRepository,
+)
+from chattocodex.orchestrator_backend.persistence.orchestration.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
     WorkerStateRepository,
 )
-from chattocodex.persistence.run_control_state_store import RunControlStateStore
-from chattocodex.persistence.worker_result_repository import WorkerResultRepository
-from chattocodex.run_control.run_control_identity import digest_capability
-from chattocodex.run_control.run_control_state import (
+from chattocodex.orchestrator_backend.persistence.orchestration.run_control_state_store import (
+    RunControlStateStore,
+)
+from chattocodex.orchestrator_backend.persistence.worker.worker_result_repository import (
+    WorkerResultRepository,
+)
+from chattocodex.orchestrator_backend.run_control.run_control_identity import (
+    digest_capability,
+)
+from chattocodex.orchestrator_backend.run_control.run_control_state import (
     WorkflowRoundState,
     WorkflowState,
     WorkflowStatus,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 from tests.broker_support import build_broker_service, claim_broker_task
 
 

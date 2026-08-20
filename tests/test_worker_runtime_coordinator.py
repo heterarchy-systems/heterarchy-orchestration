@@ -6,51 +6,75 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.broker.abandoned_assignment_recovery import (
+from chattocodex.orchestrator_backend.broker.abandoned_assignment_recovery import (
     AbandonedAssignmentRecovery,
 )
-from chattocodex.broker.broker_dto import BrokerTaskStatus, WorkerSlotStatus
-from chattocodex.broker.broker_service import BrokerService
-from chattocodex.facade.facade_service import ChatFacadeService
-from chattocodex.git.git_command_runner import GitCommandRunner
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.orchestration_dto import RunStatus
-from chattocodex.orchestration.orchestration_exceptions import InvalidTransitionError
-from chattocodex.orchestration.run_orchestration_service import RunOrchestrationService
-from chattocodex.persistence.broker_repository import (
+from chattocodex.orchestrator_backend.broker.broker_dto import (
+    BrokerTaskStatus,
+    WorkerSlotStatus,
+)
+from chattocodex.orchestrator_backend.broker.broker_service import BrokerService
+from chattocodex.orchestrator_backend.facade.facade_service import ChatFacadeService
+from chattocodex.orchestrator_backend.facade.worker_work_service import (
+    WorkerWorkService,
+)
+from chattocodex.orchestrator_backend.version_control.git_command_runner import (
+    GitCommandRunner,
+)
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.orchestration.orchestration_dto import RunStatus
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
+    InvalidTransitionError,
+)
+from chattocodex.orchestrator_backend.orchestration.run_orchestration_service import (
+    RunOrchestrationService,
+)
+from chattocodex.orchestrator_backend.persistence.broker.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.orchestration_state_repository import (
+from chattocodex.orchestrator_backend.persistence.orchestration.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
     WorkerStateRepository,
 )
-from chattocodex.persistence.wake_presence_repository import WakePresenceRepository
-from chattocodex.persistence.wake_target_repository import WakeTargetRepository
-from chattocodex.persistence.worker_runtime_group_state_store import (
+from chattocodex.orchestrator_backend.persistence.wake.wake_presence_repository import (
+    WakePresenceRepository,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_target_repository import (
+    WakeTargetRepository,
+)
+from chattocodex.orchestrator_backend.persistence.worker.worker_runtime_group_state_store import (
     WorkerRuntimeGroupStateStore,
 )
-from chattocodex.persistence.worker_runtime_presence_store import (
+from chattocodex.orchestrator_backend.persistence.worker.worker_runtime_presence_store import (
     WorkerRuntimePresenceStore,
 )
-from chattocodex.wake.wake_dto import WakeTargetStatus
-from chattocodex.wake.wake_presence_service import WakePresenceService
-from chattocodex.wake.wake_target_service import WakeTargetService
-from chattocodex.worker_runtime.broker_ready_capacity_projection import (
+from chattocodex.orchestrator_backend.wake.wake_dto import WakeTargetStatus
+from chattocodex.orchestrator_backend.wake.presence.wake_presence_service import (
+    WakePresenceService,
+)
+from chattocodex.orchestrator_backend.wake.target.wake_target_service import (
+    WakeTargetService,
+)
+from chattocodex.orchestrator_backend.worker_runtime.capacity.broker_ready_capacity_projection import (
     BrokerReadyCapacityProjection,
 )
-from chattocodex.worker_runtime.capacity_decision import CapacityLimits
-from chattocodex.worker_runtime.worker_assignment_lease_reconciler import (
+from chattocodex.orchestrator_backend.worker_runtime.capacity.capacity_decision import (
+    CapacityLimits,
+)
+from chattocodex.orchestrator_backend.worker_runtime.lease.worker_assignment_lease_reconciler import (
     WorkerAssignmentLeaseReconciler,
 )
-from chattocodex.worker_runtime.worker_runtime_coordinator import (
+from chattocodex.orchestrator_backend.worker_runtime.worker_runtime_coordinator import (
     WorkerRuntimeCoordinator,
 )
-from chattocodex.worker_runtime.worker_runtime_presence_tracker import (
+from chattocodex.orchestrator_backend.worker_runtime.presence.worker_runtime_presence_tracker import (
     WorkerRuntimePresenceTracker,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 from tests.broker_support import FakeWorkBrokerGateway
 
 
@@ -171,6 +195,12 @@ class _Runtime:
             broker_service=self.broker_service,
             wake_target_service=self.wake_service,
             workspace_project_service=self.workspace,
+            worker_work_service=WorkerWorkService(
+                broker_service=self.broker_service,
+                wake_target_service=self.wake_service,
+                workspace_project_service=self.workspace,
+                worker_runtime_coordinator=self.group,
+            ),
             worker_runtime_coordinator=self.group,
         )
 
@@ -238,6 +268,12 @@ class _Runtime:
             broker_service=self.broker_service,
             wake_target_service=self.wake_service,
             workspace_project_service=self.workspace,
+            worker_work_service=WorkerWorkService(
+                broker_service=self.broker_service,
+                wake_target_service=self.wake_service,
+                workspace_project_service=self.workspace,
+                worker_runtime_coordinator=self.group,
+            ),
             worker_runtime_coordinator=self.group,
         )
 

@@ -1,6 +1,6 @@
 import pytest
 
-from chattocodex.remote.cloudflare_tunnel import (
+from chattocodex.orchestrator_backend.control_panel.infrastructure.cloudflare_tunnel import (
     CloudflareTunnelError,
     build_cloudflare_tunnel_command,
 )

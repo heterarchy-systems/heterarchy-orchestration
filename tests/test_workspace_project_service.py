@@ -2,8 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.orchestration.orchestration_exceptions import ResourceNotFoundError
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
+    ResourceNotFoundError,
+)
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 
 
 def _write_project(*, root: Path, name: str) -> Path:

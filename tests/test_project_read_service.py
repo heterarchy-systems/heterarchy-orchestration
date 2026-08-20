@@ -3,21 +3,31 @@ import subprocess
 
 import pytest
 
-from chattocodex.git.git_command_runner import GitCommandRunner
-from chattocodex.orchestration.run_orchestration_service import RunOrchestrationService
-from chattocodex.persistence.orchestration_state_repository import (
+from chattocodex.orchestrator_backend.version_control.git_command_runner import (
+    GitCommandRunner,
+)
+from chattocodex.orchestrator_backend.orchestration.run_orchestration_service import (
+    RunOrchestrationService,
+)
+from chattocodex.orchestrator_backend.persistence.orchestration.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
     WorkerStateRepository,
 )
-from chattocodex.repository.project_path_resolver import ProjectPathResolver
-from chattocodex.repository.project_read_service import ProjectReadService
-from chattocodex.repository.repository_exceptions import (
+from chattocodex.orchestrator_backend.repository.project_path_resolver import (
+    ProjectPathResolver,
+)
+from chattocodex.orchestrator_backend.repository.project_read_service import (
+    ProjectReadService,
+)
+from chattocodex.orchestrator_backend.repository.repository_exceptions import (
     ProjectPathDeniedError,
     RepositoryReadLimitError,
     UnsupportedRepositoryFileError,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 
 
 def _commit_project(project_root: Path) -> None:

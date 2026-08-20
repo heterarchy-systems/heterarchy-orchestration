@@ -4,9 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.wake.wake_exceptions import WakeConfigurationError
-from chattocodex.wake.worker_browser_runtime_dto import WorkerBrowserRuntimeMode
-from chattocodex.wake.worker_browser_runtime_service import WorkerBrowserRuntimeService
+from chattocodex.shared.settings.runtime_settings import RuntimeSettings
+from chattocodex.orchestrator_backend.wake.wake_exceptions import WakeConfigurationError
+from chattocodex.orchestrator_backend.wake.browser.worker_browser_runtime_dto import (
+    WorkerBrowserRuntimeMode,
+)
+from chattocodex.orchestrator_backend.wake.browser.worker_browser_runtime_service import (
+    WorkerBrowserRuntimeService,
+)
 
 
 def _runtime_fixture(tmp_path: Path) -> tuple[WorkerBrowserRuntimeService, Path, Path]:
@@ -56,14 +61,16 @@ def test_visible_bootstrap_reuses_profile_without_headless_flag(tmp_path: Path) 
     assert f"--user-data-dir={profile_root}" in spec.argv
 
 
-def test_worker_browser_binary_can_come_from_environment(
+def test_worker_browser_binary_is_loaded_by_runtime_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service, chrome_binary, _extension_root = _runtime_fixture(tmp_path)
     monkeypatch.setenv("CHATTOCODEX_CHROME_BINARY", str(chrome_binary))
 
-    spec = service.build_launch_spec()
+    settings = RuntimeSettings()
+    spec = service.build_launch_spec(chrome_binary=settings.chrome_binary)
 
+    assert settings.chrome_binary == chrome_binary
     assert spec.chrome_binary == chrome_binary.resolve()
 
 

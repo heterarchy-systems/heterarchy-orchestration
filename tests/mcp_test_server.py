@@ -1,5 +1,5 @@
-from chattocodex.mcp_server import serve_configured
-from chattocodex.runtime_settings import RuntimeSettings
+from chattocodex.orchestrator_mcp.composition.mcp_server import serve_configured
+from chattocodex.shared.settings.runtime_settings import RuntimeSettings
 from tests.broker_support import FakeWorkBrokerGateway
 
 

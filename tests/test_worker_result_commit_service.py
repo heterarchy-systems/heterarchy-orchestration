@@ -5,27 +5,52 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.broker.broker_service import BrokerService
-from chattocodex.git.git_command_runner import GitCommandRunner
-from chattocodex.git.git_exceptions import GitWorktreeError
-from chattocodex.git.git_result_commit_runner import GitResultCommitRunner
-from chattocodex.git.worker_git_worktree_service import WorkerGitWorktreeService
-from chattocodex.git.worker_result_commit_service import WorkerResultCommitService
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.orchestration_exceptions import InvalidTransitionError
-from chattocodex.orchestration.run_orchestration_service import RunOrchestrationService
-from chattocodex.persistence.git_worktree_repository import GitWorktreeRepository
-from chattocodex.persistence.orchestration_state_repository import (
+from chattocodex.orchestrator_backend.broker.broker_service import BrokerService
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
+    InvalidTransitionError,
+)
+from chattocodex.orchestrator_backend.orchestration.run_orchestration_service import (
+    RunOrchestrationService,
+)
+from chattocodex.orchestrator_backend.persistence.orchestration.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
     WorkerStateRepository,
 )
-from chattocodex.persistence.worker_result_repository import WorkerResultRepository
-from chattocodex.repository.project_path_resolver import ProjectPathResolver
-from chattocodex.repository.worker_file_mutation_service import (
+from chattocodex.orchestrator_backend.persistence.version_control.git_worktree_repository import (
+    GitWorktreeRepository,
+)
+from chattocodex.orchestrator_backend.persistence.worker.worker_result_repository import (
+    WorkerResultRepository,
+)
+from chattocodex.orchestrator_backend.repository.project_path_resolver import (
+    ProjectPathResolver,
+)
+from chattocodex.orchestrator_backend.repository.worker_workspace.worker_file_mutation_service import (
     WorkerFileMutationService,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.repository.worker_workspace.worker_workspace_access_service import (
+    WorkerWorkspaceAccessService,
+)
+from chattocodex.orchestrator_backend.version_control.git_command_runner import (
+    GitCommandRunner,
+)
+from chattocodex.orchestrator_backend.version_control.git_exceptions import (
+    GitWorktreeError,
+)
+from chattocodex.orchestrator_backend.version_control.git_result_commit_runner import (
+    GitResultCommitRunner,
+)
+from chattocodex.orchestrator_backend.version_control.worker_git_worktree_service import (
+    WorkerGitWorktreeService,
+)
+from chattocodex.orchestrator_backend.version_control.worker_result_commit_service import (
+    WorkerResultCommitService,
+)
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
 from tests.broker_support import build_broker_service, claim_broker_task
 
 
@@ -101,9 +126,11 @@ def _build_runtime(
             lock_registry=locks,
         ),
         WorkerFileMutationService(
-            worker_repository=worker_repository,
-            worktree_repository=worktree_repository,
-            path_resolver=ProjectPathResolver(),
+            access_service=WorkerWorkspaceAccessService(
+                worker_repository=worker_repository,
+                worktree_repository=worktree_repository,
+                path_resolver=ProjectPathResolver(),
+            ),
             lock_registry=locks,
         ),
         WorkerResultCommitService(
@@ -293,23 +320,29 @@ def test_result_commit_waits_for_in_flight_worker_mutation(
     preliminary_check_complete = threading.Event()
     allow_mutation = threading.Event()
     commit_complete = threading.Event()
-    original_require_workspace = mutation_service._require_worker_workspace
+    original_require_workspace = mutation_service._access_service.require_workspace
 
     def pause_after_preliminary_check(
-        *, run_id: str, worker_id: str, worker_handle: str
+        run_id: str,
+        worker_id: str,
+        worker_handle: str,
+        operation: str,
+        require_mutable: bool,
     ) -> Path:
         worktree_root = original_require_workspace(
             run_id=run_id,
             worker_id=worker_id,
             worker_handle=worker_handle,
+            operation=operation,
+            require_mutable=require_mutable,
         )
         preliminary_check_complete.set()
         assert allow_mutation.wait(timeout=5)
         return worktree_root
 
     monkeypatch.setattr(
-        mutation_service,
-        "_require_worker_workspace",
+        mutation_service._access_service,
+        "require_workspace",
         pause_after_preliminary_check,
     )
     mutation_errors: list[BaseException] = []

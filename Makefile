@@ -1,51 +1,52 @@
-.PHONY: dev_env_check install-local rule_check format_check type_checking node_check test test_free_threaded ci db-config db-up db-down db-logs
+include make/frontend.mk
+include make/backend.mk
 
-dev_env_check:
-	@if find .venv/lib -type l -path '*/site-packages/chattocodex' -print -quit 2>/dev/null | grep -q .; then \
-		echo 'Refusing to run: site-packages/chattocodex is a symlink. Recreate .venv instead of linking it to the source tree.' >&2; \
-		exit 1; \
-	fi
+.PHONY: ci lock_check dev_env_check install-local frontend_install frontend_check frontend_build package_check rule_check architecture_check backend_check format_check type_checking node_check test test_free_threaded broker_e2e postgres_mcp_e2e db-config db-up db-down db-logs
 
-install-local: dev_env_check
-	# CPython 3.14 skips .pth files carrying macOS UF_HIDDEN. Install the
-	# current source as a regular local wheel so console entry points also work
-	# when a copied or corrupted .venv has stale Finder hidden flags. The normal
-	# environment repair is: chflags -R nohidden .venv
-	uv pip install --offline --python .venv/bin/python --force-reinstall --no-deps .
+# Full-project orchestration. Backend and frontend remain independently runnable
+# through `make backend-ci` and `make frontend-ci`.
+ci: frontend-ci backend-ci
 
-rule_check: dev_env_check
-	uv run python chattocodex/.agents/verify_manifest.py
+# Compatibility aliases retained for existing local/CI callers while the
+# canonical targets are the explicit backend-* / frontend-* names above.
+lock_check: backend-lock-check frontend-lock-check
 
-format_check: dev_env_check
-	uv run ruff format --check .
-	uv run ruff check .
+dev_env_check: backend-dev-env-check
 
-type_checking: dev_env_check
-	uv run pyrefly check
+install-local: backend-install-local
 
-node_check:
-	@node --version >/dev/null || (echo "Node.js is required for Chrome runtime safety tests." >&2; exit 1)
-	@tsc --version >/dev/null || (echo "TypeScript compiler is required for Chrome runtime safety tests." >&2; exit 1)
-	@tsc -p chattocodex/wake/chrome_extension_ts/tsconfig.json --noEmit
-	@tsc -p frontend/control-panel/tsconfig.json --noEmit
-	@node tests/persistent_worker_runtime_policy_harness.js
+frontend_install: frontend-install
 
-test: dev_env_check node_check
-	uv run python -m pytest -q
+frontend_check: frontend-check
 
-test_free_threaded: node_check
-	uv run --isolated --locked --managed-python --python 3.14t --no-editable python -c 'import sys, sysconfig; import cryptography, httptools, pydantic_core, pytest, uvloop; assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1; assert not sys._is_gil_enabled(); raise SystemExit(pytest.main(["-q"]))'
+frontend_build: frontend-build
 
-ci: rule_check format_check type_checking test
+package_check: frontend-check backend-package-check
 
-db-config:
-	docker compose config >/dev/null
+rule_check: backend-rule-check
 
-db-up:
-	docker compose up -d postgres
+architecture_check: backend-architecture-check
 
-db-down:
-	docker compose down
+backend_check: backend-contract-check
 
-db-logs:
-	docker compose logs -f postgres
+format_check: backend-format-check
+
+type_checking: backend-type-check
+
+node_check: backend-node-check
+
+test: backend-test
+
+test_free_threaded: backend-test-free-threaded
+
+broker_e2e: backend-broker-e2e
+
+postgres_mcp_e2e: backend-postgres-mcp-e2e
+
+db-config: backend-db-config
+
+db-up: backend-db-up
+
+db-down: backend-db-down
+
+db-logs: backend-db-logs

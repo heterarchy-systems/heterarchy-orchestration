@@ -4,22 +4,36 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.orchestration_exceptions import ResourceNotFoundError
-from chattocodex.persistence.wake_delivery_lease_store import WakeDeliveryLeaseStore
-from chattocodex.persistence.wake_presence_repository import WakePresenceRepository
-from chattocodex.persistence.wake_target_repository import WakeTargetRepository
-from chattocodex.persistence.worker_runtime_presence_store import (
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
+    ResourceNotFoundError,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_delivery_lease_store import (
+    WakeDeliveryLeaseStore,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_presence_repository import (
+    WakePresenceRepository,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_target_repository import (
+    WakeTargetRepository,
+)
+from chattocodex.orchestrator_backend.persistence.worker.worker_runtime_presence_store import (
     WorkerRuntimePresenceStore,
 )
-from chattocodex.wake.wake_dto import WakeTargetStatus
-from chattocodex.wake.wake_exceptions import WakeTargetConflictError
-from chattocodex.wake.wake_presence_service import WakePresenceService
-from chattocodex.wake.wake_target_service import WakeTargetService
-from chattocodex.worker_runtime.wake_delivery_lease_tracker import (
+from chattocodex.orchestrator_backend.wake.wake_dto import WakeTargetStatus
+from chattocodex.orchestrator_backend.wake.wake_exceptions import (
+    WakeTargetConflictError,
+)
+from chattocodex.orchestrator_backend.wake.presence.wake_presence_service import (
+    WakePresenceService,
+)
+from chattocodex.orchestrator_backend.wake.target.wake_target_service import (
+    WakeTargetService,
+)
+from chattocodex.orchestrator_backend.worker_runtime.lease.wake_delivery_lease_tracker import (
     WakeDeliveryLeaseTracker,
 )
-from chattocodex.worker_runtime.worker_runtime_presence_tracker import (
+from chattocodex.orchestrator_backend.worker_runtime.presence.worker_runtime_presence_tracker import (
     WorkerRuntimePresenceTracker,
 )
 

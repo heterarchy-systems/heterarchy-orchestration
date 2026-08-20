@@ -2,7 +2,7 @@ import asyncio
 import subprocess
 from pathlib import Path
 
-from chattocodex.mcp_server import create_mcp_server
+from chattocodex.orchestrator_mcp.composition.mcp_server import create_mcp_server
 from tests.broker_support import FakeWorkBrokerGateway
 
 

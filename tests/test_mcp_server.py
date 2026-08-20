@@ -6,20 +6,22 @@ from pathlib import Path
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from chattocodex.mcp_server import create_mcp_server
-from chattocodex.persistence.project_binding_repository import (
+from chattocodex.orchestrator_backend.persistence.project.project_binding_repository import (
     ProjectBindingRepository,
 )
-from chattocodex.persistence.worker_provisioning_repository import (
+from chattocodex.orchestrator_backend.persistence.worker.worker_provisioning_repository import (
     WorkerProvisioningRepository,
 )
-from chattocodex.project_runtime.project_binding_service import (
+from chattocodex.orchestrator_backend.project_runtime.project_binding_service import (
     ProjectBindingService,
 )
-from chattocodex.schemas.project_binding_schemas import (
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
+from chattocodex.orchestrator_mcp.composition.mcp_server import create_mcp_server
+from chattocodex.shared.contracts.project.project_binding_schemas import (
     ProjectBindingAdapterMetadata,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
 from tests.broker_support import FakeWorkBrokerGateway
 
 _EXPECTED_TOOLS = {
@@ -30,6 +32,11 @@ _EXPECTED_TOOLS = {
     "worker_workspace_prepare",
     "worker_file_create",
     "worker_file_replace",
+    "worker_directory_list",
+    "worker_path_stat",
+    "worker_directory_create",
+    "worker_directory_move",
+    "worker_directory_delete",
     "worker_result_commit",
     "run_results",
     "worker_report_submit",

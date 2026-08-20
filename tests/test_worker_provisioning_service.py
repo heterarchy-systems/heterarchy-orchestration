@@ -6,32 +6,44 @@ from typing import cast
 
 import pytest
 
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.orchestration_exceptions import (
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
     OrchestrationError,
     RevisionConflictError,
 )
-from chattocodex.persistence.project_binding_repository import (
+from chattocodex.orchestrator_backend.persistence.project.project_binding_repository import (
     ProjectBindingRepository,
 )
-from chattocodex.persistence.worker_provisioning_repository import (
+from chattocodex.orchestrator_backend.persistence.worker.worker_provisioning_repository import (
     WorkerProvisioningRepository,
 )
-from chattocodex.project_runtime.project_binding_service import ProjectBindingService
-from chattocodex.provisioning.provisioning_dto import ProvisioningRequestStatus
-from chattocodex.provisioning.provisioning_exceptions import (
+from chattocodex.orchestrator_backend.project_runtime.project_binding_service import (
+    ProjectBindingService,
+)
+from chattocodex.orchestrator_backend.provisioning.provisioning_dto import (
+    ProvisioningRequestStatus,
+)
+from chattocodex.orchestrator_backend.provisioning.provisioning_exceptions import (
     ProvisioningConflictError,
 )
-from chattocodex.provisioning.worker_provisioning_service import (
+from chattocodex.orchestrator_backend.provisioning.worker_provisioning_service import (
     WorkerProvisioningService,
 )
-from chattocodex.schemas.project_binding_schemas import ProjectBindingAdapterMetadata
-from chattocodex.wake.wake_target_service import WakeTargetService
-from chattocodex.worker_runtime.capacity_decision import CapacityDecision
-from chattocodex.worker_runtime.worker_runtime_group_state import (
+from chattocodex.shared.contracts.project.project_binding_schemas import (
+    ProjectBindingAdapterMetadata,
+)
+from chattocodex.orchestrator_backend.wake.target.wake_target_service import (
+    WakeTargetService,
+)
+from chattocodex.orchestrator_backend.worker_runtime.capacity.capacity_decision import (
+    CapacityDecision,
+)
+from chattocodex.orchestrator_backend.worker_runtime.worker_runtime_group_state import (
     WorkerRuntimeGroupState,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 
 
 class _MembershipCoordinator:

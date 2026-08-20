@@ -4,16 +4,28 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.control_panel.cloudflare_process_supervisor import (
+from chattocodex.orchestrator_backend.control_panel.infrastructure.cloudflare_process_supervisor import (
     CloudflareProcessSupervisor,
 )
-from chattocodex.control_panel.control_panel_dto import RemoteMode
-from chattocodex.control_panel.control_panel_exceptions import RuntimeLifecycleError
-from chattocodex.control_panel.control_panel_service import ControlPanelService
-from chattocodex.control_panel.mcp_process_supervisor import McpProcessSupervisor
-from chattocodex.schemas.control_panel_schemas import ControlPanelPreferencesRequest
-from chattocodex.schemas.setup_schemas import SetupRequest
-from chattocodex.setup.runtime_setup_service import RuntimeSetupService
+from chattocodex.orchestrator_backend.control_panel.domain.control_panel_dto import (
+    RemoteMode,
+)
+from chattocodex.orchestrator_backend.control_panel.domain.control_panel_exceptions import (
+    RuntimeLifecycleError,
+)
+from chattocodex.orchestrator_backend.control_panel.application.control_panel_service import (
+    ControlPanelService,
+)
+from chattocodex.orchestrator_backend.control_panel.infrastructure.mcp_process_supervisor import (
+    McpProcessSupervisor,
+)
+from chattocodex.shared.contracts.control_panel.control_panel_schemas import (
+    ControlPanelPreferencesRequest,
+)
+from chattocodex.shared.contracts.setup_schemas import SetupRequest
+from chattocodex.orchestrator_backend.setup.runtime_setup_service import (
+    RuntimeSetupService,
+)
 
 
 def _occupied_listener() -> socket.socket:

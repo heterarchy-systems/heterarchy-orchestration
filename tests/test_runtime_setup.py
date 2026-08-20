@@ -3,9 +3,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from chattocodex.auth.owner_token_service import OwnerTokenService
-from chattocodex.schemas.setup_schemas import SetupRequest
-from chattocodex.setup.runtime_setup_service import RuntimeSetupService
+from chattocodex.orchestrator_backend.setup.runtime_setup_service import (
+    RuntimeSetupService,
+)
+from chattocodex.shared.contracts.setup_schemas import SetupRequest
+from chattocodex.shared.security.owner_token_service import OwnerTokenService
 
 
 def _workspace_with_project(tmp_path: Path) -> Path:

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from chattocodex.orchestration.entity_lock_registry import (
+from chattocodex.shared.concurrency.entity_lock_registry import (
     EntityLockNamespaceError,
     EntityLockRegistry,
 )
@@ -16,7 +16,7 @@ _CHILD_LOCK_SCRIPT = """
 import sys
 from pathlib import Path
 
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
 
 lock_directory = Path(sys.argv[1])
 attempted_path = Path(sys.argv[2])

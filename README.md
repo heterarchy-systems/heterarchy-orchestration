@@ -25,7 +25,7 @@ The initial Worker count may be zero. The user does not create Worker Chats, reg
 Load the unpacked Chrome extension from:
 
 ```text
-chattocodex/wake/chrome_extension
+chattocodex/orchestrator_backend/wake/chrome_extension
 ```
 
 Open the intended Main conversation from inside the target GPT Project. Its URL must have the explicit `https://chatgpt.com/g/<project-ref>/c/<conversation-id>` shape. Click **ChatToCodex Runtime Wake**, choose the canonical local project, then click **이 Chat을 Main reviewer로 등록**. A plain `/c/<conversation-id>` route is rejected because it does not prove the GPT Project context.
@@ -298,6 +298,23 @@ Plaintext mutation capabilities are returned only to the relevant Chat; only SHA
 
 ## Settings Control Panel
 
+The Control Panel frontend uses Next.js App Router with static export. FastAPI remains
+the only runtime server: the Next build is copied into the packaged
+`chattocodex/orchestrator_backend/control_panel/static/` tree and continues to call the loopback `/api/*`
+routes on the same origin. No Node.js server is required at runtime.
+
+Install the pinned frontend dependencies once and rebuild packaged assets after UI
+changes:
+
+```bash
+make frontend_install
+make frontend_build
+```
+
+`make frontend_check` runs the legacy-client compile, strict Next.js TypeScript check,
+and a production static-export build without copying generated assets into the Python
+package. `make ci` includes that check through `node_check`.
+
 Run the local Control Panel:
 
 ```bash
@@ -342,7 +359,12 @@ The host process that runs `chattocodex app` must receive `CHATTOCODEX_DATABASE_
 postgresql://chattocodex:chattocodex-local@127.0.0.1:55432/chattocodex
 ```
 
-PostgreSQL access is loaded lazily through `psycopg`; a normal file-backed runtime does not import the driver. The first successful database projection applies the packaged SQL migrations in `chattocodex/database/migrations/`, then refreshes normalized Project, Consumer Group, Worker, and Run tables plus a validated JSONB operations snapshot. Database credentials are never returned by `/api/operations`.
+The SQLAlchemy backend uses the async `asyncpg` driver. Backend startup reconciles the
+Python-defined SQLAlchemy ORM schema under a PostgreSQL transaction-scoped advisory
+lock before opening ORM resources. Runtime Console
+projection then refreshes normalized Project, Consumer Group, Worker, Run, and
+execution read-model data. Database credentials are never returned by
+`/api/operations`.
 
 The Worker Browser remains a host-side process because it owns a local persistent Chrome profile and loopback-only Runtime Adapter. `compose.yaml` containerizes PostgreSQL only; it does not move Chrome, the local workspace, or the MCP trust boundary into a container.
 

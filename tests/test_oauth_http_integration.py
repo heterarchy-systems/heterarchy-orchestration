@@ -13,8 +13,10 @@ import httpx2
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from chattocodex.schemas.setup_schemas import SetupRequest
-from chattocodex.setup.runtime_setup_service import RuntimeSetupService
+from chattocodex.shared.contracts.setup_schemas import SetupRequest
+from chattocodex.orchestrator_backend.setup.runtime_setup_service import (
+    RuntimeSetupService,
+)
 
 
 def _find_free_port() -> int:
@@ -172,7 +174,7 @@ def test_oauth_http_flow_authenticates_real_streamable_mcp(tmp_path: Path) -> No
     environment["CHATTOCODEX_STATE_ROOT"] = str(state_root)
     environment["CHATTOCODEX_PORT"] = str(port)
     process = subprocess.Popen(
-        [sys.executable, "-m", "chattocodex.mcp_server"],
+        [sys.executable, "-m", "chattocodex.orchestrator_mcp.composition.mcp_server"],
         env=environment,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,

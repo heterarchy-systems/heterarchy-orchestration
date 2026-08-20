@@ -1,4 +1,4 @@
-from chattocodex.control_panel.cloudflare_process_supervisor import (
+from chattocodex.orchestrator_backend.control_panel.infrastructure.cloudflare_process_supervisor import (
     _QUICK_URL_PATTERN,
 )
 

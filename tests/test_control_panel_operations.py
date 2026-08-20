@@ -1,25 +1,39 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
-from chattocodex.broker_client.broker_operations_gateway import (
+from chattocodex.orchestrator_backend.broker_client.broker_operations_gateway import (
     BrokerConsumerGroupDirectory,
     BrokerConsumerGroupView,
 )
-from chattocodex.control_panel.control_panel_operations_service import (
+from chattocodex.orchestrator_backend.control_panel.application.control_panel_operations_service import (
     ControlPanelOperationsService,
 )
-from chattocodex.orchestration.orchestration_dto import RunState, RunStatus
-from chattocodex.persistence.orchestration_state_repository import RunStateRepository
-from chattocodex.persistence.wake_target_repository import WakeTargetRepository
-from chattocodex.persistence.worker_runtime_group_state_store import (
+from chattocodex.orchestrator_backend.orchestration.orchestration_dto import (
+    RunState,
+    RunStatus,
+)
+from chattocodex.orchestrator_backend.persistence.orchestration.orchestration_state_repository import (
+    RunStateRepository,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_target_repository import (
+    WakeTargetRepository,
+)
+from chattocodex.orchestrator_backend.persistence.worker.worker_runtime_group_state_store import (
     WorkerRuntimeGroupStateStore,
 )
-from chattocodex.wake.wake_dto import WakeTargetState, WakeTargetStatus
-from chattocodex.wake.worker_browser_runtime_dto import WorkerBrowserRuntimeMode
-from chattocodex.worker_runtime.worker_runtime_group_state import (
+from chattocodex.orchestrator_backend.wake.wake_dto import (
+    WakeTargetState,
+    WakeTargetStatus,
+)
+from chattocodex.orchestrator_backend.wake.browser.worker_browser_runtime_dto import (
+    WorkerBrowserRuntimeMode,
+)
+from chattocodex.orchestrator_backend.worker_runtime.worker_runtime_group_state import (
     WorkerRuntimeGroupState,
 )
-from chattocodex.workspace.workspace_project_dto import WorkspaceProject
+from chattocodex.orchestrator_backend.workspace.workspace_project_dto import (
+    WorkspaceProject,
+)
 
 
 class _BrokerOperations:
@@ -112,7 +126,7 @@ def test_operations_snapshot_projects_consumer_group_workers_and_runs(
     )
 
     assert snapshot.browser.running is True
-    assert snapshot.browser.mode is WorkerBrowserRuntimeMode.HEADLESS
+    assert snapshot.browser.mode == WorkerBrowserRuntimeMode.HEADLESS
     assert snapshot.broker is not None
     assert snapshot.broker.term == 5
     assert snapshot.broker.revision == 12

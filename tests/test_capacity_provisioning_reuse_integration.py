@@ -9,80 +9,124 @@ from threading import Event
 import pytest
 from starlette.testclient import TestClient
 
-from chattocodex.broker.abandoned_assignment_recovery import (
+from chattocodex.orchestrator_backend.broker.abandoned_assignment_recovery import (
     AbandonedAssignmentRecovery,
 )
-from chattocodex.broker.broker_dto import BrokerTaskStatus, WorkerSlotStatus
-from chattocodex.broker.broker_service import BrokerService
-from chattocodex.control_panel.control_panel_routes import create_control_panel_app
-from chattocodex.control_panel.control_panel_service import ControlPanelService
-from chattocodex.facade.facade_dto import DelegationTaskSpec, WorkerWork
-from chattocodex.facade.facade_service import ChatFacadeService
-from chattocodex.git.git_command_runner import GitCommandRunner
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.orchestration.orchestration_dto import TaskStatus
-from chattocodex.orchestration.orchestration_exceptions import ResourceNotFoundError
-from chattocodex.orchestration.run_orchestration_service import (
+from chattocodex.orchestrator_backend.broker.broker_dto import (
+    BrokerTaskStatus,
+    WorkerSlotStatus,
+)
+from chattocodex.orchestrator_backend.broker.broker_service import BrokerService
+from chattocodex.orchestrator_backend.control_panel.interface.routes.control_panel_routes import (
+    create_control_panel_app,
+)
+from chattocodex.orchestrator_backend.control_panel.application.control_panel_service import (
+    ControlPanelService,
+)
+from chattocodex.orchestrator_backend.facade.facade_dto import (
+    DelegationTaskSpec,
+    WorkerWork,
+)
+from chattocodex.orchestrator_backend.facade.facade_service import ChatFacadeService
+from chattocodex.orchestrator_backend.facade.worker_work_service import (
+    WorkerWorkService,
+)
+from chattocodex.orchestrator_backend.version_control.git_command_runner import (
+    GitCommandRunner,
+)
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.orchestration.orchestration_dto import TaskStatus
+from chattocodex.orchestrator_backend.orchestration.orchestration_exceptions import (
+    ResourceNotFoundError,
+)
+from chattocodex.orchestrator_backend.orchestration.run_orchestration_service import (
     RunOrchestrationService,
 )
-from chattocodex.orchestration.worker_execution_service import WorkerExecutionService
-from chattocodex.persistence.broker_repository import (
+from chattocodex.orchestrator_backend.orchestration.worker_execution_service import (
+    WorkerExecutionService,
+)
+from chattocodex.orchestrator_backend.persistence.broker.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.orchestration_state_repository import (
+from chattocodex.orchestrator_backend.persistence.orchestration.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
     WorkerStateRepository,
 )
-from chattocodex.persistence.project_binding_repository import (
+from chattocodex.orchestrator_backend.persistence.project.project_binding_repository import (
     ProjectBindingRepository,
 )
-from chattocodex.persistence.runtime_config_repository import RuntimeConfigRepository
-from chattocodex.persistence.wake_presence_repository import WakePresenceRepository
-from chattocodex.persistence.wake_target_repository import WakeTargetRepository
-from chattocodex.persistence.worker_provisioning_repository import (
+from chattocodex.shared.settings.runtime_config_repository import (
+    RuntimeConfigRepository,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_presence_repository import (
+    WakePresenceRepository,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_target_repository import (
+    WakeTargetRepository,
+)
+from chattocodex.orchestrator_backend.persistence.worker.worker_provisioning_repository import (
     WorkerProvisioningRepository,
 )
-from chattocodex.persistence.worker_runtime_group_state_store import (
+from chattocodex.orchestrator_backend.persistence.worker.worker_runtime_group_state_store import (
     WorkerRuntimeGroupStateStore,
 )
-from chattocodex.persistence.worker_runtime_presence_store import (
+from chattocodex.orchestrator_backend.persistence.worker.worker_runtime_presence_store import (
     WorkerRuntimePresenceStore,
 )
-from chattocodex.project_runtime.project_binding_service import ProjectBindingService
-from chattocodex.provisioning.provisioning_dto import (
+from chattocodex.orchestrator_backend.project_runtime.project_binding_service import (
+    ProjectBindingService,
+)
+from chattocodex.orchestrator_backend.provisioning.provisioning_dto import (
     ProvisioningRequestStatus,
     ProvisioningStoreState,
 )
-from chattocodex.provisioning.provisioning_exceptions import (
+from chattocodex.orchestrator_backend.provisioning.provisioning_exceptions import (
     ProvisioningConflictError,
     ProvisioningStaleCallbackError,
 )
-from chattocodex.provisioning.worker_provisioning_service import (
+from chattocodex.orchestrator_backend.provisioning.worker_provisioning_service import (
     WorkerProvisioningService,
 )
-from chattocodex.schemas.auth_schemas import RuntimeConfigRecord
-from chattocodex.schemas.project_binding_schemas import ProjectBindingAdapterMetadata
-from chattocodex.wake.wake_control_service import WakeControlService
-from chattocodex.wake.wake_dto import WakeTargetRetirement, WakeTargetStatus
-from chattocodex.wake.wake_exceptions import WakeTargetConflictError
-from chattocodex.wake.wake_presence_service import WakePresenceService
-from chattocodex.wake.wake_target_service import WakeTargetService
-from chattocodex.worker_runtime.broker_ready_capacity_projection import (
+from chattocodex.shared.contracts.auth_schemas import RuntimeConfigRecord
+from chattocodex.shared.contracts.project.project_binding_schemas import (
+    ProjectBindingAdapterMetadata,
+)
+from chattocodex.orchestrator_backend.wake.wake_control_service import (
+    WakeControlService,
+)
+from chattocodex.orchestrator_backend.wake.wake_dto import (
+    WakeTargetRetirement,
+    WakeTargetStatus,
+)
+from chattocodex.orchestrator_backend.wake.wake_exceptions import (
+    WakeTargetConflictError,
+)
+from chattocodex.orchestrator_backend.wake.presence.wake_presence_service import (
+    WakePresenceService,
+)
+from chattocodex.orchestrator_backend.wake.target.wake_target_service import (
+    WakeTargetService,
+)
+from chattocodex.orchestrator_backend.worker_runtime.capacity.broker_ready_capacity_projection import (
     BrokerReadyCapacityProjection,
 )
-from chattocodex.worker_runtime.capacity_decision import CapacityLimits
-from chattocodex.worker_runtime.worker_assignment_lease_reconciler import (
+from chattocodex.orchestrator_backend.worker_runtime.capacity.capacity_decision import (
+    CapacityLimits,
+)
+from chattocodex.orchestrator_backend.worker_runtime.lease.worker_assignment_lease_reconciler import (
     WorkerAssignmentLeaseReconciler,
 )
-from chattocodex.worker_runtime.worker_runtime_coordinator import (
+from chattocodex.orchestrator_backend.worker_runtime.worker_runtime_coordinator import (
     WorkerRuntimeCoordinator,
 )
-from chattocodex.worker_runtime.worker_runtime_presence_tracker import (
+from chattocodex.orchestrator_backend.worker_runtime.presence.worker_runtime_presence_tracker import (
     WorkerRuntimePresenceTracker,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 from tests.broker_support import FakeWorkBrokerGateway
 
 
@@ -256,6 +300,12 @@ class _Runtime:
             broker_service=broker_service,
             wake_target_service=self.wake_service,
             workspace_project_service=self.workspace,
+            worker_work_service=WorkerWorkService(
+                broker_service=broker_service,
+                wake_target_service=self.wake_service,
+                workspace_project_service=self.workspace,
+                worker_runtime_coordinator=self.group,
+            ),
             worker_runtime_coordinator=self.group,
         )
 

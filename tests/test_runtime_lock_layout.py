@@ -1,7 +1,7 @@
 import stat
 from pathlib import Path
 
-from chattocodex.persistence.runtime_lock_layout import RuntimeLockLayout
+from chattocodex.shared.storage.runtime_lock_layout import RuntimeLockLayout
 
 
 def test_runtime_lock_directory_is_stable_and_outside_execution_state(

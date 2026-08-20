@@ -5,10 +5,18 @@ import subprocess
 from pathlib import Path
 
 _EXTENSION_ROOT = (
-    Path(__file__).resolve().parents[1] / "chattocodex" / "wake" / "chrome_extension"
+    Path(__file__).resolve().parents[1]
+    / "chattocodex"
+    / "orchestrator_backend"
+    / "wake"
+    / "chrome_extension"
 )
 _TYPESCRIPT_ROOT = (
-    Path(__file__).resolve().parents[1] / "chattocodex" / "wake" / "chrome_extension_ts"
+    Path(__file__).resolve().parents[1]
+    / "chattocodex"
+    / "orchestrator_backend"
+    / "wake"
+    / "chrome_extension_ts"
 )
 
 

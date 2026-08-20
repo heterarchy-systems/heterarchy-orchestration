@@ -8,6 +8,11 @@ Always read:
 2. `00-overview.md` — system purpose and authority model.
 3. The rule files relevant to the touched boundary.
 
+Backend FastAPI / ORM / DI work additionally loads:
+
+- `../../fastapi-skill/SKILL.md`
+- `../../dependency-injector-skill/SKILL.md`
+
 Rule map:
 
 - `01` architecture and authority boundaries
@@ -25,6 +30,7 @@ Rule map:
 - `13` Ruff, Pyrefly, Node, and pytest gates
 - `14` scoped refactoring
 - `15` agent execution and worktree preservation
+- `16` FastAPI, Dependency Injector, strict schema contracts, and MCP v2 compatibility
 
 These rules constrain implementation; they are not a product backlog and do not authorize unrelated changes.
 

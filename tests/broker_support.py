@@ -1,23 +1,28 @@
 from dataclasses import dataclass
 from pathlib import Path
 
-from chattocodex.broker.broker_dto import BrokerAssignment, CreatedWorkerSlot
-from chattocodex.broker.broker_service import BrokerService
-from chattocodex.broker_client.external_broker_gateway import (
+from chattocodex.orchestrator_backend.broker.broker_dto import (
+    BrokerAssignment,
+    CreatedWorkerSlot,
+)
+from chattocodex.orchestrator_backend.broker.broker_service import BrokerService
+from chattocodex.shared.contracts.broker.broker_gateway_contract import (
     BrokerClaim as ExternalBrokerClaim,
     BrokerRenewal,
 )
-from chattocodex.orchestration.entity_lock_registry import EntityLockRegistry
-from chattocodex.persistence.broker_repository import (
+from chattocodex.shared.concurrency.entity_lock_registry import EntityLockRegistry
+from chattocodex.orchestrator_backend.persistence.broker.broker_repository import (
     BrokerTaskRepository,
     WorkerSlotRepository,
 )
-from chattocodex.persistence.orchestration_state_repository import (
+from chattocodex.orchestrator_backend.persistence.orchestration.orchestration_state_repository import (
     RunStateRepository,
     TaskStateRepository,
     WorkerStateRepository,
 )
-from chattocodex.workspace.workspace_project_service import WorkspaceProjectService
+from chattocodex.orchestrator_backend.workspace.workspace_project_service import (
+    WorkspaceProjectService,
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

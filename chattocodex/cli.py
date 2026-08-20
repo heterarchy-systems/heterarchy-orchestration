@@ -3,21 +3,30 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from chattocodex.auth.owner_token_service import OwnerTokenService
-from chattocodex.control_panel.control_panel_app import serve_control_panel
-from chattocodex.mcp_server import serve_configured
-from chattocodex.remote.cloudflare_tunnel import (
+from chattocodex.orchestrator_backend.control_panel.infrastructure.cloudflare_tunnel import (
     CloudflareTunnelError,
     launch_configured_cloudflare_tunnel,
 )
-from chattocodex.runtime_settings import RuntimeSettings
-from chattocodex.schemas.setup_schemas import SetupRequest
-from chattocodex.setup.runtime_setup_service import RuntimeSetupService
-from chattocodex.wake.worker_browser_runtime_dto import WorkerBrowserRuntimeMode
-from chattocodex.wake.worker_browser_runtime_service import WorkerBrowserRuntimeService
+from chattocodex.orchestrator_backend.control_panel.interface.http.control_panel_app import (
+    serve_control_panel,
+)
+from chattocodex.orchestrator_backend.setup.runtime_setup_service import (
+    RuntimeSetupService,
+)
+from chattocodex.orchestrator_backend.wake.browser.worker_browser_runtime_dto import (
+    WorkerBrowserRuntimeMode,
+)
+from chattocodex.orchestrator_backend.wake.browser.worker_browser_runtime_service import (
+    WorkerBrowserRuntimeService,
+)
+from chattocodex.orchestrator_mcp.composition.mcp_server import serve_configured
+from chattocodex.shared.contracts.setup_schemas import SetupRequest
+from chattocodex.shared.security.owner_token_service import OwnerTokenService
+from chattocodex.shared.settings.runtime_settings import RuntimeSettings
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    """Build parser. Args: None. Returns: argparse.ArgumentParser."""
     parser = argparse.ArgumentParser(
         prog="chattocodex",
         description="Configure, diagnose, and run the ChatToCodex MCP server.",
@@ -94,7 +103,8 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_setup(*, args: argparse.Namespace, settings: RuntimeSettings) -> int:
+def _run_setup(args: argparse.Namespace, settings: RuntimeSettings) -> int:
+    """Run setup. Args: args, settings. Returns: int."""
     try:
         request = SetupRequest(
             workspace_root=args.workspace_root,
@@ -113,13 +123,15 @@ def _run_setup(*, args: argparse.Namespace, settings: RuntimeSettings) -> int:
     return 0
 
 
-def _run_doctor(*, settings: RuntimeSettings) -> int:
+def _run_doctor(settings: RuntimeSettings) -> int:
+    """Run doctor. Args: settings. Returns: int."""
     result = RuntimeSetupService(state_root=settings.state_root).doctor()
     print(result.model_dump_json(indent=2))
     return 0 if result.ok else 1
 
 
-def _rotate_owner_token(*, settings: RuntimeSettings) -> int:
+def _rotate_owner_token(settings: RuntimeSettings) -> int:
+    """Rotate owner token. Args: settings. Returns: int."""
     owner_token = OwnerTokenService(state_root=settings.state_root).generate()
     print(owner_token)
     print(
@@ -129,6 +141,7 @@ def _rotate_owner_token(*, settings: RuntimeSettings) -> int:
 
 
 def main() -> None:
+    """Main. Args: None. Returns: None."""
     parser = _build_parser()
     args = parser.parse_args()
     base_settings = RuntimeSettings()
@@ -152,7 +165,7 @@ def main() -> None:
             else WorkerBrowserRuntimeMode.HEADLESS
         )
         exit_code = WorkerBrowserRuntimeService(state_root=state_root).run_foreground(
-            chrome_binary=args.chrome_binary,
+            chrome_binary=args.chrome_binary or base_settings.chrome_binary,
             profile_root=args.profile_root,
             mode=mode,
         )

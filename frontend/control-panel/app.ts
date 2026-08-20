@@ -2,7 +2,8 @@
 
 /**
  * Source of truth for the loopback Runtime Console UI.
- * The packaged browser asset is copied to chattocodex/control_panel/static/app.js
+ * The packaged browser asset is copied to
+ * chattocodex/orchestrator_backend/control_panel/static/app.js
  * without adding a frontend toolchain dependency.
  */
 
@@ -22,6 +23,7 @@ const API = {
 
 const SECTION_COPY = {
   overview: ["Operations", "Project companies, broker namespaces, Worker runtimes, consumers and current runs."],
+  execution: ["Execution", "See what is running, blocked, ready for claim, waiting for review, and what happens next."],
   projects: ["Projects", "Bind local projects to their exact ChatGPT Project identity."],
   broker: ["Broker", "Inspect Broker-authoritative Consumer Groups and project namespace pressure."],
   workers: ["Workers", "Inspect orchestration-owned Worker runtime topology and persistent Worker chats."],
@@ -37,6 +39,7 @@ const state = {
   settingsHydrated: false,
   refreshing: false,
   mutating: false,
+  selectedExecutionRunId: null,
 };
 
 const q = (selector) => document.querySelector(selector);
@@ -128,6 +131,23 @@ function toneForWorker(status) {
 
 function toneForRun(status) {
   return status === "active" ? "accent" : status === "completed" ? "success" : "neutral";
+}
+
+function toneForExecution(phase) {
+  return {
+    planning: "neutral",
+    ready: "accent",
+    running: "claiming",
+    blocked: "warning",
+    waiting_main_review: "warning",
+    completed: "success",
+    failed: "danger",
+    cancelled: "neutral",
+  }[phase] || "neutral";
+}
+
+function executionPhaseLabel(phase) {
+  return String(phase || "unknown").replaceAll("_", " ").toUpperCase();
 }
 
 function workerStateSummary(runtime) {
@@ -245,9 +265,134 @@ function renderOperations(operations) {
 
   renderOverviewProjects(operations?.projects || []);
   renderProjectManagement(operations?.projects || []);
+  renderExecutions(operations?.executions || []);
   renderBroker(operations?.broker || null, operations?.projects || []);
   renderWorkerGroups(operations?.projects || []);
   renderRuns(operations?.recent_runs || []);
+}
+
+function executionStageState(phase, stageIndex) {
+  if (phase === "completed") return "done";
+  const activeIndex = {
+    planning: 0,
+    ready: 1,
+    blocked: 1,
+    running: 2,
+    waiting_main_review: 3,
+    failed: 2,
+    cancelled: 0,
+  }[phase] ?? 0;
+  if (stageIndex < activeIndex) return "done";
+  if (stageIndex === activeIndex) return phase === "failed" ? "failed" : phase === "blocked" ? "blocked" : "active";
+  return "pending";
+}
+
+function renderExecutions(executions) {
+  const list = q("#execution-run-list");
+  const detail = q("#execution-detail");
+  const count = q("#execution-run-count");
+  if (!list || !detail || !count) return;
+  count.textContent = `${executions.length} run${executions.length === 1 ? "" : "s"}`;
+  if (!executions.length) {
+    state.selectedExecutionRunId = null;
+    list.innerHTML = emptyState("No execution runs", "Create a Run and its Broker tasks to start observing execution.");
+    detail.innerHTML = emptyState("Nothing selected", "Execution detail will appear here when work starts.");
+    return;
+  }
+
+  if (!executions.some((execution) => execution.run_id === state.selectedExecutionRunId)) {
+    state.selectedExecutionRunId = executions[0].run_id;
+  }
+  const selected = executions.find((execution) => execution.run_id === state.selectedExecutionRunId) || executions[0];
+  list.innerHTML = executions.map((execution) => {
+    const active = execution.run_id === selected.run_id;
+    const phaseTone = toneForExecution(execution.continuation_phase);
+    return `
+      <button class="execution-run-button ${active ? "is-selected" : ""}" type="button" data-execution-run-id="${escapeHtml(execution.run_id)}">
+        <div class="execution-run-topline">
+          <strong>${escapeHtml(execution.project_name)}</strong>
+          <span class="mini-chip" data-tone="${phaseTone}">${escapeHtml(executionPhaseLabel(execution.continuation_phase))}</span>
+        </div>
+        <span class="execution-goal">${escapeHtml(execution.goal)}</span>
+        <div class="execution-mini-metrics">
+          <span><i data-phase="running"></i>${execution.running} running</span>
+          <span>${execution.ready} ready</span>
+          <span>${execution.blocked} blocked</span>
+          <span>${execution.completed}/${execution.total_tasks} done</span>
+        </div>
+        <time>${formatTime(execution.updated_at)}</time>
+      </button>`;
+  }).join("");
+
+  const stages = [
+    ["Plan", "Orchestration DAG"],
+    ["Broker", "Publish & claim"],
+    ["Workers", "Lease execution"],
+    ["Main Review", "Approve or rework"],
+  ];
+  const taskCards = selected.tasks.length
+    ? selected.tasks.map((task) => {
+      const dependencies = (task.depends_on || []).length
+        ? task.depends_on.map((dependency) => `<span class="dependency-chip">${escapeHtml(shortId(dependency))}</span>`).join("")
+        : '<span class="dependency-chip is-root">root</span>';
+      const lease = task.lease ? `
+        <div class="execution-lease-grid">
+          <div><span>Consumer</span><code>${escapeHtml(shortId(task.lease.broker_consumer_id))}</code></div>
+          <div><span>Fence</span><strong>term ${task.lease.term} · gen ${task.lease.generation}</strong></div>
+          <div><span>Lease</span><code>${escapeHtml(shortId(task.lease.lease_id))}</code></div>
+          <div><span>Epoch</span><strong>${task.lease.lease_epoch}</strong></div>
+        </div>` : "";
+      const evidence = task.result || task.progress_summary;
+      return `
+        <article class="execution-task-card" data-phase="${escapeHtml(task.phase)}">
+          <div class="execution-task-header">
+            <div>
+              <div class="task-kicker"><code>${escapeHtml(shortId(task.broker_task_id))}</code>${task.role ? `<span>${escapeHtml(task.role)}</span>` : ""}</div>
+              <h4>${escapeHtml(task.objective)}</h4>
+            </div>
+            <span class="status-badge" data-tone="${toneForExecution(task.phase)}">${escapeHtml(executionPhaseLabel(task.phase))}</span>
+          </div>
+          <div class="execution-task-meta">
+            <div><span>Dependencies</span><div class="dependency-list">${dependencies}</div></div>
+            <div><span>Broker publish</span><strong>${task.external_published ? "Published" : "Waiting on DAG"}</strong></div>
+            <div><span>Worker</span><code>${escapeHtml(task.worker_id ? shortId(task.worker_id) : "—")}</code></div>
+          </div>
+          ${evidence ? `<div class="execution-evidence"><span>${task.result ? "Result" : "Progress"}</span><p>${escapeHtml(evidence)}</p></div>` : ""}
+          ${lease}
+        </article>`;
+    }).join("")
+    : emptyState("No tasks planned yet", "This Run is active but orchestration has not created Broker tasks.");
+
+  detail.innerHTML = `
+    <div class="execution-detail-header">
+      <div>
+        <div class="execution-detail-kicker"><span>${escapeHtml(selected.project_name)}</span><code>${escapeHtml(shortId(selected.run_id))}</code></div>
+        <h2>${escapeHtml(selected.goal)}</h2>
+      </div>
+      <span class="status-badge execution-phase-badge" data-tone="${toneForExecution(selected.continuation_phase)}">${escapeHtml(executionPhaseLabel(selected.continuation_phase))}</span>
+    </div>
+    <div class="execution-next-step">
+      <span>What happens next</span>
+      <strong>${escapeHtml(selected.next_step)}</strong>
+      <small>${selected.workflow_status ? `Workflow ${escapeHtml(executionPhaseLabel(selected.workflow_status))}` : "Derived from durable orchestration state and Broker lease projection."}</small>
+    </div>
+    <div class="execution-stage-flow">
+      ${stages.map(([title, copy], index) => `
+        <div class="execution-stage" data-state="${executionStageState(selected.continuation_phase, index)}">
+          <span class="stage-marker">${index + 1}</span>
+          <div><strong>${title}</strong><small>${copy}</small></div>
+        </div>`).join("")}
+    </div>
+    <div class="execution-count-strip">
+      <div><span>Blocked</span><strong>${selected.blocked}</strong></div>
+      <div><span>Ready</span><strong>${selected.ready}</strong></div>
+      <div><span>Running</span><strong>${selected.running}</strong></div>
+      <div><span>Completed</span><strong>${selected.completed}</strong></div>
+      <div><span>Failed</span><strong>${selected.failed}</strong></div>
+      <div><span>Parallelism</span><strong>${selected.requested_parallelism}</strong></div>
+    </div>
+    <div class="execution-task-heading"><div><h3>Task execution</h3><p>Broker ownership and orchestration progress shown together without merging authority.</p></div><span>${selected.total_tasks} tasks</span></div>
+    <div class="execution-task-list">${taskCards}</div>`;
 }
 
 function renderBroker(broker, projects) {
@@ -327,7 +472,7 @@ function renderOverviewProjects(projects) {
           </div>
           <div>
             <div class="project-title-line">
-              <strong>Consumer group</strong>
+              <strong>Worker runtime</strong>
               <span class="mini-chip" data-tone="${runtime.initialized ? "accent" : "neutral"}">${escapeHtml(runtimeLabel)}</span>
             </div>
             <div class="worker-state-inline">${workerStateSummary(runtime)}</div>
@@ -618,6 +763,12 @@ function bindEvents() {
   document.addEventListener("click", (event) => {
     const target = event.target;
     if (!(target instanceof Element)) return;
+    const executionButton = target.closest("[data-execution-run-id]");
+    if (executionButton instanceof HTMLElement && executionButton.dataset.executionRunId) {
+      state.selectedExecutionRunId = executionButton.dataset.executionRunId;
+      renderExecutions(state.operations?.executions || []);
+      return;
+    }
     const button = target.closest("[data-nav]");
     if (button instanceof HTMLElement) setSection(button.dataset.nav);
   });
@@ -644,3 +795,6 @@ bindEvents();
 const initialSection = new URLSearchParams(window.location.search).get("section");
 if (initialSection) setSection(initialSection);
 refreshAll({ quiet: true });
+window.setInterval(() => {
+  if (!document.hidden && !state.refreshing && !state.mutating) refreshAll({ quiet: true });
+}, 5000);

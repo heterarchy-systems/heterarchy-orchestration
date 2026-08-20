@@ -9,6 +9,7 @@ const repositoryRoot = path.resolve(__dirname, "..");
 const extensionRoot = path.join(
   repositoryRoot,
   "chattocodex",
+  "orchestrator_backend",
   "wake",
   "chrome_extension",
 );

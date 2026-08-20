@@ -2,21 +2,31 @@ from pathlib import Path
 
 from starlette.testclient import TestClient
 
-from chattocodex.control_panel.cloudflare_process_supervisor import (
+from chattocodex.orchestrator_backend.control_panel.infrastructure.cloudflare_process_supervisor import (
     CloudflareProcessSupervisor,
 )
-from chattocodex.control_panel.control_panel_routes import create_control_panel_app
-from chattocodex.control_panel.control_panel_service import ControlPanelService
-from chattocodex.control_panel.mcp_process_supervisor import McpProcessSupervisor
-from chattocodex.control_panel.runtime_boundary_provider import (
+from chattocodex.orchestrator_backend.control_panel.interface.routes.control_panel_routes import (
+    create_control_panel_app,
+)
+from chattocodex.orchestrator_backend.control_panel.application.control_panel_service import (
+    ControlPanelService,
+)
+from chattocodex.orchestrator_backend.control_panel.infrastructure.mcp_process_supervisor import (
+    McpProcessSupervisor,
+)
+from chattocodex.orchestrator_backend.control_panel.composition.runtime_boundary_provider import (
     WorkspaceRuntimeBoundaryProvider,
 )
-from chattocodex.persistence.runtime_config_repository import RuntimeConfigRepository
-from chattocodex.persistence.wake_target_repository import WakeTargetRepository
-from chattocodex.project_runtime.workspace_execution_layout import (
+from chattocodex.shared.settings.runtime_config_repository import (
+    RuntimeConfigRepository,
+)
+from chattocodex.orchestrator_backend.persistence.wake.wake_target_repository import (
+    WakeTargetRepository,
+)
+from chattocodex.shared.pathing.workspace_execution_layout import (
     WorkspaceExecutionLayout,
 )
-from chattocodex.schemas.auth_schemas import RuntimeConfigRecord
+from chattocodex.shared.contracts.auth_schemas import RuntimeConfigRecord
 
 
 def _workspace(tmp_path: Path, name: str) -> Path:
