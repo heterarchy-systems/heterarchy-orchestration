@@ -1,27 +1,37 @@
-.next/
-node_modules/
-frontend/control-panel/out/
-frontend/control-panel/public/app.js
-.venv/
-.pytest_cache/
-.ruff_cache/
-__pycache__/
-*.py[cod]
-*.egg-info/
+# Cargo build output
+target/
+debug/
+
+# Cargo/rustfmt tooling
+**/*.rs.bk
+**/mutants.out*/
+
+# Local ChatGPT-to-repository runtime state
+.chatgpt2codex/
+
+# macOS
+.DS_Store
+
+# IDE-local state
+.idea/
+.vscode/
+
+# Release packaging output
 build/
 dist/
-.env
-
-# ChatToCodex runtime state
-.chattocodex/
-.chattocodex-*/
-
-# Local ChatGPT-to-Codex execution/checkpoint artifacts
-.chatgpt2codex/
+docs/**
+PRODUCT.md
 .codex/
-ChatToCodex_Codex_Implementation_Prompt.md
+.impeccable/
+.omx/
+opencode.json
+.opencode
+DESIGN.md
 
-# macOS document-provider conflict copies for generated Control Panel assets
-chattocodex/orchestrator_backend/control_panel/static/* [0-9].*
-chattocodex/orchestrator_backend/control_panel/static/* [0-9]/
-*.tsbuildinfo
+# Private repository-local agent harness
+/.agents/
+
+# Private Forge runtime state
+/.heterarchy-forge/
+/.heterarchy-forge.init.*/
+.heterarchy-forge/

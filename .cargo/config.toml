@@ -1,0 +1,6 @@
+# Local Mac build cache: keep generated artifacts outside iCloud Drive.
+[build]
+target-dir = "/Users/imhaneul/Library/Caches/RustBuild/orchestration"
+
+[alias]
+xtask = "run --quiet --locked -p xtask --"

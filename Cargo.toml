@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    ".agents/rust_dev_harness/harness/xtask",
+    "crates/heterarchy-orchestration-policy",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+
+[workspace.dependencies]
+heterarchy-orchestration-policy = { path = "crates/heterarchy-orchestration-policy" }
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+serde = { version = "1.0", features = ["derive"] }
+
+[workspace.lints.rust]
+warnings = "deny"
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
