@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Heterarchy Orchestration headless backend per-user LaunchAgent template.
+  Run it as the same macOS account that bootstraps the native token authority.
+  launchd receives only the variables listed below; it does not read
+  backend.env.example or any other env file. Replace the rendered data and
+  log paths with user-owned absolute paths before loading this template.
+  Graceful shutdown uses SIGTERM.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>systems.heterarchy.orchestration.backend</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@@PREFIX@@/bin/heterarchy-orchestration-backend</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HETERARCHY_ORCHESTRATION_DATA_DIR</key>
+        <string>@@DATA_ROOT@@</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>@@DATA_ROOT@@/backend.log</string>
+    <key>StandardErrorPath</key>
+    <string>@@DATA_ROOT@@/backend.err.log</string>
+</dict>
+</plist>

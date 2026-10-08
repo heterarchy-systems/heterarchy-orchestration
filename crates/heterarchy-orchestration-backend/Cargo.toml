@@ -1,0 +1,37 @@
+[package]
+name = "heterarchy-orchestration-backend"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+futures-core = { version = "=0.3.34", default-features = false }
+forge-backend = { path = "../../../heterarchy-forge/crates/forge-backend" }
+forge-control = { path = "../../../heterarchy-forge/crates/forge-control" }
+forge-domain = { path = "../../../heterarchy-forge/crates/forge-domain" }
+heterarchy-orchestration-auth = { path = "../heterarchy-orchestration-auth" }
+heterarchy-orchestration-sessions = { path = "../heterarchy-orchestration-sessions" }
+heterarchy-orchestration-operations = { path = "../heterarchy-orchestration-operations" }
+heterarchy-orchestration-runtime = { path = "../heterarchy-orchestration-runtime" }
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream = { version = "=0.1.19", default-features = false, features = ["sync"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+forge-persistence = { path = "../../../heterarchy-forge/crates/forge-persistence" }
+forge-workspace = { path = "../../../heterarchy-forge/crates/forge-workspace" }
+
+[lints]
+workspace = true

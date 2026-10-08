@@ -1,0 +1,424 @@
+//! Broker-backed process ownership for Orchestration coordination admission.
+//!
+//! This is deliberately separate from product leadership. Broker command-session
+//! ownership fences competing Orchestration process incarnations; it never
+//! selects a Workspace or Activity leader. Raft leader changes are hidden by
+//! the fixed-three-node router and therefore do not advance the owner epoch.
+use std::path::{Path, PathBuf};
+
+use agent_broker_application::{
+    BrokerErrorCode, BrokerErrorDisposition, CommandSessionId, SessionOwnerEpoch,
+    SessionOwnerInstanceId,
+};
+use agent_broker_client::{
+    AsyncDurableClientSessionStore, AsyncStaticClusterRouter, ClientError, ClientSessionStoreError,
+    DurableSessionOwner, PendingOwnerAcquisition, StaticClusterRoutingError,
+};
+use agent_broker_protocol::RequestId;
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::broker_cluster::BrokerClusterConfig;
+
+const REQUEST_DOMAIN: &[u8] = b"heterarchy-orchestration:broker-owner:v1";
+
+/// Broker-confirmed ownership used only as an Orchestration process fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerOwnerLease {
+    owner_epoch: u64,
+    owner_instance_id: String,
+}
+
+impl BrokerOwnerLease {
+    #[must_use]
+    pub const fn owner_epoch(&self) -> u64 {
+        self.owner_epoch
+    }
+
+    #[must_use]
+    pub fn owner_instance_id(&self) -> &str {
+        &self.owner_instance_id
+    }
+}
+
+/// Fail-closed owner admission outcomes.
+#[derive(Debug, Error)]
+pub enum BrokerOwnerAuthorityError {
+    #[error("Broker owner state is unavailable: {0}")]
+    LocalState(#[source] ClientSessionStoreError),
+    #[error("Broker owner state is already owned by another local Orchestration process")]
+    LocalOwnerBusy,
+    #[error("Broker owner routing configuration is invalid")]
+    InvalidConfiguration,
+    #[error("Broker owner authority is stale")]
+    Stale,
+    #[error("Broker definitively rejected owner authority")]
+    Rejected,
+    #[error("Broker owner authority outcome is unconfirmed")]
+    Unconfirmed,
+}
+
+/// One host-owned durable Broker command session. The local state file is the
+/// write-ahead source for exact acquisition recovery; the Broker remains the
+/// authority for the epoch itself.
+pub struct BrokerOwnerAuthority {
+    session_id: CommandSessionId,
+    process_instance_id: SessionOwnerInstanceId,
+    state_path: PathBuf,
+    store: Option<AsyncDurableClientSessionStore>,
+    router: AsyncStaticClusterRouter,
+}
+
+impl BrokerOwnerAuthority {
+    /// Compose a process fence for one durable Orchestration destination.
+    ///
+    /// The stable command-session ID derives from the destination identity,
+    /// while each host process receives a fresh instance ID. Durable owner
+    /// state is opened lazily when an authoritative mutation is admitted, so a
+    /// competing read-only host can still compose without becoming a writer.
+    ///
+    /// # Errors
+    /// Fails closed for invalid paths/identifiers or invalid fixed-cluster
+    /// configuration. Durable-state corruption/contention is reported at
+    /// authoritative mutation admission.
+    pub fn new(
+        state_path: impl AsRef<Path>,
+        destination_id: Uuid,
+        process_instance_id: Uuid,
+    ) -> Result<Self, BrokerOwnerAuthorityError> {
+        Self::new_with_cluster(
+            state_path,
+            destination_id,
+            process_instance_id,
+            BrokerClusterConfig::default(),
+        )
+    }
+
+    /// Compose the same process fence with one host-owned Broker cluster
+    /// configuration. This is a composition seam, not a caller-controlled wire
+    /// input; owner and leadership fencing can therefore share the exact same
+    /// topology and routing bounds.
+    ///
+    /// # Errors
+    /// Fails closed for invalid paths/identifiers or invalid fixed-cluster
+    /// configuration.
+    pub fn new_with_cluster(
+        state_path: impl AsRef<Path>,
+        destination_id: Uuid,
+        process_instance_id: Uuid,
+        broker_cluster: BrokerClusterConfig,
+    ) -> Result<Self, BrokerOwnerAuthorityError> {
+        let state_path = state_path.as_ref().to_path_buf();
+        if !state_path.is_absolute() || state_path.parent().is_none_or(|parent| !parent.is_dir()) {
+            return Err(BrokerOwnerAuthorityError::InvalidConfiguration);
+        }
+        let session_id =
+            CommandSessionId::new(format!("orch-control-{}", destination_id.as_simple()))
+                .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
+        let process_instance_id = SessionOwnerInstanceId::new(format!(
+            "orch-process-{}",
+            process_instance_id.as_simple()
+        ))
+        .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
+        let router = AsyncStaticClusterRouter::new(broker_cluster.router_config())
+            .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
+        Ok(Self {
+            session_id,
+            process_instance_id,
+            state_path,
+            store: None,
+            router,
+        })
+    }
+
+    /// Require Broker-confirmed ownership for this process before an
+    /// authoritative Orchestration mutation may proceed.
+    ///
+    /// A crash-persisted acquisition is always recovered first with the exact
+    /// same fields. Only after that ambiguity resolves may a new process take
+    /// over and advance N -> N+1. A process that already owns N merely verifies
+    /// N and never increments it because of a Raft leader change.
+    ///
+    /// # Errors
+    /// Returns a bounded fail-closed classification. Stale/rejected pending
+    /// acquisition is intentionally retained; without authoritative owner
+    /// readback it would be unsafe to discard it and guess a newer epoch.
+    pub async fn ensure_current_owner(
+        &mut self,
+    ) -> Result<BrokerOwnerLease, BrokerOwnerAuthorityError> {
+        let store = self.store().await?;
+        if let Some(pending) = store
+            .pending_owner_acquisition()
+            .await
+            .map_err(BrokerOwnerAuthorityError::LocalState)?
+        {
+            let epoch = self.submit_pending(&pending).await?;
+            store
+                .confirm_owner_acquisition(epoch)
+                .await
+                .map_err(BrokerOwnerAuthorityError::LocalState)?;
+        }
+        let owner = store
+            .owner()
+            .await
+            .map_err(BrokerOwnerAuthorityError::LocalState)?;
+        match owner {
+            Some(owner) if owner.owner_instance_id() == &self.process_instance_id => {
+                self.verify_current_owner(&owner).await
+            }
+            Some(_) | None => self.acquire_for_current_process(&store).await,
+        }
+    }
+
+    async fn store(&mut self) -> Result<AsyncDurableClientSessionStore, BrokerOwnerAuthorityError> {
+        if let Some(store) = &self.store {
+            return Ok(store.clone());
+        }
+        let store = AsyncDurableClientSessionStore::open_or_create(
+            &self.state_path,
+            self.session_id.clone(),
+        )
+        .await
+        .map_err(classify_store_error)?;
+        self.store = Some(store.clone());
+        Ok(store)
+    }
+
+    async fn acquire_for_current_process(
+        &self,
+        store: &AsyncDurableClientSessionStore,
+    ) -> Result<BrokerOwnerLease, BrokerOwnerAuthorityError> {
+        let pending = store
+            .begin_owner_acquisition(self.process_instance_id.clone())
+            .await
+            .map_err(BrokerOwnerAuthorityError::LocalState)?;
+        let epoch = self.submit_pending(&pending).await?;
+        let owner = store
+            .confirm_owner_acquisition(epoch)
+            .await
+            .map_err(BrokerOwnerAuthorityError::LocalState)?;
+        Ok(owner_lease(&owner))
+    }
+
+    async fn submit_pending(
+        &self,
+        pending: &PendingOwnerAcquisition,
+    ) -> Result<SessionOwnerEpoch, BrokerOwnerAuthorityError> {
+        let request_id = owner_request_id(
+            "acquire",
+            pending.session_id(),
+            pending.expected_owner_epoch(),
+            pending.owner_instance_id(),
+        )?;
+        self.router
+            .acquire_command_session_owner_with_request_id(
+                request_id,
+                pending.session_id().clone(),
+                pending.expected_owner_epoch(),
+                pending.owner_instance_id().clone(),
+            )
+            .await
+            .map_err(classify_routing_error)
+    }
+
+    async fn verify_current_owner(
+        &self,
+        owner: &DurableSessionOwner,
+    ) -> Result<BrokerOwnerLease, BrokerOwnerAuthorityError> {
+        let request_id = owner_request_id(
+            "verify",
+            &self.session_id,
+            owner.owner_epoch(),
+            owner.owner_instance_id(),
+        )?;
+        let observed = self
+            .router
+            .acquire_command_session_owner_with_request_id(
+                request_id,
+                self.session_id.clone(),
+                owner.owner_epoch(),
+                owner.owner_instance_id().clone(),
+            )
+            .await
+            .map_err(classify_routing_error)?;
+        if observed != owner.owner_epoch() {
+            return Err(BrokerOwnerAuthorityError::Rejected);
+        }
+        Ok(owner_lease(owner))
+    }
+}
+
+fn classify_store_error(error: ClientSessionStoreError) -> BrokerOwnerAuthorityError {
+    match error {
+        ClientSessionStoreError::StateAlreadyOwned => BrokerOwnerAuthorityError::LocalOwnerBusy,
+        other => BrokerOwnerAuthorityError::LocalState(other),
+    }
+}
+
+fn owner_lease(owner: &DurableSessionOwner) -> BrokerOwnerLease {
+    BrokerOwnerLease {
+        owner_epoch: owner.owner_epoch().get(),
+        owner_instance_id: owner.owner_instance_id().as_str().to_owned(),
+    }
+}
+
+fn owner_request_id(
+    phase: &str,
+    session_id: &CommandSessionId,
+    owner_epoch: SessionOwnerEpoch,
+    owner_instance_id: &SessionOwnerInstanceId,
+) -> Result<RequestId, BrokerOwnerAuthorityError> {
+    let mut hash = Sha256::new();
+    hash.update(REQUEST_DOMAIN);
+    hash.update([0]);
+    hash.update(phase.as_bytes());
+    hash.update([0]);
+    hash.update(session_id.as_str().as_bytes());
+    hash.update([0]);
+    hash.update(owner_epoch.get().to_be_bytes());
+    hash.update([0]);
+    hash.update(owner_instance_id.as_str().as_bytes());
+    let digest = hash.finalize();
+    let digest_id = Uuid::from_slice(&digest[..16])
+        .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
+    RequestId::new(format!("orch-owner-{phase}-{digest_id}"))
+        .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)
+}
+
+fn classify_routing_error(error: StaticClusterRoutingError) -> BrokerOwnerAuthorityError {
+    match error {
+        StaticClusterRoutingError::Client(ClientError::Broker(error))
+            if error.code() == BrokerErrorCode::StaleFence =>
+        {
+            BrokerOwnerAuthorityError::Stale
+        }
+        StaticClusterRoutingError::Client(ClientError::Broker(error))
+            if error.disposition() == BrokerErrorDisposition::Rejected =>
+        {
+            BrokerOwnerAuthorityError::Rejected
+        }
+        StaticClusterRoutingError::InvalidConfiguration(_) => {
+            BrokerOwnerAuthorityError::InvalidConfiguration
+        }
+        StaticClusterRoutingError::InvalidOperationsResponse { .. }
+        | StaticClusterRoutingError::NoWriteReadyLeader
+        | StaticClusterRoutingError::MultipleWriteReadyLeaders(_)
+        | StaticClusterRoutingError::Client(_) => BrokerOwnerAuthorityError::Unconfirmed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+    use std::time::Duration;
+
+    use agent_broker_client::StaticClusterNode;
+
+    use super::{BrokerOwnerAuthority, BrokerOwnerAuthorityError};
+    use crate::broker_cluster::BrokerClusterConfig;
+
+    fn isolated_cluster()
+    -> Result<(BrokerClusterConfig, Vec<TcpListener>), Box<dyn std::error::Error>> {
+        let listeners = (0..6)
+            .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let addresses = listeners
+            .iter()
+            .map(TcpListener::local_addr)
+            .collect::<Result<Vec<SocketAddr>, _>>()?;
+        Ok((
+            BrokerClusterConfig {
+                nodes: [
+                    StaticClusterNode {
+                        node_id: 1,
+                        broker_address: addresses[0],
+                        operations_address: addresses[1],
+                    },
+                    StaticClusterNode {
+                        node_id: 2,
+                        broker_address: addresses[2],
+                        operations_address: addresses[3],
+                    },
+                    StaticClusterNode {
+                        node_id: 3,
+                        broker_address: addresses[4],
+                        operations_address: addresses[5],
+                    },
+                ],
+                timeout: Duration::from_millis(25),
+            },
+            listeners,
+        ))
+    }
+
+    #[tokio::test]
+    async fn competing_host_composes_but_mutation_fails_on_local_owner_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "heterarchy-orchestration-broker-owner-contention-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&directory)?;
+        let state_path = directory.join("broker-owner.json");
+        let destination = uuid::Uuid::from_u128(0xB011);
+        let (cluster, _listeners) = isolated_cluster()?;
+        let mut first = BrokerOwnerAuthority::new_with_cluster(
+            &state_path,
+            destination,
+            uuid::Uuid::from_u128(0xB012),
+            cluster,
+        )?;
+        let mut second = BrokerOwnerAuthority::new_with_cluster(
+            &state_path,
+            destination,
+            uuid::Uuid::from_u128(0xB013),
+            cluster,
+        )?;
+
+        assert!(matches!(
+            first.ensure_current_owner().await,
+            Err(BrokerOwnerAuthorityError::Unconfirmed)
+        ));
+        assert!(matches!(
+            second.ensure_current_owner().await,
+            Err(BrokerOwnerAuthorityError::LocalOwnerBusy)
+        ));
+
+        drop(second);
+        drop(first);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn absent_cluster_preserves_exact_pending_owner_acquisition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = std::env::temp_dir().join(format!(
+            "heterarchy-orchestration-broker-owner-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&directory)?;
+        let state_path = directory.join("broker-owner.json");
+        let (cluster, _listeners) = isolated_cluster()?;
+        let mut authority = BrokerOwnerAuthority::new_with_cluster(
+            &state_path,
+            uuid::Uuid::from_u128(0xB001),
+            uuid::Uuid::from_u128(0xB002),
+            cluster,
+        )?;
+
+        assert!(matches!(
+            authority.ensure_current_owner().await,
+            Err(BrokerOwnerAuthorityError::Unconfirmed)
+        ));
+        assert!(matches!(
+            authority.ensure_current_owner().await,
+            Err(BrokerOwnerAuthorityError::Unconfirmed)
+        ));
+        assert!(state_path.is_file());
+        drop(authority);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+}

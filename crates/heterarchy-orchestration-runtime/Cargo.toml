@@ -1,0 +1,20 @@
+[package]
+name = "heterarchy-orchestration-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+forge-domain = { path = "../../../heterarchy-forge/crates/forge-domain" }
+heterarchy-orchestration-operations = { path = "../heterarchy-orchestration-operations" }
+heterarchy-orchestration-policy = { path = "../heterarchy-orchestration-policy" }
+heterarchy-orchestration-sessions = { path = "../heterarchy-orchestration-sessions" }
+rusqlite.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

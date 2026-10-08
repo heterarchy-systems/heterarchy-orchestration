@@ -1,0 +1,29 @@
+[package]
+name = "heterarchy-orchestration-operations"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+agent-broker-application = { path = "../../../heterarchy-broker/crates/agent-broker-application" }
+agent-broker-client = { path = "../../../heterarchy-broker/crates/agent-broker-client", features = ["async"] }
+agent-broker-domain = { path = "../../../heterarchy-broker/crates/agent-broker-domain" }
+agent-broker-protocol = { path = "../../../heterarchy-broker/crates/agent-broker-protocol" }
+forge-domain = { path = "../../../heterarchy-forge/crates/forge-domain" }
+forge-persistence = { path = "../../../heterarchy-forge/crates/forge-persistence" }
+heterarchy-orchestration-sessions = { path = "../heterarchy-orchestration-sessions" }
+heterarchy-orchestration-policy = { path = "../heterarchy-orchestration-policy" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+forge-workspace = { path = "../../../heterarchy-forge/crates/forge-workspace" }
+tokio.workspace = true
+
+[lints]
+workspace = true

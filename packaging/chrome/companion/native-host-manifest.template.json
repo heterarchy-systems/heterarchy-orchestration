@@ -1,0 +1,9 @@
+{
+  "name": "com.heterarchy.orchestration",
+  "description": "Heterarchy Orchestration ChatGPT companion host",
+  "path": "__HETERARCHY_ORCHESTRATION_MCP_ABSOLUTE_PATH__",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://__HETERARCHY_COMPANION_EXTENSION_ID__/"
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Heterarchy ChatGPT Companion",
+  "version": "0.1.3",
+  "description": "Browser runtime adapter for Heterarchy ChatGPT Agent provisioning.",
+  "permissions": [
+    "nativeMessaging",
+    "alarms",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://chatgpt.com/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtmHE68MGK2qaFD81H26lbpSIl3nrpJ9PmN53niCybCaHkEf8uYDnSWbkthCPK16HhVQuHv4SiZzzpKgvNNidjChAlDuOcL19vzcej9OX1WmSKYKimP2nfPgh80OyLTvzAT3d5RHgWMTJdgDY1Bg0CYLsm4OC3jQfY5xwA7/bB+eca4+uT/9y3RJftFnEZ9Y/cLYA+EtzmXGAhLkpnZ6iu/FUS3tGM4cte/Hh+xgNelm9wpaYbGpoaP0yjm0EG/8OMKDj4hiF2ldEDYQ8NhuNziNsUZ6m2HjKdkVYHUsVJZZZu5o3Ybd2qtphUl9DqBBZn/mI1XRXGegVmv2YOmPVlQIDAQAB",
+  "minimum_chrome_version": "116"
+}

@@ -2,9 +2,11 @@
 //!
 //! Orchestration decides when and where runnable work may execute, how much
 //! capacity it may consume, and which runtime slot may satisfy the request.
-//! Forge remains authoritative for Workspace, Goal/DAG, Agent/Team, source
-//! mutation, execution evidence, verification, and integration state.
+//! Orchestration owns operational Agent/session/team coordination.
+//! Forge remains authoritative for Workspace, Goal/DAG, source mutation,
+//! execution evidence, verification, and integration state.
 
+pub mod agent_request;
 pub mod dependency;
 pub mod provisioning;
 pub mod queue;
@@ -13,6 +15,12 @@ pub mod scheduler;
 mod types;
 pub mod wake;
 
+pub use agent_request::{
+    AgentRequestAdmissionDecision, AgentRequestAdmissionInput, AgentResolverActionKind,
+    AgentResolverAvailability, AgentResolverCandidate, AgentResolverDecision,
+    AgentResolverSlotDecision, MAX_AGENT_REQUEST_COUNT, evaluate_agent_request_admission,
+    evaluate_agent_resolver,
+};
 pub use dependency::{
     DependencyDecision, DependencyPlan, DependencyTask, MAX_DEPENDENCY_TASKS, validate_dependencies,
 };

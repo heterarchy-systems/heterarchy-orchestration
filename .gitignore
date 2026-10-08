@@ -35,3 +35,6 @@ DESIGN.md
 /.heterarchy-forge/
 /.heterarchy-forge.init.*/
 .heterarchy-forge/
+.codegraph/
+# Local agent harness material — never pushed
+.agents/
