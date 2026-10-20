@@ -3,7 +3,10 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
-use super::{WorkspaceQueryScope, node_team::NodeTeamScopeWire};
+use super::{
+    WorkspaceQueryScope, deserialize_optional_non_null, node_team::NodeTeamScopeWire,
+    workspace_project::ProviderProjectReferenceWire,
+};
 
 /// Exact caller-owned Workspace/Session selector and Node Chat query.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -64,6 +67,12 @@ pub struct ChatTargetFenceWire {
     pub runtime_session_id: Uuid,
     pub runtime_revision: i64,
     pub provider_conversation_id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub project: Option<ProviderProjectReferenceWire>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub leadership_revision: Option<i64>,
     #[serde(deserialize_with = "deserialize_required_option")]
@@ -247,6 +256,7 @@ mod tests {
             runtime_session_id: Uuid::from_u128(12),
             runtime_revision: 13,
             provider_conversation_id: "conversation".to_owned(),
+            project: None,
             leadership_revision: None,
             node_target: Some(NodeChatTargetWire::Agent {
                 assignment_id: Uuid::from_u128(14),

@@ -177,6 +177,16 @@ pub struct ElectionSnapshotSummary {
     pub candidate_total_credits: i64,
     /// Workspace total credits.
     pub workspace_total_credits: i64,
+    /// Frozen whole-credit part of the Workspace subject mean.
+    pub workspace_arithmetic_mean: i64,
+    /// Frozen fractional-mean numerator.
+    pub mean_remainder_numerator: i64,
+    /// Frozen subject count used as the mean denominator.
+    pub mean_subject_count: i64,
+    /// Qualification already decided by the durable election owner.
+    pub qualified: bool,
+    /// Digest already checked while reading the durable snapshot.
+    pub snapshot_digest: [u8; 32],
 }
 
 impl OrchestrationRuntime {
@@ -325,6 +335,11 @@ impl OrchestrationRuntime {
             evaluated_at_ms: receipt.evaluated_at_ms(),
             candidate_total_credits: receipt.candidate_total_credits(),
             workspace_total_credits: receipt.workspace_total_credits(),
+            workspace_arithmetic_mean: receipt.workspace_arithmetic_mean(),
+            mean_remainder_numerator: receipt.mean_remainder_numerator(),
+            mean_subject_count: receipt.mean_subject_count(),
+            qualified: receipt.qualified(),
+            snapshot_digest: receipt.snapshot_digest(),
         }))
     }
 }

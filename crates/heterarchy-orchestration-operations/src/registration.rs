@@ -16,9 +16,30 @@ use forge_domain::{
 };
 use forge_persistence::{AgentBindingReservation, AgentBindingReservationRequest};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const MAX_REQUEST_WIRE_BYTES: usize = 4096;
+const NATIVE_SESSION_PARTICIPATION_DOMAIN: &[u8] =
+    b"heterarchy-member-native-session-participation-v1\0";
+
+/// Canonical logical participant identity for one native Workspace Session.
+///
+/// This is shared by registration admission and actor attribution. The
+/// Activity-specific Agent binding remains a separate identity.
+#[must_use]
+pub fn native_session_participation_id(workspace: Uuid, session: Uuid) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(NATIVE_SESSION_PARTICIPATION_DOMAIN);
+    hasher.update(workspace.as_bytes());
+    hasher.update(session.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
 
 const PENDING_PARTICIPANTS_SQL: &str = "CREATE TABLE ops_pending_participants (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), participant_id BLOB NOT NULL CHECK(length(participant_id)=16 AND participant_id != zeroblob(16)), session_id BLOB NOT NULL CHECK(length(session_id)=16 AND session_id != zeroblob(16)), principal_kind INTEGER NOT NULL CHECK(principal_kind IN(0,1,2)), principal_id BLOB CHECK(principal_id IS NULL OR length(principal_id)=16), display_name TEXT NOT NULL CHECK(length(CAST(display_name AS BLOB)) BETWEEN 1 AND 128), declared_role TEXT NOT NULL CHECK(length(CAST(declared_role AS BLOB)) BETWEEN 1 AND 128), transport_kind INTEGER NOT NULL CHECK(transport_kind IN(0,1,2,3)), PRIMARY KEY(workspace_id,participant_id), UNIQUE(workspace_id,session_id), UNIQUE(workspace_id,participant_id,session_id), CHECK((principal_kind=0 AND principal_id IS NULL) OR (principal_kind IN(1,2) AND principal_id IS NOT NULL)))";
 const REGISTRATION_REQUESTS_SQL: &str = "CREATE TABLE ops_registration_requests (request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id)=16 AND request_id != zeroblob(16)), migration_id BLOB NOT NULL CHECK(length(migration_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), destination_id BLOB NOT NULL CHECK(length(destination_id)=16), activity_id BLOB NOT NULL CHECK(length(activity_id)=16), session_id BLOB NOT NULL CHECK(length(session_id)=16), participant_id BLOB NOT NULL CHECK(length(participant_id)=16), agent_id BLOB NOT NULL CHECK(length(agent_id)=16), request_wire BLOB NOT NULL CHECK(length(request_wire) BETWEEN 1 AND 4096), phase INTEGER NOT NULL CHECK(phase IN(0,1)), reserved_at_ms INTEGER CHECK(reserved_at_ms IS NULL OR reserved_at_ms>=0), UNIQUE(workspace_id,agent_id), UNIQUE(migration_id,activity_id,session_id), FOREIGN KEY(migration_id) REFERENCES ops_imports(migration_id), FOREIGN KEY(destination_id) REFERENCES ops_catalog_identity(destination_id), FOREIGN KEY(workspace_id,participant_id,session_id) REFERENCES ops_pending_participants(workspace_id,participant_id,session_id), CHECK((phase=0 AND reserved_at_ms IS NULL) OR (phase=1 AND reserved_at_ms IS NOT NULL)))";
@@ -117,6 +138,23 @@ impl RegistrationRequest {
 
     pub(crate) fn encode(&self) -> Result<Vec<u8>, OperationsError> {
         wire::encode(self)
+    }
+
+    /// Digest the exact immutable HREG v1 payload used for Source attestation.
+    ///
+    /// # Errors
+    /// Returns the same bounded encoding errors as the durable wire codec.
+    pub fn digest(&self) -> Result<[u8; 32], OperationsError> {
+        let encoded = self.encode()?;
+        let mut digest = Sha256::new();
+        digest.update(b"heterarchy.orchestration.registration.hreg.v1\0");
+        digest.update(
+            u64::try_from(encoded.len())
+                .map_err(|_| OperationsError::Bounds("registration request"))?
+                .to_le_bytes(),
+        );
+        digest.update(encoded);
+        Ok(digest.finalize().into())
     }
 
     pub(crate) fn decode(value: &[u8]) -> Result<Self, OperationsError> {

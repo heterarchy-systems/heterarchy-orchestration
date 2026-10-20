@@ -3,17 +3,18 @@
 //! effect capabilities.
 
 use forge_backend::ops::{CommandOp, ScopeDto};
+use forge_backend::{ForgeHttpClientError, ForgeHttpServiceCode};
 use forge_control::ResolvedWorkspaceScope;
 use forge_domain::{
-    ActivityId, AgentDeclaredRole, AgentDisplayName, AgentInstanceId, AgentSessionId,
-    AgentTransportKind, AuthenticatedPrincipal, DirectTokenId, OAuthGrantId, TimestampMillis,
-    WorkspaceId,
+    ActivityId, AgentBindingRejectionReason, AgentDeclaredRole, AgentDisplayName, AgentInstanceId,
+    AgentSessionId, AgentTransportKind, AuthenticatedPrincipal, DirectTokenId, OAuthGrantId,
+    TimestampMillis, WorkspaceId, WorkspaceRootFingerprint,
 };
 use heterarchy_orchestration_operations::{
     AgentBindingActivationRequest, AgentBindingReservationRequest, BindingActivationObservation,
-    BindingReservationObservation,
+    BindingRejectionObservation, BindingReservationObservation,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -335,6 +336,104 @@ impl ForgeMembershipHttpClient {
         validate_activation_query(&projection, request)?;
         activation_observation(projection, *reference, scope.workspace_id()).map(Some)
     }
+
+    /// Record one terminal rejection from the stable O-owned attestation.
+    ///
+    /// # Errors
+    /// Rejects invalid identities, unavailable authority or inconsistent source readback.
+    /// No command is retried automatically.
+    pub async fn reject(
+        &self,
+        scope: &ResolvedWorkspaceScope,
+        reference: &MembershipSourceReference,
+        binding: &AgentBindingReservationRequest,
+        activation: &AgentBindingActivationRequest,
+        observed_at: i64,
+    ) -> Result<BindingRejectionObservation, ForgeSourceError> {
+        let (wire_scope, _) = validated_request_scope(scope, *reference)?;
+        if activation.request_id() != binding.request_id() {
+            return Err(ForgeSourceError::InvalidScope);
+        }
+        let observed_at = timestamp(observed_at, ForgeSourceError::InvalidScope)?;
+        let payload = json!({
+            "scope": &wire_scope,
+            "issuer_id": reference.issuer_id,
+            "destination_id": reference.destination_id,
+            "reference": {
+                "migration_id": reference.migration_id,
+                "expected_freeze_revision": reference.freeze_revision_i64()?,
+                "manifest_digest": encode_digest(reference.manifest_digest),
+            },
+            "reservation": reservation_json(binding),
+            "activation": activation_json(activation),
+            "reason": "principal_transport_mismatch",
+            "observed_at_ms": observed_at.get(),
+        });
+        let result = self
+            .commands
+            .command_with_request_id(binding.request_id(), CommandOp::AgentBindingReject, payload)
+            .await
+            .map_err(map_rejection_command_error)?;
+        parse_rejection_mutation(
+            result,
+            &wire_scope,
+            *reference,
+            binding,
+            activation,
+            observed_at,
+        )
+    }
+
+    /// Read one historical terminal rejection by its canonical caller intent.
+    ///
+    /// # Errors
+    /// Rejects invalid identities, unavailable authority or inconsistent source readback.
+    /// Absence never grants mutation retry authority.
+    pub async fn rejection(
+        &self,
+        scope: &ResolvedWorkspaceScope,
+        reference: &MembershipSourceReference,
+        binding: &AgentBindingReservationRequest,
+        request_digest: [u8; 32],
+    ) -> Result<Option<BindingRejectionObservation>, ForgeSourceError> {
+        let (wire_scope, _) = validated_request_scope(scope, *reference)?;
+        if request_digest == [0; 32] {
+            return Err(ForgeSourceError::InvalidScope);
+        }
+        let payload = json!({
+            "scope": &wire_scope,
+            "issuer_id": reference.issuer_id,
+            "destination_id": reference.destination_id,
+            "request_id": binding.request_id(),
+            "request_digest": encode_digest(request_digest),
+            "session_id": binding.session_id().into_uuid(),
+            "principal": principal_json(binding.principal()),
+        });
+        let result = self
+            .commands
+            .command_with_request_id(
+                binding.request_id(),
+                CommandOp::AgentBindingRejectionGet,
+                payload,
+            )
+            .await
+            .map_err(map_rejection_command_error)?;
+        parse_rejection_readback(result, &wire_scope, *reference, binding, request_digest)
+    }
+}
+
+fn map_rejection_command_error(error: ForgeHttpClientError) -> ForgeSourceError {
+    match error {
+        ForgeHttpClientError::Service {
+            status: 409,
+            code: ForgeHttpServiceCode::ForgeUnavailable,
+        } => ForgeSourceError::Stale,
+        ForgeHttpClientError::Service {
+            status: 202,
+            code: ForgeHttpServiceCode::UnknownOutcome,
+        } => ForgeSourceError::Unavailable,
+        other => forge_source::map_command_error(other),
+    }
 }
 
 fn validated_request_scope(
@@ -547,6 +646,106 @@ struct ActivationReadback {
     activated_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectionMutationReadback {
+    scope: ScopeDto,
+    issuer_id: String,
+    destination_id: String,
+    status: RejectionMutationStatus,
+    replayed: bool,
+    receipt: RejectionReceiptReadback,
+    retry_authorized: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RejectionMutationStatus {
+    Recorded,
+    Replay,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectionGetReadback {
+    scope: ScopeDto,
+    issuer_id: String,
+    destination_id: String,
+    found: bool,
+    status: RejectionReadStatus,
+    receipt: Option<RejectionReceiptReadback>,
+    retry_authorized: bool,
+    request_equivalence_proven: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RejectionReadStatus {
+    HistoricalReceipt,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectionReceiptReadback {
+    request_id: String,
+    request_digest: String,
+    workspace_id: String,
+    activity_id: String,
+    agent_id: String,
+    session_id: String,
+    principal: RejectionPrincipalReadback,
+    migration_id: String,
+    destination_id: String,
+    expected_freeze_revision: u64,
+    manifest_digest: String,
+    issuer_id: String,
+    workspace_root_fingerprint: String,
+    binding_digest: String,
+    delegation_digest: String,
+    membership_digest: String,
+    display_name: String,
+    declared_role: String,
+    transport: TransportReadback,
+    reason: RejectionReasonReadback,
+    reserved_at_ms: i64,
+    requested_at_ms: i64,
+    observed_at_ms: i64,
+    rejected_at_ms: i64,
+    receipt_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RejectionPrincipalReadback {
+    kind: RejectionPrincipalKind,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    token_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    grant_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RejectionPrincipalKind {
+    TrustedStdio,
+    DirectToken,
+    OauthGrant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RejectionReasonReadback {
+    PrincipalTransportMismatch,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ReservationProjection {
     workspace_id: Uuid,
@@ -729,6 +928,203 @@ fn parse_activation_readback(
         activation: activation_request,
         activated_at,
     }))
+}
+
+fn parse_rejection_mutation(
+    value: Value,
+    expected_scope: &ScopeDto,
+    reference: MembershipSourceReference,
+    binding: &AgentBindingReservationRequest,
+    activation: &AgentBindingActivationRequest,
+    observed_at: TimestampMillis,
+) -> Result<BindingRejectionObservation, ForgeSourceError> {
+    let readback: RejectionMutationReadback = forge_source::decode_result(value)?;
+    validate_rejection_base(
+        &readback.scope,
+        &readback.issuer_id,
+        &readback.destination_id,
+        readback.retry_authorized,
+        expected_scope,
+        reference,
+    )?;
+    if (readback.status == RejectionMutationStatus::Replay) != readback.replayed {
+        return Err(ForgeSourceError::Protocol);
+    }
+    rejection_observation(
+        &readback.receipt,
+        expected_scope,
+        reference,
+        binding,
+        Some(activation),
+        None,
+        Some(observed_at),
+    )
+}
+
+fn parse_rejection_readback(
+    value: Value,
+    expected_scope: &ScopeDto,
+    reference: MembershipSourceReference,
+    binding: &AgentBindingReservationRequest,
+    request_digest: [u8; 32],
+) -> Result<Option<BindingRejectionObservation>, ForgeSourceError> {
+    if !value
+        .as_object()
+        .is_some_and(|object| object.contains_key("receipt"))
+    {
+        return Err(ForgeSourceError::Protocol);
+    }
+    let readback: RejectionGetReadback = forge_source::decode_result(value)?;
+    validate_rejection_base(
+        &readback.scope,
+        &readback.issuer_id,
+        &readback.destination_id,
+        readback.retry_authorized,
+        expected_scope,
+        reference,
+    )?;
+    if readback.status != RejectionReadStatus::HistoricalReceipt
+        || readback.request_equivalence_proven
+        || readback.found != readback.receipt.is_some()
+    {
+        return Err(ForgeSourceError::Protocol);
+    }
+    readback
+        .receipt
+        .as_ref()
+        .map(|receipt| {
+            rejection_observation(
+                receipt,
+                expected_scope,
+                reference,
+                binding,
+                None,
+                Some(request_digest),
+                None,
+            )
+        })
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rejection_observation(
+    receipt: &RejectionReceiptReadback,
+    expected_scope: &ScopeDto,
+    reference: MembershipSourceReference,
+    binding: &AgentBindingReservationRequest,
+    activation: Option<&AgentBindingActivationRequest>,
+    expected_request_digest: Option<[u8; 32]>,
+    expected_observed_at: Option<TimestampMillis>,
+) -> Result<BindingRejectionObservation, ForgeSourceError> {
+    let request_id = response_uuid(&receipt.request_id)?;
+    let request_digest = decode_digest(&receipt.request_digest)?;
+    let workspace_id = response_uuid(&receipt.workspace_id)?;
+    let activity_id = response_uuid(&receipt.activity_id)?;
+    let agent_id = response_uuid(&receipt.agent_id)?;
+    let session_id = response_uuid(&receipt.session_id)?;
+    let principal = rejection_principal(&receipt.principal)?;
+    let migration_id = response_uuid(&receipt.migration_id)?;
+    let destination_id = response_uuid(&receipt.destination_id)?;
+    let manifest_digest = decode_digest(&receipt.manifest_digest)?;
+    let issuer_id = response_uuid(&receipt.issuer_id)?;
+    let membership_digest = decode_digest(&receipt.membership_digest)?;
+    let observed_at = timestamp(receipt.observed_at_ms, ForgeSourceError::Protocol)?;
+    if request_id != binding.request_id()
+        || workspace_id != expected_scope.workspace_id
+        || activity_id != binding.activity_id().into_uuid()
+        || agent_id != binding.agent_id().into_uuid()
+        || session_id != binding.session_id().into_uuid()
+        || principal != binding.principal()
+        || migration_id != reference.migration_id
+        || destination_id != reference.destination_id
+        || receipt.expected_freeze_revision != reference.freeze_revision
+        || manifest_digest != reference.manifest_digest
+        || issuer_id != reference.issuer_id
+        || receipt.requested_at_ms != binding.requested_at().get()
+        || expected_request_digest.is_some_and(|expected| expected != request_digest)
+        || expected_observed_at.is_some_and(|expected| expected != observed_at)
+        || activation.is_some_and(|expected| {
+            expected.request_id() != request_id
+                || expected.membership_digest() != membership_digest
+                || expected.display_name().as_str() != receipt.display_name
+                || expected.declared_role().as_str() != receipt.declared_role
+                || expected.transport() != AgentTransportKind::from(receipt.transport)
+        })
+        || receipt.reason != RejectionReasonReadback::PrincipalTransportMismatch
+    {
+        return Err(ForgeSourceError::Protocol);
+    }
+    BindingRejectionObservation::new(
+        request_id,
+        WorkspaceId::from_uuid(workspace_id),
+        ActivityId::from_uuid(activity_id),
+        AgentInstanceId::from_uuid(agent_id),
+        AgentSessionId::from_uuid(session_id),
+        principal,
+        migration_id,
+        destination_id,
+        receipt.expected_freeze_revision,
+        manifest_digest,
+        issuer_id,
+        WorkspaceRootFingerprint::from_bytes(decode_digest16(&receipt.workspace_root_fingerprint)?),
+        decode_digest(&receipt.binding_digest)?,
+        decode_digest(&receipt.delegation_digest)?,
+        membership_digest,
+        AgentDisplayName::new(receipt.display_name.clone())
+            .map_err(|_| ForgeSourceError::Protocol)?,
+        AgentDeclaredRole::new(receipt.declared_role.clone())
+            .map_err(|_| ForgeSourceError::Protocol)?,
+        AgentTransportKind::from(receipt.transport),
+        AgentBindingRejectionReason::PrincipalTransportMismatch,
+        timestamp(receipt.reserved_at_ms, ForgeSourceError::Protocol)?,
+        timestamp(receipt.requested_at_ms, ForgeSourceError::Protocol)?,
+        observed_at,
+        timestamp(receipt.rejected_at_ms, ForgeSourceError::Protocol)?,
+        request_digest,
+        decode_digest(&receipt.receipt_digest)?,
+    )
+    .map_err(|_| ForgeSourceError::Protocol)
+}
+
+fn validate_rejection_base(
+    actual_scope: &ScopeDto,
+    issuer_id: &str,
+    destination_id: &str,
+    retry_authorized: bool,
+    expected_scope: &ScopeDto,
+    reference: MembershipSourceReference,
+) -> Result<(), ForgeSourceError> {
+    if actual_scope != expected_scope
+        || response_uuid(issuer_id)? != reference.issuer_id
+        || response_uuid(destination_id)? != reference.destination_id
+        || retry_authorized
+    {
+        return Err(ForgeSourceError::Protocol);
+    }
+    Ok(())
+}
+
+fn rejection_principal(
+    value: &RejectionPrincipalReadback,
+) -> Result<AuthenticatedPrincipal, ForgeSourceError> {
+    match value.kind {
+        RejectionPrincipalKind::TrustedStdio
+            if value.token_id.is_none() && value.grant_id.is_none() =>
+        {
+            Ok(AuthenticatedPrincipal::TrustedStdio)
+        }
+        RejectionPrincipalKind::DirectToken if value.grant_id.is_none() => {
+            Ok(AuthenticatedPrincipal::DirectToken(
+                DirectTokenId::from_uuid(response_uuid(required(value.token_id.as_deref())?)?),
+            ))
+        }
+        RejectionPrincipalKind::OauthGrant if value.token_id.is_none() => {
+            Ok(AuthenticatedPrincipal::OAuthGrant(OAuthGrantId::from_uuid(
+                response_uuid(required(value.grant_id.as_deref())?)?,
+            )))
+        }
+        _ => Err(ForgeSourceError::Protocol),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -966,6 +1362,27 @@ fn decode_digest(value: &str) -> Result<[u8; 32], ForgeSourceError> {
         let high = hex_nibble(pair[0]).ok_or(ForgeSourceError::Protocol)?;
         let low = hex_nibble(pair[1]).ok_or(ForgeSourceError::Protocol)?;
         digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
+fn decode_digest16(value: &str) -> Result<[u8; 16], ForgeSourceError> {
+    if value.len() != 32
+        || !value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(ForgeSourceError::Protocol);
+    }
+    let mut digest = [0_u8; 16];
+    for (index, slot) in digest.iter_mut().enumerate() {
+        let high = hex_nibble(value.as_bytes()[index * 2]).ok_or(ForgeSourceError::Protocol)?;
+        let low = hex_nibble(value.as_bytes()[index * 2 + 1]).ok_or(ForgeSourceError::Protocol)?;
+        *slot = (high << 4) | low;
+    }
+    if digest == [0; 16] {
+        return Err(ForgeSourceError::Protocol);
     }
     Ok(digest)
 }

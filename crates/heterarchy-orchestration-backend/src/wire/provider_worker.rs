@@ -8,7 +8,14 @@ use heterarchy_orchestration_sessions::AgentProfileProviderFamily;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
-use super::{node_chat::ChatProviderStateWire, provisioning_operations::ProvisionOperationWire};
+use super::{
+    deserialize_optional_non_null,
+    node_chat::ChatProviderStateWire,
+    provisioning_operations::{
+        ProvisionOperationUncertaintyRetirementWire, ProvisionOperationWire,
+    },
+    workspace_project::ProviderProjectReferenceWire,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -69,6 +76,12 @@ pub struct ProviderProvisionConfirmation {
     pub operation_id: Uuid,
     pub expected_revision: u64,
     pub provider_conversation_id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub provider_project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -86,6 +99,74 @@ pub struct ProviderMessageFence {
     pub expected_revision: u64,
 }
 
+/// Closed operator reason for preserving and isolating one uncertain provider message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMessageUnknownIsolationReasonWire {
+    OperatorAcknowledgedUnknown,
+}
+
+/// Exact operator acknowledgement for one immutable UNKNOWN outbox row.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderMessageUnknownIsolationRequest {
+    pub request_id: Uuid,
+    pub message_id: Uuid,
+    pub expected_revision: u64,
+    pub expected_target: ProviderMessageTargetWire,
+    pub reason: ProviderMessageUnknownIsolationReasonWire,
+}
+
+/// Exact receipt lookup; a null request ID discovers the immutable receipt by message.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderMessageUnknownIsolationQuery {
+    pub message_id: Uuid,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub request_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMessageIsolationPrincipalKindWire {
+    TrustedStdio,
+    DirectToken,
+    OAuthGrant,
+}
+
+/// Durable authenticated identity only; no bearer credential is represented.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderMessageIsolationPrincipalWire {
+    pub kind: ProviderMessageIsolationPrincipalKindWire,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub id: Option<Uuid>,
+}
+
+/// Immutable acknowledgement and original compare-and-set request evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderMessageUnknownIsolationReceiptWire {
+    pub request_id: Uuid,
+    pub message_id: Uuid,
+    pub expected_revision: u64,
+    pub expected_target: ProviderMessageTargetWire,
+    pub reason: ProviderMessageUnknownIsolationReasonWire,
+    pub principal: ProviderMessageIsolationPrincipalWire,
+    pub acknowledged_at_ms: i64,
+}
+
+/// Exact durable receipt readback; isolation never grants retry authority.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderMessageUnknownIsolationResponse {
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub receipt: Option<ProviderMessageUnknownIsolationReceiptWire>,
+    pub retry_authorized: bool,
+}
+
+pub type ProviderMessageCancelRequest = ProviderMessageFence;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProviderMessageInspection {
@@ -100,6 +181,12 @@ pub struct ProviderDeliveryConfirmation {
     pub provider_conversation_id: String,
     pub provider_turn_id: String,
     pub body: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub provider_project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -137,6 +224,12 @@ pub struct ProviderProvisionTargetWire {
     pub provider_family: String,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub provider_conversation_id: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub project: Option<ProviderProjectReferenceWire>,
 }
 
 /// One durable provision operation and its exact one-shot worker fence.
@@ -194,6 +287,12 @@ pub struct ProviderMessageTargetWire {
     pub provider_family: ProviderWorkerFamilyWire,
     pub runtime_session_id: Uuid,
     pub provider_conversation_id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub project: Option<ProviderProjectReferenceWire>,
 }
 
 /// Exact provider delivery receipt recorded by the durable outbox.
@@ -202,6 +301,12 @@ pub struct ProviderMessageTargetWire {
 pub struct ProviderDeliveryReceiptWire {
     pub provider_turn_id: String,
     pub body: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_non_null"
+    )]
+    pub provider_project_id: Option<String>,
 }
 
 /// Durable message outbox state with exact target and revision.
@@ -322,6 +427,10 @@ impl From<&AgentProvisionOperation> for ProvisionOperationWire {
             prepared_at_ms: operation.prepared_at().get(),
             updated_at_ms: operation.updated_at().get(),
             revision: operation.revision(),
+            uncertainty_retirement: operation
+                .uncertainty_retirement()
+                .map(ProvisionOperationUncertaintyRetirementWire::from),
+            project: operation.project().map(ProviderProjectReferenceWire::from),
         }
     }
 }
@@ -337,6 +446,7 @@ impl From<&ProviderMessageTarget> for ProviderMessageTargetWire {
             },
             runtime_session_id: target.runtime_session_id().into_uuid(),
             provider_conversation_id: target.provider_conversation_id().to_owned(),
+            project: target.project().map(ProviderProjectReferenceWire::from),
         }
     }
 }
@@ -360,6 +470,7 @@ impl From<&ProviderMessageOutbox> for ProviderMessageOutboxWire {
             receipt: outbox.receipt().map(|receipt| ProviderDeliveryReceiptWire {
                 provider_turn_id: receipt.provider_turn_id().to_owned(),
                 body: receipt.body().to_owned(),
+                provider_project_id: receipt.provider_project_id().map(|value| value.to_string()),
             }),
         }
     }

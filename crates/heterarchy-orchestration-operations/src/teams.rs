@@ -644,7 +644,7 @@ fn authorize_team_creator(
             .ok_or(OperationsError::Conflict(
                 "team create requires current Workspace leader",
             ))?;
-            if actor.participant_id != Some(authority.participant_id())
+            if actor.participant_id() != Some(authority.participant_id())
                 || expected_revision != authority.leadership_revision()
             {
                 return Err(OperationsError::Conflict(
@@ -677,12 +677,20 @@ fn resolve_initial_roster(
                 session_id: input.session_id,
             },
         )?;
-        let participant_id = actor.participant_id.ok_or(OperationsError::Conflict(
-            "team roster member is not a participant",
-        ))?;
-        let participation_id = actor.participation_id.ok_or(OperationsError::Conflict(
-            "team roster member has no participation",
-        ))?;
+        if !actor.is_profile_participant() {
+            return Err(OperationsError::Conflict(
+                "Team roster requires participant",
+            ));
+        }
+        let participant_id = actor
+            .participant_id()
+            .ok_or(OperationsError::Corrupt("Team roster participant"))?;
+        let participation_id = actor
+            .participation_id()
+            .ok_or(OperationsError::Corrupt("Team roster participation"))?;
+        let profile_id = actor
+            .profile_id()
+            .ok_or(OperationsError::Corrupt("Team roster Profile"))?;
         if participants.contains(&participant_id) || participations.contains(&participation_id) {
             return Err(OperationsError::Conflict(
                 "duplicate team roster participant",
@@ -695,7 +703,7 @@ fn resolve_initial_roster(
                 workspace_id,
                 team_id,
                 participation_id,
-                profile_id: actor.profile_id,
+                profile_id: Some(profile_id),
                 role: Some(input.role.clone()),
                 state: TeamMembershipState::Joined,
                 revision: 1,
@@ -723,11 +731,11 @@ fn insert_team_create_roster_member(
     let participation_id = member.member.participation_id;
     let participant_id = member
         .actor
-        .participant_id
+        .participant_id()
         .ok_or(OperationsError::Corrupt("team roster participant readback"))?;
     let profile_id = member
         .actor
-        .profile_id
+        .profile_id()
         .ok_or(OperationsError::Corrupt("team roster profile readback"))?;
     transaction.execute(
         "INSERT INTO ops_team_create_roster(request_id,ordinal,workspace_id,team_id,participation_id,activity_id,agent_id,session_id,participant_id,profile_id,role,membership_revision,joined_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
@@ -1089,7 +1097,7 @@ fn mutate_membership(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     ensure_verified_workspace(&transaction, command.workspace_id())?;
     let actor = resolve_actor(&transaction, command.workspace_id(), command.actor())?;
-    let participation_id = actor.participation_id.ok_or(OperationsError::Conflict(
+    let participation_id = actor.participation_id().ok_or(OperationsError::Conflict(
         "team membership requires participant",
     ))?;
     let fingerprint = RequestFingerprint::simple(
@@ -1363,11 +1371,11 @@ impl TeamCreator {
     fn from_actor(actor: &ResolvedOperationalActor) -> Self {
         Self {
             key: actor.key(),
-            display_name: actor.display_name.clone(),
-            participation_id: actor.participation_id,
-            profile_id: actor.profile_id,
-            participant_id: actor.participant_id,
-            session_id: actor.session_id,
+            display_name: actor.display_name().to_owned(),
+            participation_id: actor.participation_id(),
+            profile_id: actor.profile_id(),
+            participant_id: actor.participant_id(),
+            session_id: actor.session_id(),
         }
     }
 }
@@ -1972,11 +1980,11 @@ fn insert_membership_event(
 			membership.state.encode(),
 			i64::try_from(membership.revision).map_err(|_| OperationsError::Bounds("team membership revision"))?,
 			actor.key(),
-			actor.display_name.as_str(),
-			actor.participation_id.map(|id| id.into_uuid().into_bytes().to_vec()),
-			actor.profile_id.map(|id| id.into_bytes().to_vec()),
-			actor.participant_id.map(|id| id.into_bytes().to_vec()),
-            actor.session_id.map(|id| id.into_uuid().into_bytes().to_vec()),
+            actor.display_name(),
+            actor.participation_id().map(|id| id.into_uuid().into_bytes().to_vec()),
+            actor.profile_id().map(|id| id.into_bytes().to_vec()),
+            actor.participant_id().map(|id| id.into_bytes().to_vec()),
+            actor.session_id().map(|id| id.into_uuid().into_bytes().to_vec()),
             observed_at_ms,
             membership.role.as_deref(),
 		],
@@ -2320,7 +2328,7 @@ mod tests {
 			?;
         connection
 			.execute(
-				"INSERT INTO ops_current_effect_bindings(workspace_id,participant_id,activity_id,session_id,agent_id,source_kind,source_request_id) VALUES(?1,?2,?3,?4,?5,0,?6)",
+				"INSERT INTO ops_current_effect_bindings(workspace_id,participant_id,activity_id,session_id,agent_id,source_kind,source_request_id) VALUES(?1,?2,?3,?4,?5,1,?6)",
 				params![workspace.into_uuid().as_bytes(), participant.as_bytes(), activity.as_bytes(), session.as_bytes(), agent.as_bytes(), Uuid::from_u128(request_seed.as_u128() + 2).as_bytes()],
 			)
 			?;
@@ -2493,6 +2501,29 @@ mod tests {
         }
         std::fs::remove_file(path)?;
         Ok(())
+    }
+
+    #[test]
+    fn native_team_creator_keeps_native_identity_without_profile_anchor() {
+        let participant_id = Uuid::from_u128(0xA120);
+        let session_id = AgentSessionId::from_uuid(Uuid::from_u128(0xA121));
+        let actor = ResolvedOperationalActor::NativeParticipant {
+            participant_id,
+            session_id,
+            display_name: "Codex Main".to_owned(),
+        };
+
+        let creator = TeamCreator::from_actor(&actor);
+
+        assert_eq!(
+            creator.key(),
+            format!("native-participant:{participant_id}")
+        );
+        assert_eq!(creator.display_name(), "Codex Main");
+        assert_eq!(creator.participant_id(), Some(participant_id));
+        assert_eq!(creator.session_id(), Some(session_id));
+        assert_eq!(creator.profile_id(), None);
+        assert_eq!(creator.participation_id(), None);
     }
 
     #[test]

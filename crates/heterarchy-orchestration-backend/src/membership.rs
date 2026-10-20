@@ -5,10 +5,15 @@ use crate::{
     app_support::{LaneError, validate_workspace_reference},
     forge_membership::MembershipSourceReference,
     wire::membership::{
-        MemberActivateRequest, MemberActivateResponse, MemberActivationWire, MemberCommitWire,
-        MemberConfirmRequest, MemberConfirmResponse, MemberPhaseWire, MemberProgressWire,
-        MemberRegisterRequest, MemberRegisterResponse, MemberRegistrationQueryRequest,
-        MemberRegistrationQueryResponse, MemberTarget, MemberTransportWire,
+        DurableRequestIdPolicyWire, LegacyEnvelopeRequestIdPolicyWire, MemberActivateRequest,
+        MemberActivateResponse, MemberActivationWire, MemberBindingRejectRequest,
+        MemberBindingRejectResponse, MemberBindingRejectionQueryRequest,
+        MemberBindingRejectionQueryResponse, MemberBindingRejectionReasonWire,
+        MemberBindingRejectionReconcileRequest, MemberBindingRejectionReconcileResponse,
+        MemberBindingRejectionWire, MemberCommitWire, MemberConfirmRequest, MemberConfirmResponse,
+        MemberPhaseWire, MemberPrincipalWire, MemberProgressWire, MemberRegisterRequest,
+        MemberRegisterResponse, MemberRegistrationQueryRequest, MemberRegistrationQueryResponse,
+        MemberTarget, MemberTransportWire, SourceRequestIdPolicyWire,
     },
 };
 use axum::{
@@ -17,12 +22,17 @@ use axum::{
     routing::post,
 };
 use forge_domain::{AgentTransportKind, AuthenticatedPrincipal, TimestampMillis};
-use heterarchy_orchestration_operations::{AgentBindingActivationRequest, RegistrationPhase};
+use heterarchy_orchestration_operations::{
+    AgentBindingActivationRequest, AgentBindingRejectionReason, BindingRejectionAttemptDisposition,
+    BindingRejectionAttemptRequest, BindingRejectionSourceRequestPolicy,
+    LegacyBindingRejectionEnvelopePolicy, RegistrationBindingRejectionReceipt, RegistrationPhase,
+    RegistrationRequest, ResolveBindingRejectionAttempt,
+};
 use heterarchy_orchestration_runtime::{
     RuntimeError,
     membership::{
-        MemberActivation, MemberCommit, MemberProgress, MemberRegisterCommand, MembershipTarget,
-        member_registration_request_id,
+        MemberActivation, MemberBindingRejectionPlan, MemberCommit, MemberProgress,
+        MemberRegisterCommand, MembershipTarget, member_registration_request_id,
     },
 };
 use tokio::sync::OwnedSemaphorePermit;
@@ -45,6 +55,18 @@ pub(crate) fn routes() -> Router<BackendState> {
         .route(
             "/internal/v1/workspaces/{workspace_id}/members/query",
             post(query),
+        )
+        .route(
+            "/internal/v1/workspaces/{workspace_id}/members/binding-rejection/query",
+            post(binding_rejection_query),
+        )
+        .route(
+            "/internal/v1/workspaces/{workspace_id}/members/binding-rejection/settle",
+            post(binding_rejection_settle),
+        )
+        .route(
+            "/internal/v1/workspaces/{workspace_id}/members/binding-rejection/reconcile-pre-admission-no-effect",
+            post(binding_rejection_reconcile),
         )
 }
 
@@ -174,6 +196,73 @@ impl BackendState {
             .map_err(source_error)?;
         Ok((authority, reference))
     }
+
+    async fn prepare_binding_rejection_source_attempt(
+        &self,
+        selected: &MemberTarget,
+        target: MembershipTarget,
+        principal: AuthenticatedPrincipal,
+        plan: &MemberBindingRejectionPlan,
+        registration: &RegistrationRequest,
+    ) -> Result<
+        (
+            CoordinatorAuthority,
+            MembershipSourceReference,
+            BindingRejectionAttemptRequest,
+            BindingRejectionAttemptDisposition,
+        ),
+        ApiError,
+    > {
+        if let Some(attempt) = plan.attempt().cloned() {
+            self.workspace_scope_proof(selected.scope.clone()).await?;
+            let authority = self
+                .coordinator_authority
+                .clone()
+                .ok_or(ApiError::WorkspaceScopeUnavailable)?;
+            let reference = MembershipSourceReference::new(
+                attempt.issuer_id(),
+                attempt.destination_id(),
+                attempt.migration_id(),
+                attempt.freeze_revision(),
+                attempt.manifest_digest(),
+            )
+            .map_err(|_| ApiError::WorkspaceScopeUnavailable)?;
+            let consume_attempt = attempt.clone();
+            let disposition = self
+                .catalog_job(move |runtime| {
+                    runtime.consume_member_binding_rejection_resolution(
+                        target,
+                        principal,
+                        consume_attempt.request_id(),
+                        now().map_err(|_| RuntimeError::InvalidInput)?,
+                    )
+                })
+                .await?;
+            return Ok((authority, reference, attempt, disposition));
+        }
+
+        let (authority, reference) = self.member_admit(selected, principal).await?;
+        let attempt = BindingRejectionAttemptRequest::for_registration(
+            plan.progress().workspace_id(),
+            reference.issuer_id(),
+            reference.destination_id(),
+            reference.migration_id(),
+            reference.freeze_revision(),
+            reference.manifest_digest(),
+            registration,
+            plan.commit().commit_digest(),
+            now()?,
+        )
+        .map_err(RuntimeError::from)
+        .map_err(ApiError::Runtime)?;
+        let stored_attempt = attempt.clone();
+        let disposition = self
+            .catalog_job(move |runtime| {
+                runtime.prepare_member_binding_rejection_attempt(target, principal, &stored_attempt)
+            })
+            .await?;
+        Ok((authority, reference, attempt, disposition))
+    }
 }
 
 async fn register(
@@ -214,6 +303,42 @@ async fn query(
 ) -> Result<Json<MemberRegistrationQueryResponse>, LaneError> {
     let _target = validate(&path, &body.target, Some(body.request_id))?;
     state.query_member(principal, body).await.map(Json)
+}
+
+async fn binding_rejection_query(
+    State(state): State<BackendState>,
+    Path(path): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<MemberBindingRejectionQueryRequest>,
+) -> Result<Json<MemberBindingRejectionQueryResponse>, LaneError> {
+    let _target = validate(&path, &body.target, Some(body.request_id))?;
+    state
+        .query_member_binding_rejection(principal, body)
+        .await
+        .map(Json)
+}
+
+async fn binding_rejection_settle(
+    State(state): State<BackendState>,
+    Path(path): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<MemberBindingRejectRequest>,
+) -> Result<Json<MemberBindingRejectResponse>, LaneError> {
+    let _target = validate(&path, &body.target, Some(body.request_id))?;
+    state.reject_member_binding(principal, body).await.map(Json)
+}
+
+async fn binding_rejection_reconcile(
+    State(state): State<BackendState>,
+    Path(path): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<MemberBindingRejectionReconcileRequest>,
+) -> Result<Json<MemberBindingRejectionReconcileResponse>, LaneError> {
+    let _target = validate(&path, &body.target, Some(body.request_id))?;
+    state
+        .reconcile_member_binding_rejection_attempt(principal, body)
+        .await
+        .map(Json)
 }
 
 impl BackendState {
@@ -430,6 +555,207 @@ impl BackendState {
         })
     }
 
+    pub(crate) async fn reject_member_binding(
+        &self,
+        principal: AuthenticatedPrincipal,
+        body: MemberBindingRejectRequest,
+    ) -> Result<MemberBindingRejectResponse, LaneError> {
+        let target = validate(
+            &body.target.scope.workspace_id.to_string(),
+            &body.target,
+            Some(body.request_id),
+        )?;
+        let selected = body.target.clone();
+        let request_id = body.request_id;
+        let owner = self.clone();
+        let rejection = self
+            .run_owned(async move {
+                owner
+                    .catalog_job(move |runtime| runtime.require_operator(principal))
+                    .await?;
+                let plan = owner
+                    .catalog_job(move |runtime| {
+                        runtime.member_binding_rejection_plan(target, principal, request_id)
+                    })
+                    .await?;
+                if let Some(rejection) = plan.rejection() {
+                    return Ok(rejection.clone());
+                }
+                let registration = plan.progress().request().clone();
+                let binding = registration.binding().clone();
+                let activation = AgentBindingActivationRequest::new(
+                    request_id,
+                    plan.commit().commit_digest(),
+                    registration.display_name().clone(),
+                    registration.declared_role().clone(),
+                    registration.transport(),
+                )
+                .map_err(|_| ApiError::InvalidIdentity)?;
+
+                let (authority, reference, attempt, disposition) = owner
+                    .prepare_binding_rejection_source_attempt(
+                        &selected,
+                        target,
+                        principal,
+                        &plan,
+                        &registration,
+                    )
+                    .await?;
+
+                let readback_only = matches!(
+                    &disposition,
+                    BindingRejectionAttemptDisposition::ReadbackRequired
+                );
+                if let BindingRejectionAttemptDisposition::Recorded(receipt) = disposition {
+                    return Ok(*receipt);
+                }
+                let existing = authority
+                    .membership_rejection(
+                        selected.scope.clone(),
+                        reference,
+                        binding.clone(),
+                        attempt.request_digest(),
+                        owner.member_source_slot().await?,
+                    )
+                    .await
+                    .map_err(source_effect_error)?;
+                let observed = if let Some(receipt) = existing {
+                    receipt
+                } else {
+                    if readback_only {
+                        return Err(ApiError::SourceBindingUnconfirmed);
+                    }
+                    owner
+                        .member_refresh(&selected, principal, reference)
+                        .await?;
+                    authority
+                        .membership_reject(
+                            selected.scope.clone(),
+                            reference,
+                            binding,
+                            activation,
+                            attempt.attempted_at(),
+                            owner.member_source_slot().await?,
+                        )
+                        .await
+                        .map_err(source_effect_error)?
+                };
+                let receipt = owner
+                    .catalog_job(move |runtime| {
+                        runtime.record_member_binding_rejection_observation(
+                            target, principal, &observed,
+                        )
+                    })
+                    .await?;
+                Ok(receipt)
+            })
+            .await?;
+        Ok(MemberBindingRejectResponse {
+            target: body.target,
+            rejection: binding_rejection_wire(&rejection),
+        })
+    }
+
+    pub(crate) async fn reconcile_member_binding_rejection_attempt(
+        &self,
+        principal: AuthenticatedPrincipal,
+        body: MemberBindingRejectionReconcileRequest,
+    ) -> Result<MemberBindingRejectionReconcileResponse, LaneError> {
+        let target = validate(
+            &body.target.scope.workspace_id.to_string(),
+            &body.target,
+            Some(body.request_id),
+        )?;
+        let expected_attempt = digest32(&body.expected_attempt_request_digest)?;
+        let expected_artifact = digest32(&body.expected_legacy_artifact_digest)?;
+        let selected = body.target.clone();
+        let request_id = body.request_id;
+        let resolution_request_id = body.resolution_request_id;
+        let owner = self.clone();
+        let resolution = self
+            .run_owned(async move {
+                owner
+                    .catalog_job(move |runtime| runtime.require_operator(principal))
+                    .await?;
+                let plan = owner
+                    .catalog_job(move |runtime| {
+                        runtime.member_binding_rejection_plan(target, principal, request_id)
+                    })
+                    .await?;
+                let attempt = plan.attempt().cloned().ok_or(ApiError::NotFound)?;
+                if plan.rejection().is_some() || attempt.request_digest() != expected_attempt {
+                    return Err(ApiError::Runtime(RuntimeError::Conflict));
+                }
+                owner.workspace_scope_proof(selected.scope.clone()).await?;
+                let authority = owner
+                    .coordinator_authority
+                    .clone()
+                    .ok_or(ApiError::WorkspaceScopeUnavailable)?;
+                let reference = MembershipSourceReference::new(
+                    attempt.issuer_id(),
+                    attempt.destination_id(),
+                    attempt.migration_id(),
+                    attempt.freeze_revision(),
+                    attempt.manifest_digest(),
+                )
+                .map_err(|_| ApiError::WorkspaceScopeUnavailable)?;
+                let binding = plan.progress().request().binding().clone();
+                let found = authority
+                    .membership_rejection(
+                        selected.scope.clone(),
+                        reference,
+                        binding,
+                        attempt.request_digest(),
+                        owner.member_source_slot().await?,
+                    )
+                    .await
+                    .map_err(source_effect_error)?;
+                if found.is_some() {
+                    return Err(ApiError::Runtime(RuntimeError::Conflict));
+                }
+                let observed_at = now()?;
+                let proof = ResolveBindingRejectionAttempt {
+                    request_id,
+                    resolution_request_id,
+                    expected_attempt_request_digest: expected_attempt,
+                    expected_legacy_client_artifact_digest: expected_artifact,
+                    source_get_observed_at: observed_at,
+                    operator_principal: principal,
+                    resolved_at: observed_at,
+                };
+                owner
+                    .catalog_job(move |runtime| {
+                        runtime.resolve_member_binding_rejection_attempt(target, principal, &proof)
+                    })
+                    .await
+            })
+            .await?;
+        if resolution.durable_uuid_version() != 8 {
+            return Err(ApiError::Runtime(RuntimeError::Conflict).into());
+        }
+        Ok(MemberBindingRejectionReconcileResponse {
+            target: body.target,
+            request_id,
+            resolution_request_id: resolution.resolution_request_id(),
+            attempt_request_digest: hex(&resolution.attempt_request_digest()),
+            legacy_artifact_digest: hex(&resolution.legacy_client_artifact_digest()),
+            legacy_envelope_request_id_policy: match resolution.envelope_policy() {
+                LegacyBindingRejectionEnvelopePolicy::GeneratedUuidV7 => {
+                    LegacyEnvelopeRequestIdPolicyWire::GeneratedUuidV7
+                }
+            },
+            durable_request_id_policy: DurableRequestIdPolicyWire::PersistedUuidV8,
+            source_request_id_policy: match resolution.source_request_policy() {
+                BindingRejectionSourceRequestPolicy::BodyEqualsEnvelope => {
+                    SourceRequestIdPolicyWire::BodyEqualsEnvelope
+                }
+            },
+            source_get_observed_at_ms: resolution.source_get_observed_at().get(),
+            resolved_at_ms: resolution.resolved_at().get(),
+            consumed: resolution.consumed_at().is_some(),
+        })
+    }
+
     pub(crate) async fn query_member(
         &self,
         principal: AuthenticatedPrincipal,
@@ -455,6 +781,29 @@ impl BackendState {
             progress: readback.progress.as_ref().map(progress_wire),
             commit: readback.commit.as_ref().map(commit_wire),
             activation: readback.activation.as_ref().map(activation_wire),
+        })
+    }
+
+    pub(crate) async fn query_member_binding_rejection(
+        &self,
+        principal: AuthenticatedPrincipal,
+        body: MemberBindingRejectionQueryRequest,
+    ) -> Result<MemberBindingRejectionQueryResponse, LaneError> {
+        let target = validate(
+            &body.target.scope.workspace_id.to_string(),
+            &body.target,
+            Some(body.request_id),
+        )?;
+        let request_id = body.request_id;
+        let rejection = self
+            .catalog_job(move |runtime| {
+                runtime.member_binding_rejection_readback(target, principal, request_id)
+            })
+            .await?;
+        Ok(MemberBindingRejectionQueryResponse {
+            target: body.target,
+            request_id,
+            rejection: rejection.as_ref().map(binding_rejection_wire),
         })
     }
 }
@@ -512,6 +861,92 @@ pub(crate) fn activation_wire(value: &MemberActivation) -> MemberActivationWire 
         activated_at_ms: value.activated_at().get(),
         phase: MemberPhaseWire::Ready,
     }
+}
+
+fn binding_rejection_wire(
+    value: &RegistrationBindingRejectionReceipt,
+) -> MemberBindingRejectionWire {
+    MemberBindingRejectionWire {
+        request_id: value.request_id(),
+        workspace_id: value.workspace_id().into_uuid(),
+        participant_id: value.participant_id(),
+        activity_id: value.binding().activity_id().into_uuid(),
+        agent_id: value.binding().agent_id().into_uuid(),
+        session_id: value.binding().session_id().into_uuid(),
+        principal: principal_wire(value.binding().principal()),
+        migration_id: value.migration_id(),
+        destination_id: value.destination_id(),
+        expected_freeze_revision: value.expected_freeze_revision(),
+        manifest_digest: hex(&value.manifest_digest()),
+        issuer_id: value.issuer_id(),
+        workspace_root_fingerprint: hex16(value.workspace_root_fingerprint().as_bytes()),
+        binding_digest: hex(&value.binding_digest()),
+        delegation_digest: hex(&value.delegation_digest()),
+        membership_digest: hex(&value.membership_digest()),
+        display_name: value.display_name().as_str().to_owned(),
+        declared_role: value.declared_role().as_str().to_owned(),
+        transport: transport_wire(value.transport()),
+        reason: match value.reason() {
+            AgentBindingRejectionReason::PrincipalTransportMismatch => {
+                MemberBindingRejectionReasonWire::PrincipalTransportMismatch
+            }
+        },
+        reserved_at_ms: value.reserved_at().get(),
+        requested_at_ms: value.binding().requested_at().get(),
+        observed_at_ms: value.observed_at().get(),
+        rejected_at_ms: value.rejected_at().get(),
+        request_digest: hex(&value.request_digest()),
+        receipt_digest: hex(&value.receipt_digest()),
+    }
+}
+
+fn principal_wire(value: AuthenticatedPrincipal) -> MemberPrincipalWire {
+    match value {
+        AuthenticatedPrincipal::TrustedStdio => MemberPrincipalWire::TrustedStdio,
+        AuthenticatedPrincipal::DirectToken(value) => MemberPrincipalWire::DirectToken {
+            token_id: value.into_uuid(),
+        },
+        AuthenticatedPrincipal::OAuthGrant(value) => MemberPrincipalWire::OAuthGrant {
+            grant_id: value.into_uuid(),
+        },
+    }
+}
+
+fn transport_wire(value: AgentTransportKind) -> MemberTransportWire {
+    match value {
+        AgentTransportKind::Retired => MemberTransportWire::Mcp,
+        AgentTransportKind::Stdio => MemberTransportWire::Stdio,
+        AgentTransportKind::StreamableHttp => MemberTransportWire::StreamableHttp,
+        AgentTransportKind::Other => MemberTransportWire::Other,
+    }
+}
+
+fn hex16(bytes: &[u8; 16]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(32);
+    for byte in bytes {
+        output.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        output.push(char::from(DIGITS[usize::from(byte & 15)]));
+    }
+    output
+}
+fn digest32(value: &str) -> Result<[u8; 32], LaneError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(LaneError::InvalidIdentity);
+    }
+    let mut digest = [0_u8; 32];
+    for (index, slot) in digest.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| LaneError::InvalidIdentity)?;
+    }
+    if digest == [0; 32] {
+        return Err(LaneError::InvalidIdentity);
+    }
+    Ok(digest)
 }
 fn hex(bytes: &[u8; 32]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";

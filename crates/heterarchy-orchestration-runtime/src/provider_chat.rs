@@ -2,9 +2,10 @@
 
 use forge_domain::{AuthenticatedPrincipal, TimestampMillis};
 use heterarchy_orchestration_operations::{
-    IncomingProviderMessageOutcome, MessageOrigin, ProviderMessageDeliveryReceipt,
-    ProviderMessageDispatchAction, ProviderMessageInFlightPage, ProviderMessageOutbox,
-    ProviderMessageSource, ProviderMessageState, ProviderMessageTarget,
+    ChatGptProjectId, IncomingProviderMessageOutcome, MessageOrigin,
+    ProviderMessageDeliveryReceipt, ProviderMessageDispatchAction, ProviderMessageInFlightPage,
+    ProviderMessageOutbox, ProviderMessageSource, ProviderMessageState, ProviderMessageTarget,
+    ProviderMessageUnknownIsolationCommand, ProviderMessageUnknownIsolationReceipt,
     RecordIncomingProviderMessageCommand, WorkspaceMessage, provider_message_text,
 };
 use heterarchy_orchestration_sessions::AgentProfileProviderFamily;
@@ -210,6 +211,39 @@ impl OrchestrationRuntime {
         )?)
     }
 
+    /// Preserve an exact UNKNOWN provider row and release unrelated runtimes.
+    ///
+    /// # Errors
+    /// Rejects nonoperators, changed targets, stale revisions and owner failures.
+    pub fn provider_worker_isolate_unknown_message(
+        &self,
+        principal: AuthenticatedPrincipal,
+        command: &ProviderMessageUnknownIsolationCommand,
+    ) -> Result<ProviderMessageUnknownIsolationReceipt, RuntimeError> {
+        self.require_operator(principal)?;
+        if command.principal() != principal {
+            return Err(RuntimeError::Forbidden);
+        }
+        self.provider_chat_historical_target(command.expected_target())?;
+        Ok(self.catalog()?.isolate_unknown_provider_message(command)?)
+    }
+
+    /// Read the exact immutable isolation receipt without changing provider state.
+    ///
+    /// # Errors
+    /// Rejects nonoperators, nil identities and corrupt catalog data.
+    pub fn provider_worker_unknown_message_isolation(
+        &self,
+        principal: AuthenticatedPrincipal,
+        message_id: Uuid,
+        request_id: Option<Uuid>,
+    ) -> Result<Option<ProviderMessageUnknownIsolationReceipt>, RuntimeError> {
+        self.require_operator(principal)?;
+        Ok(self
+            .catalog()?
+            .provider_message_unknown_isolation(message_id, request_id)?)
+    }
+
     /// Record a definite provider failure. Uncertainty must use the unknown path.
     ///
     /// # Errors
@@ -232,6 +266,28 @@ impl OrchestrationRuntime {
         )?)
     }
 
+    /// Cancel an undispatched Queued provider message.
+    ///
+    /// # Errors
+    /// Rejects nonoperators, changed targets and stale fences.
+    pub fn provider_worker_cancel_queued_message(
+        &self,
+        principal: AuthenticatedPrincipal,
+        message_id: Uuid,
+        expected_revision: u64,
+        now_ms: i64,
+    ) -> Result<ProviderMessageOutbox, RuntimeError> {
+        self.require_operator(principal)?;
+        let outbox = self.provider_chat_outbox(message_id)?;
+        self.provider_chat_historical_target(outbox.target())?;
+        Ok(self.catalog()?.cancel_queued_provider_message(
+            message_id,
+            expected_revision,
+            outbox.target(),
+            timestamp(now_ms)?,
+        )?)
+    }
+
     /// Confirm the exact observed provider conversation, public turn and body.
     ///
     /// # Errors
@@ -247,14 +303,58 @@ impl OrchestrationRuntime {
         body: String,
         now_ms: i64,
     ) -> Result<ProviderMessageOutbox, RuntimeError> {
+        self.provider_worker_confirm_message_delivery_with_project(
+            principal,
+            message_id,
+            expected_revision,
+            provider_conversation_id,
+            None,
+            provider_turn_id,
+            body,
+            now_ms,
+        )
+    }
+
+    /// Confirm a delivered turn with the actual visible provider Project.
+    /// Bound message routes require exact membership evidence; legacy messages
+    /// preserve the old absent-field contract.
+    ///
+    /// # Errors
+    /// Rejects nonoperators, changed target/body/turn, missing/mismatched Project
+    /// evidence, stale fences and owner failures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn provider_worker_confirm_message_delivery_with_project(
+        &self,
+        principal: AuthenticatedPrincipal,
+        message_id: Uuid,
+        expected_revision: u64,
+        provider_conversation_id: &str,
+        provider_project_id: Option<&str>,
+        provider_turn_id: String,
+        body: String,
+        now_ms: i64,
+    ) -> Result<ProviderMessageOutbox, RuntimeError> {
         self.require_operator(principal)?;
         let outbox = self.provider_chat_outbox(message_id)?;
         self.provider_chat_historical_target(outbox.target())?;
         if outbox.target().provider_conversation_id() != provider_conversation_id {
             return Err(RuntimeError::Conflict);
         }
-        let receipt =
-            ProviderMessageDeliveryReceipt::new(outbox.target().clone(), provider_turn_id, body)?;
+        let provider_project_id = provider_project_id
+            .map(ChatGptProjectId::try_from)
+            .transpose()
+            .map_err(|_| RuntimeError::InvalidInput)?;
+        match (outbox.target().project(), provider_project_id) {
+            (None, None) => {}
+            (Some(expected), Some(actual)) if expected.project_id() == actual => {}
+            _ => return Err(RuntimeError::Conflict),
+        }
+        let receipt = ProviderMessageDeliveryReceipt::new_with_project(
+            outbox.target().clone(),
+            provider_project_id,
+            provider_turn_id,
+            body,
+        )?;
         Ok(self.catalog()?.confirm_provider_message_delivery(
             message_id,
             expected_revision,
@@ -365,6 +465,7 @@ impl OrchestrationRuntime {
                     && route.participation_id() == target.participation_id()
                     && route.runtime_session_id() == target.runtime_session_id()
                     && route.provider_conversation_id() == target.provider_conversation_id()
+                    && route.project() == target.project()
             })
         {
             return Err(RuntimeError::Conflict);

@@ -7,9 +7,10 @@
 use forge_backend::ops::CommandOp;
 use forge_control::ResolvedWorkspaceScope;
 use forge_domain::{
-    ActivityId, AgentAssignmentId, AgentAssignmentRevision, AgentAssignmentState, AgentInstanceId,
-    AgentSessionId, DagHeadRevision, DagNodeId, DagNodeRevision, DagRevisionNumber, GoalId,
-    GoalRevision, TimestampMillis, WorkspaceId,
+    ActivityId, AgentAssignmentId, AgentAssignmentRevision, AgentAssignmentState,
+    AgentAttachmentState, AgentInstanceId, AgentInstanceRevision, AgentSessionId, DagHeadRevision,
+    DagNodeId, DagNodeRevision, DagRevisionNumber, GoalId, GoalRevision, RegisteredAgentInstance,
+    TimestampMillis, WorkspaceId,
 };
 use heterarchy_orchestration_operations::{DagNodeAssignmentSnapshot, DagNodeEvidenceScope};
 use heterarchy_orchestration_runtime::node_team::NodeTeamSourceObservation;
@@ -17,6 +18,54 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use super::{ForgeSourceError, ForgeSourceHttpClient, map_command_error, validated_scope};
+
+/// Exact current Forge Agent fields needed to fence an assignment offer.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeAssignmentTargetAgentObservation {
+    workspace_id: WorkspaceId,
+    activity_id: ActivityId,
+    agent_id: AgentInstanceId,
+    attachment_state: AgentAttachmentState,
+    revision: AgentInstanceRevision,
+}
+
+impl NodeAssignmentTargetAgentObservation {
+    pub(crate) const fn from_agent(agent: &RegisteredAgentInstance) -> Self {
+        Self {
+            workspace_id: agent.workspace_id(),
+            activity_id: agent.activity_id(),
+            agent_id: agent.id(),
+            attachment_state: agent.attachment_state(),
+            revision: agent.revision(),
+        }
+    }
+
+    #[must_use]
+    pub const fn workspace_id(self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    #[must_use]
+    pub const fn activity_id(self) -> ActivityId {
+        self.activity_id
+    }
+
+    #[must_use]
+    pub const fn agent_id(self) -> AgentInstanceId {
+        self.agent_id
+    }
+
+    #[must_use]
+    pub const fn attachment_state(self) -> AgentAttachmentState {
+        self.attachment_state
+    }
+
+    #[must_use]
+    pub const fn revision(self) -> AgentInstanceRevision {
+        self.revision
+    }
+}
 
 /// The current head information returned alongside the requested historical
 /// node. `current_dag_revision` may differ from the scope's DAG revision.
@@ -32,6 +81,12 @@ impl NodeAssignmentHead {
     #[must_use]
     pub const fn current_dag_revision(self) -> DagRevisionNumber {
         self.current_dag_revision
+    }
+
+    /// The exact current head revision observed with the requested node.
+    #[must_use]
+    pub const fn head_revision(self) -> DagHeadRevision {
+        self.head_revision
     }
 }
 
@@ -215,6 +270,34 @@ impl NodeAssignmentObservation {
 }
 
 impl ForgeSourceHttpClient {
+    /// Read one current Agent context through Forge's existing read-only command.
+    ///
+    /// # Errors
+    /// Rejects invalid selectors, absent or foreign context, and malformed
+    /// Source readback. The observation is not mutation authority.
+    pub async fn node_assignment_target_agent(
+        &self,
+        expected: &ResolvedWorkspaceScope,
+        activity_id: Uuid,
+        agent_id: Uuid,
+    ) -> Result<Option<NodeAssignmentTargetAgentObservation>, ForgeSourceError> {
+        if activity_id.is_nil() || agent_id.is_nil() {
+            return Err(ForgeSourceError::InvalidScope);
+        }
+        let (scope, _) = validated_scope(expected)?;
+        let payload = json!({
+            "scope": scope,
+            "activity_id": activity_id,
+            "agent_id": agent_id,
+        });
+        let readback = self
+            .commands()
+            .command(CommandOp::AgentGetContext, payload)
+            .await
+            .map_err(map_command_error)?;
+        node_assignment_target_agent_from_wire(&readback, expected, activity_id, agent_id)
+    }
+
     /// Read the exact Goal/DAG/node assignment observation from configured Forge.
     ///
     /// # Errors
@@ -232,6 +315,96 @@ impl ForgeSourceHttpClient {
             .map_err(map_command_error)?;
         node_assignment_read_output_from_wire(&readback, expected, node_scope)
     }
+}
+
+/// Decode the bounded existing `agent.get_context` result for one exact target.
+///
+/// # Errors
+/// Returns `Protocol` if the current context is absent, malformed, foreign, or
+/// internally inconsistent.
+pub fn node_assignment_target_agent_from_wire(
+    readback: &Value,
+    expected_workspace: &ResolvedWorkspaceScope,
+    expected_activity_id: Uuid,
+    expected_agent_id: Uuid,
+) -> Result<Option<NodeAssignmentTargetAgentObservation>, ForgeSourceError> {
+    let found = readback
+        .get("found")
+        .and_then(Value::as_bool)
+        .ok_or(ForgeSourceError::Protocol)?;
+    if !found {
+        require_exact_fields(readback, &["found"])?;
+        return Ok(None);
+    }
+    require_exact_fields(
+        readback,
+        &[
+            "found",
+            "agent",
+            "activity_revision",
+            "activity_liveness",
+            "work_updates",
+            "work_update_count",
+            "focus_event_count",
+        ],
+    )?;
+    let agent = readback.get("agent").ok_or(ForgeSourceError::Protocol)?;
+    require_exact_fields(
+        agent,
+        &[
+            "agent_id",
+            "workspace_id",
+            "activity_id",
+            "display_name",
+            "attachment_state",
+            "revision",
+        ],
+    )?;
+    let agent_id = AgentInstanceId::from_uuid(required_uuid(agent.get("agent_id"))?);
+    let workspace_id = WorkspaceId::from_uuid(required_uuid(agent.get("workspace_id"))?);
+    let activity_id = ActivityId::from_uuid(required_uuid(agent.get("activity_id"))?);
+    let revision = AgentInstanceRevision::new(required_positive_revision(agent.get("revision"))?)
+        .map_err(|_| ForgeSourceError::Protocol)?;
+    let attachment_state = match agent.get("attachment_state").and_then(Value::as_str) {
+        Some("attached") => AgentAttachmentState::Attached,
+        Some("detached") => AgentAttachmentState::Detached,
+        _ => return Err(ForgeSourceError::Protocol),
+    };
+    let _ = required_positive_revision(readback.get("activity_revision"))?;
+    if agent
+        .get("display_name")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        || workspace_id != expected_workspace.workspace_id()
+        || activity_id.into_uuid() != expected_activity_id
+        || agent_id.into_uuid() != expected_agent_id
+        || !matches!(
+            readback.get("activity_liveness").and_then(Value::as_str),
+            Some("available" | "live" | "expired" | "closed" | "interrupted")
+        )
+    {
+        return Err(ForgeSourceError::Protocol);
+    }
+    let work_updates = readback
+        .get("work_updates")
+        .and_then(Value::as_array)
+        .ok_or(ForgeSourceError::Protocol)?;
+    if readback.get("work_update_count").and_then(Value::as_u64)
+        != Some(u64::try_from(work_updates.len()).map_err(|_| ForgeSourceError::Protocol)?)
+        || readback
+            .get("focus_event_count")
+            .and_then(Value::as_u64)
+            .is_none()
+    {
+        return Err(ForgeSourceError::Protocol);
+    }
+    Ok(Some(NodeAssignmentTargetAgentObservation {
+        workspace_id,
+        activity_id,
+        agent_id,
+        attachment_state,
+        revision,
+    }))
 }
 
 /// Normalize the in-process Forge snapshot to the same typed observation used
@@ -512,6 +685,82 @@ mod tests {
             DagRevisionNumber::new(1)?,
             DagNodeId::from_uuid(Uuid::from_u128(0x304)),
         ))
+    }
+
+    fn target_agent_readback(
+        workspace: &ResolvedWorkspaceScope,
+        activity_id: Uuid,
+        agent_id: Uuid,
+        revision: i64,
+        attachment_state: &str,
+    ) -> Value {
+        json!({
+            "found": true,
+            "agent": {
+                "agent_id": agent_id,
+                "workspace_id": workspace.workspace_id().into_uuid(),
+                "activity_id": activity_id,
+                "display_name": "target",
+                "attachment_state": attachment_state,
+                "revision": revision
+            },
+            "activity_revision": 1,
+            "activity_liveness": "live",
+            "work_updates": [],
+            "work_update_count": 0,
+            "focus_event_count": 0
+        })
+    }
+
+    #[test]
+    fn target_agent_context_requires_exact_identity_revision_and_attachment()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = workspace_scope()?;
+        let activity_id = Uuid::from_u128(0x305);
+        let agent_id = Uuid::from_u128(0x306);
+        let observation = node_assignment_target_agent_from_wire(
+            &target_agent_readback(&workspace, activity_id, agent_id, 4, "attached"),
+            &workspace,
+            activity_id,
+            agent_id,
+        )?
+        .ok_or("expected current target Agent context")?;
+        assert_eq!(observation.workspace_id(), workspace.workspace_id());
+        assert_eq!(
+            observation.activity_id(),
+            ActivityId::from_uuid(activity_id)
+        );
+        assert_eq!(observation.agent_id(), AgentInstanceId::from_uuid(agent_id));
+        assert_eq!(observation.revision().get(), 4);
+        assert!(observation.attachment_state().is_attached());
+
+        let detached = node_assignment_target_agent_from_wire(
+            &target_agent_readback(&workspace, activity_id, agent_id, 4, "detached"),
+            &workspace,
+            activity_id,
+            agent_id,
+        )?
+        .ok_or("expected detached target Agent context")?;
+        assert!(!detached.attachment_state().is_attached());
+
+        let foreign = target_agent_readback(
+            &workspace,
+            activity_id,
+            Uuid::from_u128(0x307),
+            4,
+            "attached",
+        );
+        assert_eq!(
+            node_assignment_target_agent_from_wire(&foreign, &workspace, activity_id, agent_id),
+            Err(ForgeSourceError::Protocol)
+        );
+        let mut unknown = target_agent_readback(&workspace, activity_id, agent_id, 4, "attached");
+        unknown["agent"]["session_id"] = json!(Uuid::from_u128(0x308));
+        assert_eq!(
+            node_assignment_target_agent_from_wire(&unknown, &workspace, activity_id, agent_id),
+            Err(ForgeSourceError::Protocol)
+        );
+        Ok(())
     }
 
     fn active_assignment() -> Value {

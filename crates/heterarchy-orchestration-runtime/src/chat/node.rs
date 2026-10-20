@@ -5,8 +5,9 @@ use forge_domain::{
     AgentSessionId, DagRevisionNumber, TimestampMillis, WorkspaceId,
 };
 use heterarchy_orchestration_operations::{
-    LeadershipScope, NodeMessageRouteTarget, NodeMessageRouteWitness, NodeTeamBinding,
-    NodeTeamBindingScope, OperationalActor, OperationsCatalog,
+    AssignmentAffinityDisposition, LeadershipScope, NodeMessageRouteTarget,
+    NodeMessageRouteWitness, NodeTeamBinding, NodeTeamBindingScope, OperationalActor,
+    OperationsCatalog,
 };
 use heterarchy_orchestration_sessions::{AgentProfileCatalog, AgentProfileId};
 use uuid::Uuid;
@@ -212,6 +213,28 @@ fn resolve_agent_chat(
             "This node has no active Agent assignment. History remains available.",
         ));
     };
+    let Some(affinity) = catalog.read_assignment_affinity(workspace, assignment.id)? else {
+        return Ok(unavailable(
+            "This node assignment has not been admitted by Orchestration. History remains available.",
+        ));
+    };
+    let binding_revision = catalog
+        .node_team_binding(scope)?
+        .map(|value| value.revision());
+    if affinity.node_scope() != Some(scope)
+        || affinity.team_id().is_some()
+        || affinity.binding_revision() != binding_revision
+        || affinity.target_agent_id() != assignment.target_agent_id
+        || affinity.target_session_id() != assignment.target_session_id
+        || !matches!(
+            affinity.disposition(),
+            AssignmentAffinityDisposition::Pending | AssignmentAffinityDisposition::Active
+        )
+    {
+        return Ok(unavailable(
+            "This node assignment has not been admitted by Orchestration. History remains available.",
+        ));
+    }
     let Some(link) = profiles.logical_session_link(assignment.target_session_id)? else {
         return Ok(unavailable("The assigned Agent has no linked Profile."));
     };
@@ -222,6 +245,18 @@ fn resolve_agent_chat(
             "The assigned Agent is not active in this Workspace.",
         ));
     };
+    let Some(participation) = catalog.workspace_participation(workspace, link.profile_id())? else {
+        return Ok(unavailable(
+            "This node assignment has not been admitted by Orchestration. History remains available.",
+        ));
+    };
+    if affinity.target_participant_id() != identity.participant_id()
+        || affinity.target_participation_id() != participation.participation_id()
+    {
+        return Ok(unavailable(
+            "This node assignment has not been admitted by Orchestration. History remains available.",
+        ));
+    }
     if !identity.effect_bindings().iter().any(|binding| {
         binding.activity_id() == scope.activity_id()
             && binding.agent_id() == assignment.target_agent_id

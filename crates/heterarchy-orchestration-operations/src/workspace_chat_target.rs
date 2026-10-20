@@ -10,7 +10,10 @@ use heterarchy_orchestration_sessions::{AgentProfileId, AgentProfileRuntimeSessi
 use rusqlite::{Transaction, params};
 use uuid::Uuid;
 
-use crate::{OperationsCatalog, OperationsError, wire};
+use crate::{
+    ChatGptProjectId, OperationsCatalog, OperationsError, WorkspaceProjectBindingRevision,
+    WorkspaceProjectReference, wire,
+};
 
 const MAX_CHAT_TARGETS: usize = 8;
 const CONFIRMED_PROVISION_STATE: i64 = 5;
@@ -30,6 +33,7 @@ pub struct WorkspaceChatTarget {
     participation_id: crate::WorkspaceParticipationId,
     runtime_session_id: AgentProfileRuntimeSessionId,
     conversation: String,
+    project: Option<WorkspaceProjectReference>,
 }
 
 impl WorkspaceChatTarget {
@@ -61,6 +65,11 @@ impl WorkspaceChatTarget {
     #[must_use]
     pub fn provider_conversation_id(&self) -> &str {
         &self.conversation
+    }
+
+    #[must_use]
+    pub const fn project(&self) -> Option<WorkspaceProjectReference> {
+        self.project
     }
 }
 
@@ -145,15 +154,7 @@ pub(crate) fn read_workspace_chat_target_in_transaction(
         .find(|route| route.operation_id == operation_id))
 }
 
-fn read_workspace_chat_targets(
-    tx: &Transaction<'_>,
-    workspace_id: WorkspaceId,
-    profile_id: AgentProfileId,
-    query_limit: i64,
-    limit: usize,
-) -> Result<WorkspaceChatTargetPage, OperationsError> {
-    let mut statement = tx.prepare(
-        "WITH confirmed AS (
+const WORKSPACE_CHAT_TARGETS_SQL: &str = "WITH confirmed AS (
              SELECT p.operation_id, r.workspace_id, p.runtime_session_id
              FROM ops_agent_provision_operations AS p
              JOIN ops_agent_requests AS r ON r.request_id=p.request_id
@@ -167,11 +168,15 @@ fn read_workspace_chat_targets(
                 p.profile_id,
                 wp.participation_id,
                 p.runtime_session_id,
-                p.provider_conversation_id
+                p.provider_conversation_id,
+                route.project_id,
+                route.binding_revision
          FROM ops_agent_provision_operations AS p
          JOIN ops_agent_requests AS r
            ON r.request_id=p.request_id
           AND r.workspace_id=?3
+         LEFT JOIN ops_agent_provision_project_routes AS route
+           ON route.operation_id=p.operation_id
          JOIN ops_workspace_participations AS wp
            ON wp.workspace_id=r.workspace_id
           AND wp.agent_profile_id=p.profile_id
@@ -197,6 +202,42 @@ fn read_workspace_chat_targets(
                  AND newer.runtime_session_id=p.runtime_session_id
                  AND newer_request.workspace_id=r.workspace_id
                  AND (
+                     EXISTS (
+                         SELECT 1
+                         FROM ops_workspace_participation_mappings AS mapping
+                         JOIN ops_logical_members AS member
+                           ON member.workspace_id=mapping.workspace_id
+                          AND member.participant_id=mapping.participant_id
+                          AND member.session_id=mapping.session_id
+                         JOIN ops_current_effect_bindings AS binding
+                           ON binding.workspace_id=member.workspace_id
+                          AND binding.participant_id=member.participant_id
+                          AND binding.session_id=member.session_id
+                          AND binding.activity_id=newer_request.activity_id
+                         WHERE mapping.workspace_id=newer_request.workspace_id
+                           AND mapping.participation_id=wp.participation_id
+                           AND mapping.agent_profile_id=newer.profile_id
+                           AND mapping.profile_mapping_request_id=newer.operation_id
+                     )
+                     OR EXISTS (
+                         SELECT 1
+                         FROM ops_workspace_participation_session_rebinds AS rebind
+                         JOIN ops_logical_members AS member
+                           ON member.workspace_id=rebind.workspace_id
+                          AND member.participant_id=rebind.participant_id
+                          AND member.session_id=rebind.new_session_id
+                         JOIN ops_current_effect_bindings AS binding
+                           ON binding.workspace_id=member.workspace_id
+                          AND binding.participant_id=member.participant_id
+                          AND binding.session_id=member.session_id
+                          AND binding.activity_id=newer_request.activity_id
+                         WHERE rebind.workspace_id=newer_request.workspace_id
+                           AND rebind.participation_id=wp.participation_id
+                           AND rebind.agent_profile_id=newer.profile_id
+                           AND rebind.profile_mapping_request_id=newer.operation_id
+                     )
+                 )
+                 AND (
                      newer.updated_at_ms > p.updated_at_ms
                      OR (
                          newer.updated_at_ms = p.updated_at_ms
@@ -205,8 +246,16 @@ fn read_workspace_chat_targets(
                  )
            )
          ORDER BY p.updated_at_ms DESC, p.operation_id DESC
-         LIMIT ?5",
-    )?;
+         LIMIT ?5";
+
+fn read_workspace_chat_targets(
+    tx: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+    profile_id: AgentProfileId,
+    query_limit: i64,
+    limit: usize,
+) -> Result<WorkspaceChatTargetPage, OperationsError> {
+    let mut statement = tx.prepare(WORKSPACE_CHAT_TARGETS_SQL)?;
     let mut rows = statement.query(params![
         CHATGPT_PROVIDER_FAMILY,
         CONFIRMED_PROVISION_STATE,
@@ -232,6 +281,23 @@ fn decode_workspace_chat_target(
     let participation_id = row.get::<_, Vec<u8>>(3)?;
     let runtime_session_id = row.get::<_, Vec<u8>>(4)?;
     let provider_conversation_id = row.get::<_, String>(5)?;
+    let project_id = row.get::<_, Option<String>>(6)?;
+    let binding_revision = row.get::<_, Option<i64>>(7)?;
+    let project = match (project_id, binding_revision) {
+        (None, None) => None,
+        (Some(project_id), Some(binding_revision)) => {
+            let project_id = ChatGptProjectId::try_from(project_id.as_str())
+                .map_err(|_| OperationsError::Corrupt("workspace chat Project identity"))?;
+            let binding_revision = WorkspaceProjectBindingRevision::new(binding_revision)
+                .map_err(|_| OperationsError::Corrupt("workspace chat Project revision"))?;
+            Some(WorkspaceProjectReference::new(project_id, binding_revision))
+        }
+        _ => {
+            return Err(OperationsError::Corrupt(
+                "workspace chat Project route shape",
+            ));
+        }
+    };
     decode_workspace_chat_target_values(
         operation_id,
         activity_id,
@@ -239,6 +305,7 @@ fn decode_workspace_chat_target(
         participation_id,
         runtime_session_id,
         provider_conversation_id,
+        project,
     )
 }
 
@@ -249,6 +316,7 @@ fn decode_workspace_chat_target_values(
     participation_id: Vec<u8>,
     runtime_session_id: Vec<u8>,
     provider_conversation_id: String,
+    project: Option<WorkspaceProjectReference>,
 ) -> Result<WorkspaceChatTarget, OperationsError> {
     if provider_conversation_id.is_empty()
         || provider_conversation_id.len() > MAX_PROVIDER_CONVERSATION_ID_BYTES
@@ -270,6 +338,7 @@ fn decode_workspace_chat_target_values(
         )?))
         .map_err(|_| OperationsError::Corrupt("workspace chat Runtime Session identity"))?,
         conversation: provider_conversation_id,
+        project,
     })
 }
 
@@ -284,6 +353,14 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    struct SeededTarget {
+        activity: Uuid,
+        session: Uuid,
+        agent: Uuid,
+        operation: Uuid,
+    }
 
     fn catalog() -> Result<(PathBuf, OperationsCatalog), Box<dyn Error>> {
         let root = std::env::temp_dir().join(format!(
@@ -303,10 +380,12 @@ mod tests {
         runtime: AgentProfileRuntimeSessionId,
         operation: Uuid,
         conversation: &str,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<SeededTarget, Box<dyn Error>> {
         let request = Uuid::now_v7();
         let claim = Uuid::now_v7();
         let activity = Uuid::now_v7();
+        let session = Uuid::now_v7();
+        let agent = Uuid::now_v7();
         let connection = &catalog.connection;
         connection.execute(
             "INSERT INTO ops_imports(migration_id,workspace_id,destination_id,source_revision,phase,next_cursor,page_count,record_count,import_digest,verified_pages,verify_digest) SELECT ?1,?2,?3,1,2,NULL,5,0,?4,5,?4 WHERE NOT EXISTS(SELECT 1 FROM ops_imports WHERE workspace_id=?2 AND destination_id=?3)",
@@ -318,7 +397,7 @@ mod tests {
         )?;
         connection.execute(
             "INSERT INTO ops_agent_requests(request_id,workspace_id,activity_id,requester_agent_id,requester_session_id,coordinator_revision,objective,capability,requested_count,effect_scope,independence_requirement,reason,state,created_at_ms,revision) VALUES(?1,?2,?3,?4,?5,1,'objective','capability',1,0,0,'reason',1,1,1)",
-            params![request.as_bytes(), workspace.into_uuid().as_bytes(), activity.as_bytes(), Uuid::now_v7().as_bytes(), Uuid::now_v7().as_bytes()],
+            params![request.as_bytes(), workspace.into_uuid().as_bytes(), activity.as_bytes(), Uuid::now_v7().as_bytes(), session.as_bytes()],
         )?;
         connection.execute(
             "INSERT INTO ops_agent_request_resolutions(request_id,slot_ordinal,resolution_kind,claim_id,profile_id,profile_revision,runtime_session_id,runtime_session_revision,policy_revision,reserved_at_ms) VALUES(?1,0,2,?2,?3,1,?4,1,1,1)",
@@ -327,6 +406,63 @@ mod tests {
         connection.execute(
             "INSERT INTO ops_agent_provision_operations(operation_id,request_id,slot_ordinal,effect_kind,provider_family,profile_id,runtime_session_id,state,provider_conversation_id,prepared_at_ms,updated_at_ms,revision) VALUES(?1,?2,0,1,1,?3,?4,5,?5,1,1,1)",
             params![operation.as_bytes(), request.as_bytes(), profile.into_uuid().as_bytes(), runtime.into_uuid().as_bytes(), conversation],
+        )?;
+        Ok(SeededTarget {
+            activity,
+            session,
+            agent,
+            operation,
+        })
+    }
+
+    fn activate_target(
+        catalog: &OperationsCatalog,
+        workspace: WorkspaceId,
+        profile: AgentProfileId,
+        participation: Uuid,
+        participant: Uuid,
+        target: SeededTarget,
+    ) -> Result<(), Box<dyn Error>> {
+        let principal = Uuid::now_v7();
+        catalog.connection.execute(
+            "INSERT INTO ops_logical_members(workspace_id,participant_id,session_id,principal_kind,principal_id,display_name,declared_role,transport_kind,membership_revision,created_at_ms) VALUES(?1,?2,?3,1,?4,'member','researcher',2,1,1) ON CONFLICT(workspace_id,participant_id) DO UPDATE SET session_id=excluded.session_id",
+            params![workspace.into_uuid().as_bytes(), participant.as_bytes(), target.session.as_bytes(), principal.as_bytes()],
+        )?;
+        catalog.connection.execute(
+            "INSERT INTO ops_workspace_participation_mappings(request_id,workspace_id,participation_id,agent_profile_id,profile_revision,profile_mapping_request_id,session_id,session_revision,participant_id,participant_membership_revision,mapped_at_ms) VALUES(?1,?2,?3,?4,1,?1,?5,1,?6,1,1)",
+            params![target.operation.as_bytes(), workspace.into_uuid().as_bytes(), participation.as_bytes(), profile.into_uuid().as_bytes(), target.session.as_bytes(), participant.as_bytes()],
+        )?;
+        catalog.connection.execute(
+            "INSERT INTO ops_current_effect_bindings(workspace_id,participant_id,activity_id,session_id,agent_id,source_kind,source_request_id) VALUES(?1,?2,?3,?4,?5,0,?6)",
+            params![workspace.into_uuid().as_bytes(), participant.as_bytes(), target.activity.as_bytes(), target.session.as_bytes(), target.agent.as_bytes(), target.operation.as_bytes()],
+        )?;
+        Ok(())
+    }
+
+    fn activate_replacement_target(
+        catalog: &OperationsCatalog,
+        workspace: WorkspaceId,
+        profile: AgentProfileId,
+        participation: Uuid,
+        participant: Uuid,
+        previous: SeededTarget,
+        target: SeededTarget,
+    ) -> Result<(), Box<dyn Error>> {
+        catalog.connection.execute(
+            "UPDATE ops_logical_members SET session_id=?1 WHERE workspace_id=?2 AND participant_id=?3 AND session_id=?4",
+            params![target.session.as_bytes(), workspace.into_uuid().as_bytes(), participant.as_bytes(), previous.session.as_bytes()],
+        )?;
+        catalog.connection.execute(
+            "UPDATE ops_workspace_participations SET revision=2 WHERE workspace_id=?1 AND agent_profile_id=?2 AND participation_id=?3 AND revision=1",
+            params![workspace.into_uuid().as_bytes(), profile.into_uuid().as_bytes(), participation.as_bytes()],
+        )?;
+        catalog.connection.execute(
+            "INSERT INTO ops_workspace_participation_session_rebinds(request_id,workspace_id,participation_id,agent_profile_id,profile_revision,profile_mapping_request_id,previous_session_id,new_session_id,new_session_revision,participant_id,participant_membership_revision,expected_participation_revision,result_participation_revision,bound_at_ms) VALUES(?1,?2,?3,?4,1,?1,?5,?6,1,?7,1,1,2,2)",
+            params![target.operation.as_bytes(), workspace.into_uuid().as_bytes(), participation.as_bytes(), profile.into_uuid().as_bytes(), previous.session.as_bytes(), target.session.as_bytes(), participant.as_bytes()],
+        )?;
+        catalog.connection.execute(
+            "INSERT INTO ops_current_effect_bindings(workspace_id,participant_id,activity_id,session_id,agent_id,source_kind,source_request_id) VALUES(?1,?2,?3,?4,?5,0,?6)",
+            params![workspace.into_uuid().as_bytes(), participant.as_bytes(), target.activity.as_bytes(), target.session.as_bytes(), target.agent.as_bytes(), target.operation.as_bytes()],
         )?;
         Ok(())
     }
@@ -418,23 +554,32 @@ mod tests {
         let (workspace, profile, runtime) = ids(0xD00);
         let first_operation = Uuid::from_u128(0xD10);
         let latest_operation = Uuid::from_u128(0xD11);
+        let participation = Uuid::from_u128(0xD20);
         seed_target(
             &catalog,
             workspace,
             profile,
-            Uuid::from_u128(0xD20),
+            participation,
             runtime,
             first_operation,
             "old-conversation",
         )?;
-        seed_target(
+        let latest = seed_target(
             &catalog,
             workspace,
             profile,
-            Uuid::from_u128(0xD21),
+            participation,
             runtime,
             latest_operation,
             "latest-conversation",
+        )?;
+        activate_target(
+            &catalog,
+            workspace,
+            profile,
+            participation,
+            Uuid::from_u128(0xD22),
+            latest,
         )?;
         catalog.connection.execute(
             "UPDATE ops_agent_provision_operations SET updated_at_ms=2 WHERE operation_id=?1",
@@ -448,6 +593,72 @@ mod tests {
             "latest-conversation"
         );
         assert!(!page.truncated());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reserved_newer_operation_does_not_suppress_the_activated_route() -> Result<(), Box<dyn Error>>
+    {
+        let (root, catalog) = catalog()?;
+        let (workspace, profile, runtime) = ids(0xE00);
+        let participation = Uuid::from_u128(0xE10);
+        let participant = Uuid::from_u128(0xE11);
+        let first_operation = Uuid::from_u128(0xE20);
+        let newer_operation = Uuid::from_u128(0xE21);
+        let first = seed_target(
+            &catalog,
+            workspace,
+            profile,
+            participation,
+            runtime,
+            first_operation,
+            "old-conversation",
+        )?;
+        activate_target(
+            &catalog,
+            workspace,
+            profile,
+            participation,
+            participant,
+            first,
+        )?;
+        let newer = seed_target(
+            &catalog,
+            workspace,
+            profile,
+            participation,
+            runtime,
+            newer_operation,
+            "same-conversation",
+        )?;
+        catalog.connection.execute(
+            "UPDATE ops_agent_provision_operations SET updated_at_ms=2 WHERE operation_id=?1",
+            params![newer_operation.as_bytes()],
+        )?;
+
+        let reserved = catalog.workspace_chat_targets(workspace, profile, 8)?;
+        assert_eq!(reserved.targets().len(), 2);
+        assert_eq!(reserved.targets()[0].operation_id(), newer_operation);
+        assert_eq!(reserved.targets()[1].operation_id(), first_operation);
+
+        catalog.connection.execute(
+            "DELETE FROM ops_current_effect_bindings WHERE workspace_id=?1 AND participant_id=?2",
+            params![workspace.into_uuid().as_bytes(), participant.as_bytes()],
+        )?;
+        activate_replacement_target(
+            &catalog,
+            workspace,
+            profile,
+            participation,
+            participant,
+            first,
+            newer,
+        )?;
+        let activated = catalog.workspace_chat_targets(workspace, profile, 8)?;
+        assert_eq!(activated.targets().len(), 1);
+        assert_eq!(activated.targets()[0].operation_id(), newer_operation);
+        assert!(!activated.truncated());
         fs::remove_dir_all(root)?;
         Ok(())
     }

@@ -110,7 +110,7 @@ impl BackendState {
                         let revision = u64::try_from(receipt.leadership_revision)
                             .ok()
                             .filter(|revision| *revision > 0)
-                            .ok_or(RuntimeError::Persistence(OperationsError::Corrupt(
+                            .ok_or(RuntimeError::persistence(OperationsError::Corrupt(
                                 "recall leadership revision",
                             )))?;
                         publisher.publish_state_changed(
@@ -170,7 +170,7 @@ fn receipt_wire(
         "awaiting_decision" => LeadershipReviewPhaseWire::AwaitingDecision,
         "resolved" => LeadershipReviewPhaseWire::Resolved,
         _ => {
-            return Err(RuntimeError::Persistence(OperationsError::Corrupt(
+            return Err(RuntimeError::persistence(OperationsError::Corrupt(
                 "recall receipt phase",
             ))
             .into());

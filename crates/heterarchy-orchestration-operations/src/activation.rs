@@ -101,6 +101,17 @@ pub(crate) fn request_ready_witness(
     Ok(true)
 }
 
+pub(crate) fn has_activation(
+    connection: &Connection,
+    request_id: Uuid,
+) -> Result<bool, OperationsError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ops_binding_activations WHERE request_id=?1)",
+        params![request_id.as_bytes()],
+        |row| row.get(0),
+    )?)
+}
+
 /// Immutable Orchestration readback of a real Forge activation witness.
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +216,11 @@ impl OperationsCatalog {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if crate::binding_rejection::has_rejection(&transaction, request_id)? {
+            return Err(OperationsError::Conflict(
+                "binding rejection already recorded",
+            ));
+        }
         let Some(progress) = registration::committed_progress_at(&transaction, request_id)? else {
             return Err(OperationsError::Conflict("registration request missing"));
         };

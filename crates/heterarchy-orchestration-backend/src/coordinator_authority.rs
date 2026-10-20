@@ -12,21 +12,25 @@ mod membership;
 use forge_backend::{ForgeHttpClientError, ForgeHttpServiceCode};
 use forge_control::{
     AgentOperationsExportRequest, AgentOperationsFreezeReadRequest, ControlClientError,
-    CoordinatorActorRequest, FileActivityScope, ForgeControlClient,
+    CoordinatorActorRequest, FileActivityScope, ForgeControlClient, WorkspaceLocator,
 };
 use forge_domain::{
     ActivityCoordinatorActor, ActivityId, AuthenticatedPrincipal, RuntimeInstanceId,
-    TimestampMillis,
+    TimestampMillis, WorkspaceId, WorkspaceRevision,
 };
 use heterarchy_orchestration_operations::{
     AgentOperationsExportCursor, AgentOperationsExportPage, AgentOperationsFreeze,
+    MAX_WORKSPACE_AUTHORITY_SCOPES, WorkspaceProjectBindingRevision, WorkspaceProjectEnrollment,
+    WorkspaceProjectScope,
 };
 use heterarchy_orchestration_runtime::provisioning::AgentRequestSubmit;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, RwLock},
+};
 use thiserror::Error;
 
 use forge_control::{ControlErrorCode, ResolvedWorkspaceScope};
-
-const MAX_SCOPES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum CoordinatorAuthorityError {
@@ -48,7 +52,20 @@ pub enum CoordinatorAuthorityError {
 pub struct CoordinatorAuthority {
     transport: SourceTransport,
     scopes: Vec<ResolvedWorkspaceScope>,
+    enrolled_scopes: Arc<RwLock<WorkspaceProjectScopeProjection>>,
     effect_facts: Option<forge_backend::ForgeHttpClient>,
+}
+
+#[derive(Debug, Default)]
+struct WorkspaceProjectScopeProjection {
+    enrolled: BTreeMap<uuid::Uuid, EnrolledWorkspaceScope>,
+    uncertain: BTreeSet<uuid::Uuid>,
+}
+
+#[derive(Debug, Clone)]
+struct EnrolledWorkspaceScope {
+    scope: ResolvedWorkspaceScope,
+    binding_revision: WorkspaceProjectBindingRevision,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +78,111 @@ enum SourceTransport {
 }
 
 impl CoordinatorAuthority {
+    /// Resolve the exact current Coordinator and node observation from one Source snapshot lane.
+    ///
+    /// The caller separately proves the Workspace before invoking this method.
+    /// No Orchestration catalog guard or Broker authority is held while Source
+    /// is queried.
+    pub(crate) async fn node_assignment_admission_observation(
+        &self,
+        scope: crate::wire::WorkspaceQueryScope,
+        activity_id: uuid::Uuid,
+        target_agent_id: uuid::Uuid,
+        principal: AuthenticatedPrincipal,
+        node_scope: heterarchy_orchestration_operations::NodeTeamBindingScope,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<
+        (
+            ActivityCoordinatorActor,
+            crate::forge_source::node_assignment::NodeAssignmentObservation,
+            crate::forge_source::node_assignment::NodeAssignmentTargetAgentObservation,
+        ),
+        CoordinatorAuthorityError,
+    > {
+        if activity_id.is_nil()
+            || target_agent_id.is_nil()
+            || node_scope.workspace_id().into_uuid() != scope.workspace_id
+            || node_scope.activity_id().into_uuid() != activity_id
+        {
+            return Err(CoordinatorAuthorityError::Stale);
+        }
+        let requested = heterarchy_orchestration_operations::DagNodeEvidenceScope::new(
+            node_scope.goal_id(),
+            node_scope.dag_revision(),
+            node_scope.node_id(),
+        );
+        match &self.transport {
+            SourceTransport::Http(client) => {
+                let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
+                let actor = client
+                    .coordinator_actor(&trusted, activity_id, principal)
+                    .await
+                    .map_err(map_source_error)?
+                    .ok_or(CoordinatorAuthorityError::Denied)?;
+                let observation = client
+                    .node_assignment(&trusted, requested)
+                    .await
+                    .map_err(map_source_error)?
+                    .ok_or(CoordinatorAuthorityError::Stale)?;
+                let target_agent = client
+                    .node_assignment_target_agent(&trusted, activity_id, target_agent_id)
+                    .await
+                    .map_err(map_source_error)?
+                    .ok_or(CoordinatorAuthorityError::Stale)?;
+                Ok((actor, observation, target_agent))
+            }
+            SourceTransport::Control { .. } => {
+                let authority = self.clone();
+                control_job(permit, move || {
+                    let resolved = authority.fresh_workspace(&scope)?;
+                    let actor = authority
+                        .control()?
+                        .activity_coordinator_actor(CoordinatorActorRequest {
+                            scope: resolved.clone(),
+                            activity_id: ActivityId::from_uuid(activity_id),
+                            principal,
+                        })
+                        .map_err(map_control_error)?
+                        .ok_or(CoordinatorAuthorityError::Denied)?;
+                    let snapshot = authority
+                        .control()?
+                        .dag_node_assignment_snapshot(resolved.clone(), requested)
+                        .map_err(map_control_error)?
+                        .ok_or(CoordinatorAuthorityError::Stale)?;
+                    let context = authority
+                        .control()?
+                        .agent_get_context(forge_control::AgentContextRequest {
+                            scope: resolved,
+                            activity_id: ActivityId::from_uuid(activity_id),
+                            agent_id: forge_domain::AgentInstanceId::from_uuid(target_agent_id),
+                            now: TimestampMillis::new(
+                                crate::current_timestamp_millis()
+                                    .map_err(|_| CoordinatorAuthorityError::Unavailable)?,
+                            )
+                            .map_err(|_| CoordinatorAuthorityError::Unavailable)?,
+                            focus_event_limit: forge_domain::AgentListLimit::DEFAULT,
+                            work_update_limit: forge_domain::AgentListLimit::DEFAULT,
+                        })
+                        .map_err(map_control_error)?
+                        .ok_or(CoordinatorAuthorityError::Stale)?;
+                    let target_agent = crate::forge_source::node_assignment::
+                        NodeAssignmentTargetAgentObservation::from_agent(
+                            context.attachment().agent(),
+                        );
+                    Ok((
+                        actor,
+                        crate::forge_source::node_assignment::node_assignment_observation_from_snapshot(
+                            &snapshot,
+                        ),
+                        target_agent,
+                    ))
+                })
+                .await
+            }
+        }
+    }
+
     /// Build one bounded authority from an existing Forge control client and
     /// host-resolved Workspace references.
     ///
@@ -78,6 +200,7 @@ impl CoordinatorAuthority {
                 runtime_instance_id: RuntimeInstanceId::from_uuid(uuid::Uuid::now_v7()),
             },
             scopes,
+            enrolled_scopes: Arc::new(RwLock::new(WorkspaceProjectScopeProjection::default())),
             effect_facts: None,
         })
     }
@@ -95,6 +218,7 @@ impl CoordinatorAuthority {
         Ok(Self {
             transport: SourceTransport::Http(client),
             scopes,
+            enrolled_scopes: Arc::new(RwLock::new(WorkspaceProjectScopeProjection::default())),
             effect_facts: None,
         })
     }
@@ -220,35 +344,169 @@ impl CoordinatorAuthority {
             .map_err(map_operations_source_error)
     }
 
+    pub(crate) fn static_workspace_ids(&self) -> Vec<uuid::Uuid> {
+        self.scopes
+            .iter()
+            .map(|scope| scope.workspace_id().into_uuid())
+            .collect()
+    }
+
+    /// Load the durable enrollment projection before serving requests. Static
+    /// scopes remain the compatibility baseline only where no dynamic row exists.
+    pub(crate) fn hydrate_workspace_project_enrollments(
+        &self,
+        enrollments: &[WorkspaceProjectEnrollment],
+    ) -> Result<(), CoordinatorAuthorityError> {
+        let mut dynamic = BTreeMap::new();
+        for enrollment in enrollments {
+            let scope = resolved_workspace_scope(enrollment.scope())?;
+            let workspace_id = scope.workspace_id().into_uuid();
+            if dynamic
+                .insert(
+                    workspace_id,
+                    EnrolledWorkspaceScope {
+                        scope,
+                        binding_revision: enrollment.binding_revision(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(CoordinatorAuthorityError::Unavailable);
+            }
+        }
+        let mut workspace_ids = self
+            .scopes
+            .iter()
+            .map(|scope| scope.workspace_id().into_uuid())
+            .collect::<std::collections::BTreeSet<_>>();
+        workspace_ids.extend(dynamic.keys().copied());
+        if workspace_ids.len() > MAX_WORKSPACE_AUTHORITY_SCOPES {
+            return Err(CoordinatorAuthorityError::Unavailable);
+        }
+        *self
+            .enrolled_scopes
+            .write()
+            .map_err(|_| CoordinatorAuthorityError::Unavailable)? =
+            WorkspaceProjectScopeProjection {
+                enrolled: dynamic,
+                uncertain: BTreeSet::new(),
+            };
+        Ok(())
+    }
+
+    /// Publish one just-committed enrollment. Older or duplicate publication
+    /// cannot replace a newer binding revision in a clone-shared projection.
+    pub(crate) fn publish_workspace_project_enrollment(
+        &self,
+        scope: &ResolvedWorkspaceScope,
+        binding_revision: WorkspaceProjectBindingRevision,
+    ) -> bool {
+        let Ok(mut projection) = self.enrolled_scopes.write() else {
+            return false;
+        };
+        let workspace_id = scope.workspace_id().into_uuid();
+        if let Some(current) = projection.enrolled.get(&workspace_id)
+            && current.binding_revision >= binding_revision
+        {
+            let current_matches =
+                current.binding_revision == binding_revision && current.scope == *scope;
+            if current_matches {
+                projection.uncertain.remove(&workspace_id);
+            }
+            return current_matches;
+        }
+        let mut workspace_ids = self
+            .scopes
+            .iter()
+            .map(|scope| scope.workspace_id().into_uuid())
+            .collect::<std::collections::BTreeSet<_>>();
+        workspace_ids.extend(projection.enrolled.keys().copied());
+        if !workspace_ids.contains(&workspace_id)
+            && workspace_ids.len() >= MAX_WORKSPACE_AUTHORITY_SCOPES
+        {
+            return false;
+        }
+        projection.enrolled.insert(
+            workspace_id,
+            EnrolledWorkspaceScope {
+                scope: scope.clone(),
+                binding_revision,
+            },
+        );
+        projection.uncertain.remove(&workspace_id);
+        true
+    }
+
+    pub(crate) fn mark_workspace_project_projection_unavailable(&self, workspace_id: uuid::Uuid) {
+        if let Ok(mut projection) = self.enrolled_scopes.write() {
+            projection.uncertain.insert(workspace_id);
+        }
+    }
+
+    /// Read the current authorization snapshot for one already-proven Forge scope.
+    pub(crate) fn workspace_authorized(
+        &self,
+        scope: &ResolvedWorkspaceScope,
+    ) -> Result<bool, CoordinatorAuthorityError> {
+        let workspace_id = scope.workspace_id().into_uuid();
+        let projection = self
+            .enrolled_scopes
+            .read()
+            .map_err(|_| CoordinatorAuthorityError::Unavailable)?;
+        if projection.uncertain.contains(&workspace_id) {
+            return Err(CoordinatorAuthorityError::Unavailable);
+        }
+        if let Some(enrollment) = projection.enrolled.get(&workspace_id) {
+            return Ok(enrollment.scope == *scope);
+        }
+        Ok(self.scopes.iter().any(|configured| configured == scope))
+    }
+
     /// Select an exact host-configured reference for a persisted Workspace ID.
     /// This selection is not a fresh source observation or execution authority.
     pub(crate) fn workspace_reference(
         &self,
         workspace_id: uuid::Uuid,
     ) -> Result<crate::wire::WorkspaceQueryScope, CoordinatorAuthorityError> {
-        let scope = self
+        let scope = self.trusted_workspace_scope(workspace_id)?;
+        Ok(workspace_scope_wire(&scope))
+    }
+
+    pub(crate) fn workspace_reference_for_operator_readback(
+        &self,
+        workspace_id: uuid::Uuid,
+        candidate: &crate::wire::WorkspaceQueryScope,
+    ) -> Result<crate::wire::WorkspaceQueryScope, CoordinatorAuthorityError> {
+        if candidate.workspace_id != workspace_id {
+            return Err(CoordinatorAuthorityError::Stale);
+        }
+        let projection = self
+            .enrolled_scopes
+            .read()
+            .map_err(|_| CoordinatorAuthorityError::Unavailable)?;
+        if projection.uncertain.contains(&workspace_id) {
+            drop(projection);
+            return Ok(candidate.clone());
+        }
+        if let Some(enrollment) = projection.enrolled.get(&workspace_id) {
+            return Ok(workspace_scope_wire(&enrollment.scope));
+        }
+        drop(projection);
+        if let Some(scope) = self
             .scopes
             .iter()
             .find(|scope| scope.workspace_id().into_uuid() == workspace_id)
-            .ok_or(CoordinatorAuthorityError::Unavailable)?;
-        Ok(crate::wire::WorkspaceQueryScope {
-            workspace_id,
-            workspace_revision: scope.workspace_revision().get(),
-            location_id: scope.locator().location_id().into_uuid(),
-            location_revision: scope.locator().expected_revision().get(),
-            locator: scope.locator().encode(),
-        })
+        {
+            return Ok(workspace_scope_wire(scope));
+        }
+        Ok(candidate.clone())
     }
 
     fn trusted_scope(
         &self,
         request: &crate::wire::WorkspaceQueryScope,
-    ) -> Result<&ResolvedWorkspaceScope, CoordinatorAuthorityError> {
-        let expected = self
-            .scopes
-            .iter()
-            .find(|scope| scope.workspace_id().into_uuid() == request.workspace_id)
-            .ok_or(CoordinatorAuthorityError::Unavailable)?;
+    ) -> Result<ResolvedWorkspaceScope, CoordinatorAuthorityError> {
+        let expected = self.trusted_workspace_scope(request.workspace_id)?;
         let locator = expected.locator();
         if locator.location_id().into_uuid() != request.location_id
             || locator.expected_revision().get() != request.location_revision
@@ -258,6 +516,27 @@ impl CoordinatorAuthority {
             return Err(CoordinatorAuthorityError::Stale);
         }
         Ok(expected)
+    }
+
+    fn trusted_workspace_scope(
+        &self,
+        workspace_id: uuid::Uuid,
+    ) -> Result<ResolvedWorkspaceScope, CoordinatorAuthorityError> {
+        let projection = self
+            .enrolled_scopes
+            .read()
+            .map_err(|_| CoordinatorAuthorityError::Unavailable)?;
+        if projection.uncertain.contains(&workspace_id) {
+            return Err(CoordinatorAuthorityError::Unavailable);
+        }
+        if let Some(enrollment) = projection.enrolled.get(&workspace_id) {
+            return Ok(enrollment.scope.clone());
+        }
+        self.scopes
+            .iter()
+            .find(|scope| scope.workspace_id().into_uuid() == workspace_id)
+            .cloned()
+            .ok_or(CoordinatorAuthorityError::Unavailable)
     }
 
     /// Validate one caller-supplied scope against the exact host-configured
@@ -278,8 +557,9 @@ impl CoordinatorAuthority {
         match &self.transport {
             SourceTransport::Http(client) => {
                 let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
                 client
-                    .coordinator(self.trusted_scope(&scope)?, activity_id)
+                    .coordinator(&trusted, activity_id)
                     .await
                     .map_err(map_source_error)
             }
@@ -320,8 +600,9 @@ impl CoordinatorAuthority {
         match &self.transport {
             SourceTransport::Http(client) => {
                 let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
                 client
-                    .node_assignment(self.trusted_scope(&scope)?, requested)
+                    .node_assignment(&trusted, requested)
                     .await
                     .map_err(map_source_error)
             }
@@ -346,14 +627,68 @@ impl CoordinatorAuthority {
         match &self.transport {
             SourceTransport::Http(client) => {
                 let _permit = permit;
+                let trusted = self.trusted_scope(&request)?;
                 client
-                    .resolve_workspace(self.trusted_scope(&request)?)
+                    .resolve_workspace(&trusted)
                     .await
                     .map_err(map_source_error)
             }
             SourceTransport::Control { .. } => {
                 let authority = self.clone();
                 control_job(permit, move || authority.resolve_workspace(&request)).await
+            }
+        }
+    }
+
+    /// Prove one exact current Forge Workspace candidate without requiring a
+    /// prior static or dynamic enrollment row. This grants no work permission.
+    pub(crate) async fn check_workspace_candidate(
+        &self,
+        request: crate::wire::WorkspaceQueryScope,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<ResolvedWorkspaceScope, CoordinatorAuthorityError> {
+        let expected = workspace_scope_from_wire(&request)?;
+        match &self.transport {
+            SourceTransport::Http(client) => {
+                let _permit = permit;
+                let locator = expected.locator();
+                let relative_root = locator
+                    .relative_root()
+                    .to_str()
+                    .ok_or(CoordinatorAuthorityError::Stale)?;
+                let resolution = client
+                    .resolve_workspace_identity(
+                        locator.location_id(),
+                        locator.expected_revision(),
+                        relative_root,
+                    )
+                    .await
+                    .map_err(map_source_error)?;
+                if resolution.workspace_id() != request.workspace_id
+                    || resolution.workspace_revision() != request.workspace_revision
+                {
+                    return Err(CoordinatorAuthorityError::Stale);
+                }
+                Ok(expected)
+            }
+            SourceTransport::Control { .. } => {
+                let authority = self.clone();
+                control_job(permit, move || {
+                    let locator = expected.locator();
+                    let resolved = authority
+                        .control()?
+                        .resolve_workspace(
+                            locator.location_id(),
+                            locator.expected_revision(),
+                            locator.clone(),
+                        )
+                        .map_err(map_control_error)?;
+                    if resolved != expected {
+                        return Err(CoordinatorAuthorityError::Stale);
+                    }
+                    Ok(resolved)
+                })
+                .await
             }
         }
     }
@@ -372,11 +707,11 @@ impl CoordinatorAuthority {
                 let _permit = permit;
                 let expected = self.trusted_scope(&request)?;
                 client
-                    .resolve_workspace(expected)
+                    .resolve_workspace(&expected)
                     .await
                     .map_err(map_source_error)?;
                 match client
-                    .activity(expected, activity)
+                    .activity(&expected, activity)
                     .await
                     .map_err(map_source_error)?
                 {
@@ -407,13 +742,9 @@ impl CoordinatorAuthority {
         match &self.transport {
             SourceTransport::Http(client) => {
                 let _permit = permit;
-                let scope = self
-                    .scopes
-                    .iter()
-                    .find(|scope| scope.workspace_id().into_uuid() == command.workspace_id)
-                    .ok_or(CoordinatorAuthorityError::Unavailable)?;
+                let scope = self.trusted_workspace_scope(command.workspace_id)?;
                 let actor = client
-                    .coordinator_actor(scope, command.activity_id, principal)
+                    .coordinator_actor(&scope, command.activity_id, principal)
                     .await
                     .map_err(map_source_error)?
                     .ok_or(CoordinatorAuthorityError::Denied)?;
@@ -515,12 +846,7 @@ impl CoordinatorAuthority {
         command: &AgentRequestSubmit,
         principal: AuthenticatedPrincipal,
     ) -> Result<ActivityCoordinatorActor, CoordinatorAuthorityError> {
-        let scope = self
-            .scopes
-            .iter()
-            .find(|scope| scope.workspace_id().into_uuid() == command.workspace_id)
-            .cloned()
-            .ok_or(CoordinatorAuthorityError::Unavailable)?;
+        let scope = self.trusted_workspace_scope(command.workspace_id)?;
         let activity_id = ActivityId::from_uuid(command.activity_id);
         let actor = self
             .control()?
@@ -557,7 +883,7 @@ fn validate_actor(
 }
 
 fn validate_scopes(scopes: &[ResolvedWorkspaceScope]) -> Result<(), CoordinatorAuthorityError> {
-    if scopes.len() > MAX_SCOPES {
+    if scopes.len() > MAX_WORKSPACE_AUTHORITY_SCOPES {
         return Err(CoordinatorAuthorityError::Unavailable);
     }
     let mut workspace_ids = Vec::with_capacity(scopes.len());
@@ -572,6 +898,51 @@ fn validate_scopes(scopes: &[ResolvedWorkspaceScope]) -> Result<(), CoordinatorA
         workspace_ids.push(workspace);
     }
     Ok(())
+}
+
+fn workspace_scope_wire(scope: &ResolvedWorkspaceScope) -> crate::wire::WorkspaceQueryScope {
+    crate::wire::WorkspaceQueryScope {
+        workspace_id: scope.workspace_id().into_uuid(),
+        workspace_revision: scope.workspace_revision().get(),
+        location_id: scope.locator().location_id().into_uuid(),
+        location_revision: scope.locator().expected_revision().get(),
+        locator: scope.locator().encode(),
+    }
+}
+
+fn resolved_workspace_scope(
+    scope: &WorkspaceProjectScope,
+) -> Result<ResolvedWorkspaceScope, CoordinatorAuthorityError> {
+    if scope.workspace_id().is_nil()
+        || scope.location_id().is_nil()
+        || scope.location_revision() <= 0
+        || scope.workspace_revision() <= 0
+    {
+        return Err(CoordinatorAuthorityError::Stale);
+    }
+    let locator =
+        WorkspaceLocator::decode(scope.locator()).map_err(|_| CoordinatorAuthorityError::Stale)?;
+    if locator.encode() != scope.locator()
+        || locator.location_id().into_uuid() != scope.location_id()
+        || locator.expected_revision().get() != scope.location_revision()
+    {
+        return Err(CoordinatorAuthorityError::Stale);
+    }
+    let workspace_revision = WorkspaceRevision::new(scope.workspace_revision())
+        .map_err(|_| CoordinatorAuthorityError::Stale)?;
+    Ok(ResolvedWorkspaceScope::from_observation(
+        WorkspaceId::from_uuid(scope.workspace_id()),
+        workspace_revision,
+        locator,
+    ))
+}
+
+fn workspace_scope_from_wire(
+    request: &crate::wire::WorkspaceQueryScope,
+) -> Result<ResolvedWorkspaceScope, CoordinatorAuthorityError> {
+    let scope =
+        WorkspaceProjectScope::try_from(request).map_err(|_| CoordinatorAuthorityError::Stale)?;
+    resolved_workspace_scope(&scope)
 }
 
 async fn control_job<T, F>(
@@ -691,6 +1062,87 @@ fn map_control_service(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_control::WorkspaceLocator;
+    use forge_domain::{LocationId, LocationRevision, WorkspaceId, WorkspaceRevision};
+    use std::path::Path;
+
+    fn workspace_scope(
+        workspace_id: u128,
+        location_id: u128,
+        workspace_revision: i64,
+        relative_root: &str,
+    ) -> Result<ResolvedWorkspaceScope, Box<dyn std::error::Error>> {
+        Ok(ResolvedWorkspaceScope::from_observation(
+            WorkspaceId::from_uuid(uuid::Uuid::from_u128(workspace_id)),
+            WorkspaceRevision::new(workspace_revision)?,
+            WorkspaceLocator::new(
+                LocationId::from_uuid(uuid::Uuid::from_u128(location_id)),
+                LocationRevision::new(1)?,
+                Path::new(relative_root),
+            )?,
+        ))
+    }
+
+    fn authority(
+        static_scope: ResolvedWorkspaceScope,
+    ) -> Result<CoordinatorAuthority, Box<dyn std::error::Error>> {
+        let commands = crate::forge_commands::ForgeCommandHttpClient::new(
+            "127.0.0.1:55221".parse()?,
+            "projection-test-secret",
+            std::time::Duration::from_secs(1),
+        )?;
+        Ok(CoordinatorAuthority::from_http(
+            crate::forge_source::ForgeSourceHttpClient::new(commands),
+            vec![static_scope],
+        )?)
+    }
+
+    #[test]
+    fn enrollment_projection_is_shared_ordered_and_never_falls_back_when_uncertain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let static_scope = workspace_scope(0xA201, 0xA202, 1, "static")?;
+        let first_enrollment = workspace_scope(0xA201, 0xA202, 2, "enrolled-v1")?;
+        let current_enrollment = workspace_scope(0xA201, 0xA202, 3, "enrolled-v2")?;
+        let authority = authority(static_scope.clone())?;
+        authority.hydrate_workspace_project_enrollments(&[])?;
+        assert!(authority.workspace_authorized(&static_scope)?);
+
+        let cloned_authority = authority.clone();
+        assert!(cloned_authority.publish_workspace_project_enrollment(
+            &first_enrollment,
+            WorkspaceProjectBindingRevision::new(1)?,
+        ));
+        assert!(authority.workspace_authorized(&first_enrollment)?);
+        assert!(!authority.workspace_authorized(&static_scope)?);
+
+        assert!(cloned_authority.publish_workspace_project_enrollment(
+            &current_enrollment,
+            WorkspaceProjectBindingRevision::new(2)?,
+        ));
+        assert!(!authority.workspace_authorized(&first_enrollment)?);
+        assert!(authority.workspace_authorized(&current_enrollment)?);
+        assert!(!authority.publish_workspace_project_enrollment(
+            &first_enrollment,
+            WorkspaceProjectBindingRevision::new(1)?,
+        ));
+        assert_eq!(
+            authority.workspace_reference(current_enrollment.workspace_id().into_uuid())?,
+            workspace_scope_wire(&current_enrollment)
+        );
+
+        authority.mark_workspace_project_projection_unavailable(
+            current_enrollment.workspace_id().into_uuid(),
+        );
+        assert_eq!(
+            authority.workspace_authorized(&static_scope),
+            Err(CoordinatorAuthorityError::Unavailable)
+        );
+        assert_eq!(
+            authority.workspace_reference(static_scope.workspace_id().into_uuid()),
+            Err(CoordinatorAuthorityError::Unavailable)
+        );
+        Ok(())
+    }
 
     #[test]
     fn uncertain_control_rejections_never_become_known_denials() {

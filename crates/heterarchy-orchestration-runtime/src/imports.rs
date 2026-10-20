@@ -5,7 +5,8 @@
 //! I/O while holding its catalog lock.
 
 use heterarchy_orchestration_operations::{
-    AgentOperationsExportPage, AgentOperationsFreeze, ImportProgress, ImportVerificationTarget,
+    AgentOperationsExportPage, AgentOperationsFreeze, CurrentImportHandoff, ImportHandoffSeal,
+    ImportHandoffSealCommand, ImportProgress, ImportVerificationTarget,
 };
 use uuid::Uuid;
 
@@ -128,6 +129,50 @@ impl OrchestrationRuntime {
         let mut catalog = self.catalog()?;
         catalog
             .abort_import_expected(migration, expected)
+            .map_err(Into::into)
+    }
+
+    /// Seal one verified import and capture the current configured issuer/backend.
+    ///
+    /// # Errors
+    /// Returns stale identity/digest expectations, incomplete verification,
+    /// catalog ownership, or uncertain commit failures.
+    pub fn import_handoff_seal(
+        &self,
+        command: &ImportHandoffSealCommand,
+    ) -> Result<ImportHandoffSeal, RuntimeError> {
+        let mut catalog = self.catalog()?;
+        catalog.seal_import_handoff(command).map_err(Into::into)
+    }
+
+    /// Read the exact optional Source handoff proof without contacting Forge.
+    ///
+    /// # Errors
+    /// Returns mismatched target, corrupt proof, or catalog ownership failures.
+    pub fn import_handoff_seal_readback(
+        &self,
+        migration: Uuid,
+        workspace: Uuid,
+        destination: Uuid,
+    ) -> Result<Option<ImportHandoffSeal>, RuntimeError> {
+        let catalog = self.catalog()?;
+        catalog
+            .import_handoff_seal(migration, workspace, destination)
+            .map_err(Into::into)
+    }
+
+    /// Read the current non-aborted import and optional seal for one Workspace.
+    ///
+    /// # Errors
+    /// Returns destination ownership conflicts, corrupt rows, or catalog errors.
+    pub fn current_import_handoff(
+        &self,
+        workspace: Uuid,
+        destination: Uuid,
+    ) -> Result<CurrentImportHandoff, RuntimeError> {
+        let catalog = self.catalog()?;
+        catalog
+            .current_import_handoff(workspace, destination)
             .map_err(Into::into)
     }
 }

@@ -1,6 +1,6 @@
 use std::env;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use forge_domain::{AuthenticatedPrincipal, DirectTokenId, ForgeBackendId, OrchestrationIssuerId};
 use heterarchy_orchestration_auth::McpTokenBootstrapMode;
@@ -21,6 +21,8 @@ const FORGE_SOURCE_CONFIG_ENV: &str = "HETERARCHY_ORCHESTRATION_FORGE_SOURCE_CON
 const ADMISSION_ISSUER_ID_ENV: &str = "HETERARCHY_ORCHESTRATION_ADMISSION_ISSUER_ID";
 const ADMISSION_BACKEND_ID_ENV: &str = "HETERARCHY_ORCHESTRATION_ADMISSION_BACKEND_ID";
 const ADMISSION_TTL_MS_ENV: &str = "HETERARCHY_ORCHESTRATION_ADMISSION_TTL_MS";
+const BINDING_REJECTION_TRUST_MANIFEST_ENV: &str =
+    "HETERARCHY_ORCHESTRATION_BINDING_REJECTION_TRUST_MANIFEST";
 
 #[tokio::main]
 async fn main() -> Result<(), MainError> {
@@ -87,7 +89,7 @@ async fn main() -> Result<(), MainError> {
         .unwrap_or_else(|_| DEFAULT_LISTEN.to_owned())
         .parse::<SocketAddr>()
         .map_err(|_| MainError::InvalidListen)?;
-    let mut config = BackendConfig::new(listen, data_root)?;
+    let mut config = BackendConfig::new(listen, data_root.clone())?;
     if let Some(admission_issuer) = parse_admission_issuer_config()? {
         config = config.with_admission_issuer(admission_issuer);
     }
@@ -95,6 +97,7 @@ async fn main() -> Result<(), MainError> {
         let raw = raw.to_str().ok_or(MainError::InvalidOperatorPolicy)?;
         config = config.with_operator_policy(parse_operator_policy(raw)?);
     }
+    config = with_binding_rejection_trust(config, &data_root)?;
     // Default policy requires an already-initialized app-global token
     // authority; first-run bootstrapping is an explicit operator decision.
     if env::var(TOKEN_BOOTSTRAP_ENV).as_deref() == Ok("initialize") {
@@ -129,6 +132,21 @@ async fn main() -> Result<(), MainError> {
     }
 }
 
+fn with_binding_rejection_trust(
+    config: BackendConfig,
+    data_root: &Path,
+) -> Result<BackendConfig, MainError> {
+    let Some(path) = env::var_os(BINDING_REJECTION_TRUST_MANIFEST_ENV) else {
+        return Ok(config);
+    };
+    let deployments = heterarchy_orchestration_backend::binding_rejection_trust::load(
+        &PathBuf::from(path),
+        data_root,
+    )
+    .map_err(|_| MainError::InvalidBindingRejectionTrustManifest)?;
+    Ok(config.with_trusted_binding_rejection_legacy_deployments(deployments))
+}
+
 fn print_usage() {
     println!("usage: heterarchy-orchestration-backend [--version | --help]");
     println!(
@@ -152,6 +170,9 @@ fn print_usage() {
     );
     println!(
         "  HETERARCHY_ORCHESTRATION_FORGE_SOURCE_CONFIG: host-trusted Forge source config path"
+    );
+    println!(
+        "  HETERARCHY_ORCHESTRATION_BINDING_REJECTION_TRUST_MANIFEST: sealed legacy deployment allowlist path"
     );
     println!(
         "  HETERARCHY_ORCHESTRATION_ADMISSION_ISSUER_ID: explicit Forge admission issuer UUID"
@@ -270,6 +291,8 @@ enum MainError {
     InvalidAdmissionIssuer,
     #[error("HETERARCHY_ORCHESTRATION_FORGE_SOURCE_CONFIG is invalid or unavailable")]
     InvalidForgeSource,
+    #[error("HETERARCHY_ORCHESTRATION_BINDING_REJECTION_TRUST_MANIFEST is invalid or unavailable")]
+    InvalidBindingRejectionTrustManifest,
     #[error("structured tracing initialization failed")]
     Tracing,
     #[error("signal handling failed")]

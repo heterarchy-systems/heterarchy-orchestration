@@ -26,6 +26,7 @@ use uuid::Uuid;
 use crate::BackendState;
 use crate::RealtimeEventKind;
 use crate::app_support::{LaneError, now_millis};
+use crate::wire::workspace_project::ProviderProjectReferenceWire;
 
 /// Provisioning routes; merge before the router takes its state.
 pub(crate) fn routes() -> Router<BackendState> {
@@ -203,7 +204,7 @@ async fn submit(
                 Some(
                     runtime
                         .agent_request_resolution(summary.request_id)?
-                        .ok_or(crate::RuntimeError::Persistence(
+                        .ok_or(crate::RuntimeError::persistence(
                             heterarchy_orchestration_operations::OperationsError::Corrupt(
                                 "reserved AgentRequest is missing resolver rows",
                             ),
@@ -337,7 +338,7 @@ async fn resolution(
                 return Ok(None);
             };
             let scope = Uuid::parse_str(&request.workspace_id).map_err(|_| {
-                heterarchy_orchestration_runtime::RuntimeError::Persistence(
+                heterarchy_orchestration_runtime::RuntimeError::persistence(
                     heterarchy_orchestration_operations::OperationsError::Corrupt(
                         "request Workspace identity",
                     ),
@@ -393,7 +394,7 @@ async fn prepare_targets(
                 .agent_request(request_id)?
                 .ok_or(crate::RuntimeError::NotFound)?;
             let workspace_id = Uuid::parse_str(&request.workspace_id).map_err(|_| {
-                crate::RuntimeError::Persistence(
+                crate::RuntimeError::persistence(
                     heterarchy_orchestration_operations::OperationsError::Corrupt(
                         "request Workspace identity",
                     ),
@@ -444,7 +445,7 @@ async fn prepared_targets(
                 return Ok(None);
             };
             let scope = Uuid::parse_str(&request.workspace_id).map_err(|_| {
-                crate::RuntimeError::Persistence(
+                crate::RuntimeError::persistence(
                     heterarchy_orchestration_operations::OperationsError::Corrupt(
                         "request Workspace identity",
                     ),
@@ -476,6 +477,8 @@ struct ProvisionOperationWire {
     created: bool,
     revision: u64,
     changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<ProviderProjectReferenceWire>,
 }
 
 impl ProvisionOperationWire {
@@ -491,6 +494,7 @@ impl ProvisionOperationWire {
             created: operation.created,
             revision: operation.revision,
             changed: operation.changed,
+            project: operation.project.map(ProviderProjectReferenceWire::from),
         }
     }
 }

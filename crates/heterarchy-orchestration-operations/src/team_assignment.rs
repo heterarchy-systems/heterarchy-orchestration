@@ -8,7 +8,7 @@
 
 use crate::{
     NodeTeamBinding, NodeTeamBindingScope, OperationsCatalog, OperationsError,
-    WorkspaceParticipationId, effect_binding, operational_actor::ResolvedOperationalActor, wire,
+    WorkspaceParticipationId, operational_actor::ResolvedOperationalActor, wire,
 };
 use forge_domain::{
     ActivityId, AgentAssignmentId, AgentAssignmentState, AgentInstanceId, AgentSessionId,
@@ -25,7 +25,8 @@ pub const MAX_ORIGINAL_OFFER_PAYLOAD_BYTES: usize = 16 * 1024;
 pub const MAX_ASSIGNMENT_AFFINITY_RESERVATION_PAGE_SIZE: u32 = 32;
 
 const ASSIGNMENT_AFFINITY_V35_SQL: &str = "CREATE TABLE ops_assignment_team_affinities (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16 AND workspace_id != zeroblob(16)), assignment_id BLOB NOT NULL CHECK(length(assignment_id)=16 AND assignment_id != zeroblob(16)), activity_id BLOB NOT NULL CHECK(length(activity_id)=16 AND activity_id != zeroblob(16)), target_agent_id BLOB NOT NULL CHECK(length(target_agent_id)=16 AND target_agent_id != zeroblob(16)), target_session_id BLOB NOT NULL CHECK(length(target_session_id)=16 AND target_session_id != zeroblob(16)), target_participation_id BLOB NOT NULL CHECK(length(target_participation_id)=16 AND target_participation_id != zeroblob(16)), target_participant_id BLOB NOT NULL CHECK(length(target_participant_id)=16 AND target_participant_id != zeroblob(16)), team_id BLOB CHECK(team_id IS NULL OR (length(team_id)=16 AND team_id != zeroblob(16))), team_membership_revision INTEGER CHECK(team_membership_revision IS NULL OR team_membership_revision>=1), requester_activity_id BLOB CHECK(requester_activity_id IS NULL OR (length(requester_activity_id)=16 AND requester_activity_id != zeroblob(16))), requester_agent_id BLOB CHECK(requester_agent_id IS NULL OR (length(requester_agent_id)=16 AND requester_agent_id != zeroblob(16))), requester_session_id BLOB CHECK(requester_session_id IS NULL OR (length(requester_session_id)=16 AND requester_session_id != zeroblob(16))), requester_participation_id BLOB CHECK(requester_participation_id IS NULL OR (length(requester_participation_id)=16 AND requester_participation_id != zeroblob(16))), requester_profile_id BLOB CHECK(requester_profile_id IS NULL OR (length(requester_profile_id)=16 AND requester_profile_id != zeroblob(16))), requester_participant_id BLOB CHECK(requester_participant_id IS NULL OR (length(requester_participant_id)=16 AND requester_participant_id != zeroblob(16))), requester_key TEXT NOT NULL CHECK(length(CAST(requester_key AS BLOB)) BETWEEN 1 AND 256), requester_display_name TEXT NOT NULL CHECK(length(CAST(requester_display_name AS BLOB)) BETWEEN 1 AND 128), assignment_payload_fingerprint BLOB NOT NULL CHECK(length(assignment_payload_fingerprint)=32), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0), PRIMARY KEY(workspace_id,assignment_id), CHECK((team_id IS NULL AND team_membership_revision IS NULL) OR (team_id IS NOT NULL AND team_membership_revision IS NOT NULL)), CHECK((requester_activity_id IS NULL AND requester_agent_id IS NULL AND requester_session_id IS NULL AND requester_participation_id IS NULL AND requester_profile_id IS NULL AND requester_participant_id IS NULL) OR (requester_activity_id IS NOT NULL AND requester_agent_id IS NOT NULL AND requester_session_id IS NOT NULL AND requester_participation_id IS NOT NULL AND requester_profile_id IS NOT NULL AND requester_participant_id IS NOT NULL)))";
-const ASSIGNMENT_AFFINITY_SQL: &str = "CREATE TABLE ops_assignment_team_affinities (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16 AND workspace_id != zeroblob(16)), assignment_id BLOB NOT NULL CHECK(length(assignment_id)=16 AND assignment_id != zeroblob(16)), activity_id BLOB NOT NULL CHECK(length(activity_id)=16 AND activity_id != zeroblob(16)), target_agent_id BLOB NOT NULL CHECK(length(target_agent_id)=16 AND target_agent_id != zeroblob(16)), target_session_id BLOB NOT NULL CHECK(length(target_session_id)=16 AND target_session_id != zeroblob(16)), target_participation_id BLOB NOT NULL CHECK(length(target_participation_id)=16 AND target_participation_id != zeroblob(16)), target_participant_id BLOB NOT NULL CHECK(length(target_participant_id)=16 AND target_participant_id != zeroblob(16)), team_id BLOB CHECK(team_id IS NULL OR (length(team_id)=16 AND team_id != zeroblob(16))), team_membership_revision INTEGER CHECK(team_membership_revision IS NULL OR team_membership_revision>=1), requester_activity_id BLOB CHECK(requester_activity_id IS NULL OR (length(requester_activity_id)=16 AND requester_activity_id != zeroblob(16))), requester_agent_id BLOB CHECK(requester_agent_id IS NULL OR (length(requester_agent_id)=16 AND requester_agent_id != zeroblob(16))), requester_session_id BLOB CHECK(requester_session_id IS NULL OR (length(requester_session_id)=16 AND requester_session_id != zeroblob(16))), requester_participation_id BLOB CHECK(requester_participation_id IS NULL OR (length(requester_participation_id)=16 AND requester_participation_id != zeroblob(16))), requester_profile_id BLOB CHECK(requester_profile_id IS NULL OR (length(requester_profile_id)=16 AND requester_profile_id != zeroblob(16))), requester_participant_id BLOB CHECK(requester_participant_id IS NULL OR (length(requester_participant_id)=16 AND requester_participant_id != zeroblob(16))), requester_key TEXT NOT NULL CHECK(length(CAST(requester_key AS BLOB)) BETWEEN 1 AND 256), requester_display_name TEXT NOT NULL CHECK(length(CAST(requester_display_name AS BLOB)) BETWEEN 1 AND 128), assignment_payload_fingerprint BLOB NOT NULL CHECK(length(assignment_payload_fingerprint)=32), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0), node_goal_id BLOB CHECK(node_goal_id IS NULL OR (length(node_goal_id)=16 AND node_goal_id != zeroblob(16))), goal_created_at_ms INTEGER CHECK(goal_created_at_ms IS NULL OR goal_created_at_ms>=0), node_dag_revision INTEGER CHECK(node_dag_revision IS NULL OR node_dag_revision>=1), node_dag_base_goal_revision INTEGER CHECK(node_dag_base_goal_revision IS NULL OR node_dag_base_goal_revision>=1), node_id BLOB CHECK(node_id IS NULL OR (length(node_id)=16 AND node_id != zeroblob(16))), node_binding_revision INTEGER CHECK(node_binding_revision IS NULL OR node_binding_revision>=1), disposition TEXT NOT NULL CHECK(disposition IN('PENDING','ACTIVE','TERMINAL','QUIESCED','LEGACY_UNKNOWN','LEGACY_QUIESCED')), original_offer_payload BLOB CHECK(original_offer_payload IS NULL OR length(original_offer_payload) BETWEEN 1 AND 16384), seal_sealed_at_ms INTEGER CHECK(seal_sealed_at_ms IS NULL OR seal_sealed_at_ms>=0), seal_applied_at_ms INTEGER CHECK(seal_applied_at_ms IS NULL OR seal_applied_at_ms>=0), seal_authority_kind TEXT CHECK(seal_authority_kind IS NULL OR seal_authority_kind IN('LOCAL_OPERATOR','COORDINATOR')), seal_authority_agent_id BLOB CHECK(seal_authority_agent_id IS NULL OR (length(seal_authority_agent_id)=16 AND seal_authority_agent_id != zeroblob(16))), seal_authority_session_id BLOB CHECK(seal_authority_session_id IS NULL OR (length(seal_authority_session_id)=16 AND seal_authority_session_id != zeroblob(16))), seal_authority_revision INTEGER CHECK(seal_authority_revision IS NULL OR seal_authority_revision>=1), seal_observation_kind TEXT CHECK(seal_observation_kind IS NULL OR seal_observation_kind IN('ABSENT_NOW_SEALED','FOREIGN_ACTIVITY','LEGACY_TERMINAL_SAME_ACTIVITY')), seal_current_activity_id BLOB CHECK(seal_current_activity_id IS NULL OR (length(seal_current_activity_id)=16 AND seal_current_activity_id != zeroblob(16))), seal_current_state TEXT CHECK(seal_current_state IS NULL OR seal_current_state IN('OFFERED','RUNNING','SUBMITTED','ACCEPTED','REJECTED','CANCELLED','INTERRUPTED')), seal_current_revision INTEGER CHECK(seal_current_revision IS NULL OR seal_current_revision>=1), PRIMARY KEY(workspace_id,assignment_id), CHECK((team_id IS NULL AND team_membership_revision IS NULL) OR (team_id IS NOT NULL AND team_membership_revision IS NOT NULL)), CHECK((requester_activity_id IS NULL AND requester_agent_id IS NULL AND requester_session_id IS NULL AND requester_participation_id IS NULL AND requester_profile_id IS NULL AND requester_participant_id IS NULL) OR (requester_activity_id IS NOT NULL AND requester_agent_id IS NOT NULL AND requester_session_id IS NOT NULL AND requester_participation_id IS NOT NULL AND requester_profile_id IS NOT NULL AND requester_participant_id IS NOT NULL)), CHECK((disposition IN('LEGACY_UNKNOWN','LEGACY_QUIESCED') AND node_goal_id IS NULL AND goal_created_at_ms IS NULL AND node_dag_revision IS NULL AND node_dag_base_goal_revision IS NULL AND node_id IS NULL AND node_binding_revision IS NULL) OR (disposition IN('PENDING','ACTIVE','TERMINAL','QUIESCED') AND node_goal_id IS NOT NULL AND goal_created_at_ms IS NOT NULL AND node_dag_revision IS NOT NULL AND node_dag_base_goal_revision IS NOT NULL AND node_id IS NOT NULL)), CHECK((disposition IN('LEGACY_UNKNOWN','LEGACY_QUIESCED') AND original_offer_payload IS NULL) OR (disposition IN('PENDING','ACTIVE','TERMINAL','QUIESCED') AND original_offer_payload IS NOT NULL)), CHECK((seal_sealed_at_ms IS NULL AND seal_applied_at_ms IS NULL AND seal_authority_kind IS NULL AND seal_authority_agent_id IS NULL AND seal_authority_session_id IS NULL AND seal_authority_revision IS NULL AND seal_observation_kind IS NULL AND seal_current_activity_id IS NULL AND seal_current_state IS NULL AND seal_current_revision IS NULL) OR (disposition IN('QUIESCED','LEGACY_QUIESCED') AND seal_sealed_at_ms IS NOT NULL AND seal_applied_at_ms IS NOT NULL AND seal_authority_kind IS NOT NULL AND seal_observation_kind IS NOT NULL)), CHECK((seal_authority_kind IS NULL AND seal_authority_agent_id IS NULL AND seal_authority_session_id IS NULL AND seal_authority_revision IS NULL) OR (seal_authority_kind='LOCAL_OPERATOR' AND seal_authority_agent_id IS NULL AND seal_authority_session_id IS NULL AND seal_authority_revision IS NULL) OR (seal_authority_kind='COORDINATOR' AND seal_authority_agent_id IS NOT NULL AND seal_authority_session_id IS NOT NULL AND seal_authority_revision IS NOT NULL)), CHECK((seal_observation_kind IS NULL AND seal_current_activity_id IS NULL AND seal_current_state IS NULL AND seal_current_revision IS NULL) OR (seal_observation_kind='ABSENT_NOW_SEALED' AND seal_current_activity_id IS NULL AND seal_current_state IS NULL AND seal_current_revision IS NULL) OR (seal_observation_kind IN('FOREIGN_ACTIVITY','LEGACY_TERMINAL_SAME_ACTIVITY') AND seal_current_activity_id IS NOT NULL AND seal_current_state IS NOT NULL AND seal_current_revision IS NOT NULL)))";
+const ASSIGNMENT_AFFINITY_V47_SQL: &str = "CREATE TABLE ops_assignment_team_affinities (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16 AND workspace_id != zeroblob(16)), assignment_id BLOB NOT NULL CHECK(length(assignment_id)=16 AND assignment_id != zeroblob(16)), activity_id BLOB NOT NULL CHECK(length(activity_id)=16 AND activity_id != zeroblob(16)), target_agent_id BLOB NOT NULL CHECK(length(target_agent_id)=16 AND target_agent_id != zeroblob(16)), target_session_id BLOB NOT NULL CHECK(length(target_session_id)=16 AND target_session_id != zeroblob(16)), target_participation_id BLOB NOT NULL CHECK(length(target_participation_id)=16 AND target_participation_id != zeroblob(16)), target_participant_id BLOB NOT NULL CHECK(length(target_participant_id)=16 AND target_participant_id != zeroblob(16)), team_id BLOB CHECK(team_id IS NULL OR (length(team_id)=16 AND team_id != zeroblob(16))), team_membership_revision INTEGER CHECK(team_membership_revision IS NULL OR team_membership_revision>=1), requester_activity_id BLOB CHECK(requester_activity_id IS NULL OR (length(requester_activity_id)=16 AND requester_activity_id != zeroblob(16))), requester_agent_id BLOB CHECK(requester_agent_id IS NULL OR (length(requester_agent_id)=16 AND requester_agent_id != zeroblob(16))), requester_session_id BLOB CHECK(requester_session_id IS NULL OR (length(requester_session_id)=16 AND requester_session_id != zeroblob(16))), requester_participation_id BLOB CHECK(requester_participation_id IS NULL OR (length(requester_participation_id)=16 AND requester_participation_id != zeroblob(16))), requester_profile_id BLOB CHECK(requester_profile_id IS NULL OR (length(requester_profile_id)=16 AND requester_profile_id != zeroblob(16))), requester_participant_id BLOB CHECK(requester_participant_id IS NULL OR (length(requester_participant_id)=16 AND requester_participant_id != zeroblob(16))), requester_key TEXT NOT NULL CHECK(length(CAST(requester_key AS BLOB)) BETWEEN 1 AND 256), requester_display_name TEXT NOT NULL CHECK(length(CAST(requester_display_name AS BLOB)) BETWEEN 1 AND 128), assignment_payload_fingerprint BLOB NOT NULL CHECK(length(assignment_payload_fingerprint)=32), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0), node_goal_id BLOB CHECK(node_goal_id IS NULL OR (length(node_goal_id)=16 AND node_goal_id != zeroblob(16))), goal_created_at_ms INTEGER CHECK(goal_created_at_ms IS NULL OR goal_created_at_ms>=0), node_dag_revision INTEGER CHECK(node_dag_revision IS NULL OR node_dag_revision>=1), node_dag_base_goal_revision INTEGER CHECK(node_dag_base_goal_revision IS NULL OR node_dag_base_goal_revision>=1), node_id BLOB CHECK(node_id IS NULL OR (length(node_id)=16 AND node_id != zeroblob(16))), node_binding_revision INTEGER CHECK(node_binding_revision IS NULL OR node_binding_revision>=1), disposition TEXT NOT NULL CHECK(disposition IN('PENDING','ACTIVE','TERMINAL','QUIESCED','LEGACY_UNKNOWN','LEGACY_QUIESCED')), original_offer_payload BLOB CHECK(original_offer_payload IS NULL OR length(original_offer_payload) BETWEEN 1 AND 16384), seal_sealed_at_ms INTEGER CHECK(seal_sealed_at_ms IS NULL OR seal_sealed_at_ms>=0), seal_applied_at_ms INTEGER CHECK(seal_applied_at_ms IS NULL OR seal_applied_at_ms>=0), seal_authority_kind TEXT CHECK(seal_authority_kind IS NULL OR seal_authority_kind IN('LOCAL_OPERATOR','COORDINATOR')), seal_authority_agent_id BLOB CHECK(seal_authority_agent_id IS NULL OR (length(seal_authority_agent_id)=16 AND seal_authority_agent_id != zeroblob(16))), seal_authority_session_id BLOB CHECK(seal_authority_session_id IS NULL OR (length(seal_authority_session_id)=16 AND seal_authority_session_id != zeroblob(16))), seal_authority_revision INTEGER CHECK(seal_authority_revision IS NULL OR seal_authority_revision>=1), seal_observation_kind TEXT CHECK(seal_observation_kind IS NULL OR seal_observation_kind IN('ABSENT_NOW_SEALED','FOREIGN_ACTIVITY','LEGACY_TERMINAL_SAME_ACTIVITY')), seal_current_activity_id BLOB CHECK(seal_current_activity_id IS NULL OR (length(seal_current_activity_id)=16 AND seal_current_activity_id != zeroblob(16))), seal_current_state TEXT CHECK(seal_current_state IS NULL OR seal_current_state IN('OFFERED','RUNNING','SUBMITTED','ACCEPTED','REJECTED','CANCELLED','INTERRUPTED')), seal_current_revision INTEGER CHECK(seal_current_revision IS NULL OR seal_current_revision>=1), PRIMARY KEY(workspace_id,assignment_id), CHECK((team_id IS NULL AND team_membership_revision IS NULL) OR (team_id IS NOT NULL AND team_membership_revision IS NOT NULL)), CHECK((requester_activity_id IS NULL AND requester_agent_id IS NULL AND requester_session_id IS NULL AND requester_participation_id IS NULL AND requester_profile_id IS NULL AND requester_participant_id IS NULL) OR (requester_activity_id IS NOT NULL AND requester_agent_id IS NOT NULL AND requester_session_id IS NOT NULL AND requester_participation_id IS NOT NULL AND requester_profile_id IS NOT NULL AND requester_participant_id IS NOT NULL)), CHECK((disposition IN('LEGACY_UNKNOWN','LEGACY_QUIESCED') AND node_goal_id IS NULL AND goal_created_at_ms IS NULL AND node_dag_revision IS NULL AND node_dag_base_goal_revision IS NULL AND node_id IS NULL AND node_binding_revision IS NULL) OR (disposition IN('PENDING','ACTIVE','TERMINAL','QUIESCED') AND node_goal_id IS NOT NULL AND goal_created_at_ms IS NOT NULL AND node_dag_revision IS NOT NULL AND node_dag_base_goal_revision IS NOT NULL AND node_id IS NOT NULL)), CHECK((disposition IN('LEGACY_UNKNOWN','LEGACY_QUIESCED') AND original_offer_payload IS NULL) OR (disposition IN('PENDING','ACTIVE','TERMINAL','QUIESCED') AND original_offer_payload IS NOT NULL)), CHECK((seal_sealed_at_ms IS NULL AND seal_applied_at_ms IS NULL AND seal_authority_kind IS NULL AND seal_authority_agent_id IS NULL AND seal_authority_session_id IS NULL AND seal_authority_revision IS NULL AND seal_observation_kind IS NULL AND seal_current_activity_id IS NULL AND seal_current_state IS NULL AND seal_current_revision IS NULL) OR (disposition IN('QUIESCED','LEGACY_QUIESCED') AND seal_sealed_at_ms IS NOT NULL AND seal_applied_at_ms IS NOT NULL AND seal_authority_kind IS NOT NULL AND seal_observation_kind IS NOT NULL)), CHECK((seal_authority_kind IS NULL AND seal_authority_agent_id IS NULL AND seal_authority_session_id IS NULL AND seal_authority_revision IS NULL) OR (seal_authority_kind='LOCAL_OPERATOR' AND seal_authority_agent_id IS NULL AND seal_authority_session_id IS NULL AND seal_authority_revision IS NULL) OR (seal_authority_kind='COORDINATOR' AND seal_authority_agent_id IS NOT NULL AND seal_authority_session_id IS NOT NULL AND seal_authority_revision IS NOT NULL)), CHECK((seal_observation_kind IS NULL AND seal_current_activity_id IS NULL AND seal_current_state IS NULL AND seal_current_revision IS NULL) OR (seal_observation_kind='ABSENT_NOW_SEALED' AND seal_current_activity_id IS NULL AND seal_current_state IS NULL AND seal_current_revision IS NULL) OR (seal_observation_kind IN('FOREIGN_ACTIVITY','LEGACY_TERMINAL_SAME_ACTIVITY') AND seal_current_activity_id IS NOT NULL AND seal_current_state IS NOT NULL AND seal_current_revision IS NOT NULL)))";
+const ASSIGNMENT_AFFINITY_SQL: &str = "CREATE TABLE ops_assignment_team_affinities (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16 AND workspace_id != zeroblob(16)), assignment_id BLOB NOT NULL CHECK(length(assignment_id)=16 AND assignment_id != zeroblob(16)), activity_id BLOB NOT NULL CHECK(length(activity_id)=16 AND activity_id != zeroblob(16)), target_agent_id BLOB NOT NULL CHECK(length(target_agent_id)=16 AND target_agent_id != zeroblob(16)), target_session_id BLOB NOT NULL CHECK(length(target_session_id)=16 AND target_session_id != zeroblob(16)), target_participation_id BLOB NOT NULL CHECK(length(target_participation_id)=16 AND target_participation_id != zeroblob(16)), target_participant_id BLOB NOT NULL CHECK(length(target_participant_id)=16 AND target_participant_id != zeroblob(16)), team_id BLOB CHECK(team_id IS NULL OR (length(team_id)=16 AND team_id != zeroblob(16))), team_membership_revision INTEGER CHECK(team_membership_revision IS NULL OR team_membership_revision>=1), requester_activity_id BLOB CHECK(requester_activity_id IS NULL OR (length(requester_activity_id)=16 AND requester_activity_id != zeroblob(16))), requester_agent_id BLOB CHECK(requester_agent_id IS NULL OR (length(requester_agent_id)=16 AND requester_agent_id != zeroblob(16))), requester_session_id BLOB CHECK(requester_session_id IS NULL OR (length(requester_session_id)=16 AND requester_session_id != zeroblob(16))), requester_participation_id BLOB CHECK(requester_participation_id IS NULL OR (length(requester_participation_id)=16 AND requester_participation_id != zeroblob(16))), requester_profile_id BLOB CHECK(requester_profile_id IS NULL OR (length(requester_profile_id)=16 AND requester_profile_id != zeroblob(16))), requester_participant_id BLOB CHECK(requester_participant_id IS NULL OR (length(requester_participant_id)=16 AND requester_participant_id != zeroblob(16))), requester_key TEXT NOT NULL CHECK(length(CAST(requester_key AS BLOB)) BETWEEN 1 AND 256), requester_display_name TEXT NOT NULL CHECK(length(CAST(requester_display_name AS BLOB)) BETWEEN 1 AND 128), assignment_payload_fingerprint BLOB NOT NULL CHECK(length(assignment_payload_fingerprint)=32), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0), node_goal_id BLOB CHECK(node_goal_id IS NULL OR (length(node_goal_id)=16 AND node_goal_id != zeroblob(16))), goal_created_at_ms INTEGER CHECK(goal_created_at_ms IS NULL OR goal_created_at_ms>=0), node_dag_revision INTEGER CHECK(node_dag_revision IS NULL OR node_dag_revision>=1), node_dag_base_goal_revision INTEGER CHECK(node_dag_base_goal_revision IS NULL OR node_dag_base_goal_revision>=1), node_id BLOB CHECK(node_id IS NULL OR (length(node_id)=16 AND node_id != zeroblob(16))), node_binding_revision INTEGER CHECK(node_binding_revision IS NULL OR node_binding_revision>=1), disposition TEXT NOT NULL CHECK(disposition IN('PENDING','ACTIVE','TERMINAL','QUIESCED','LEGACY_UNKNOWN','LEGACY_QUIESCED')), original_offer_payload BLOB CHECK(original_offer_payload IS NULL OR length(original_offer_payload) BETWEEN 1 AND 16384), seal_sealed_at_ms INTEGER CHECK(seal_sealed_at_ms IS NULL OR seal_sealed_at_ms>=0), seal_applied_at_ms INTEGER CHECK(seal_applied_at_ms IS NULL OR seal_applied_at_ms>=0), seal_authority_kind TEXT CHECK(seal_authority_kind IS NULL OR seal_authority_kind IN('LOCAL_OPERATOR','COORDINATOR')), seal_authority_agent_id BLOB CHECK(seal_authority_agent_id IS NULL OR (length(seal_authority_agent_id)=16 AND seal_authority_agent_id != zeroblob(16))), seal_authority_session_id BLOB CHECK(seal_authority_session_id IS NULL OR (length(seal_authority_session_id)=16 AND seal_authority_session_id != zeroblob(16))), seal_authority_revision INTEGER CHECK(seal_authority_revision IS NULL OR seal_authority_revision>=1), seal_observation_kind TEXT CHECK(seal_observation_kind IS NULL OR seal_observation_kind IN('ABSENT_NOW_SEALED','FOREIGN_ACTIVITY','LEGACY_TERMINAL_SAME_ACTIVITY')), seal_current_activity_id BLOB CHECK(seal_current_activity_id IS NULL OR (length(seal_current_activity_id)=16 AND seal_current_activity_id != zeroblob(16))), seal_current_state TEXT CHECK(seal_current_state IS NULL OR seal_current_state IN('OFFERED','RUNNING','SUBMITTED','ACCEPTED','REJECTED','CANCELLED','INTERRUPTED')), seal_current_revision INTEGER CHECK(seal_current_revision IS NULL OR seal_current_revision>=1), PRIMARY KEY(workspace_id,assignment_id), CHECK((team_id IS NULL AND team_membership_revision IS NULL) OR (team_id IS NOT NULL AND team_membership_revision IS NOT NULL)), CHECK((requester_activity_id IS NULL AND requester_agent_id IS NULL AND requester_session_id IS NULL AND requester_participation_id IS NULL AND requester_profile_id IS NULL AND requester_participant_id IS NULL) OR (requester_activity_id IS NOT NULL AND requester_agent_id IS NOT NULL AND requester_session_id IS NOT NULL AND requester_participation_id IS NOT NULL AND requester_profile_id IS NOT NULL AND requester_participant_id IS NOT NULL) OR (requester_activity_id IS NOT NULL AND requester_agent_id IS NOT NULL AND requester_session_id IS NOT NULL AND requester_participation_id IS NULL AND requester_profile_id IS NULL AND requester_participant_id IS NOT NULL AND requester_key LIKE 'native-participant:%')), CHECK((disposition IN('LEGACY_UNKNOWN','LEGACY_QUIESCED') AND node_goal_id IS NULL AND goal_created_at_ms IS NULL AND node_dag_revision IS NULL AND node_dag_base_goal_revision IS NULL AND node_id IS NULL AND node_binding_revision IS NULL) OR (disposition IN('PENDING','ACTIVE','TERMINAL','QUIESCED') AND node_goal_id IS NOT NULL AND goal_created_at_ms IS NOT NULL AND node_dag_revision IS NOT NULL AND node_dag_base_goal_revision IS NOT NULL AND node_id IS NOT NULL)), CHECK((disposition IN('LEGACY_UNKNOWN','LEGACY_QUIESCED') AND original_offer_payload IS NULL) OR (disposition IN('PENDING','ACTIVE','TERMINAL','QUIESCED') AND original_offer_payload IS NOT NULL)), CHECK((seal_sealed_at_ms IS NULL AND seal_applied_at_ms IS NULL AND seal_authority_kind IS NULL AND seal_authority_agent_id IS NULL AND seal_authority_session_id IS NULL AND seal_authority_revision IS NULL AND seal_observation_kind IS NULL AND seal_current_activity_id IS NULL AND seal_current_state IS NULL AND seal_current_revision IS NULL) OR (disposition IN('QUIESCED','LEGACY_QUIESCED') AND seal_sealed_at_ms IS NOT NULL AND seal_applied_at_ms IS NOT NULL AND seal_authority_kind IS NOT NULL AND seal_observation_kind IS NOT NULL)), CHECK((seal_authority_kind IS NULL AND seal_authority_agent_id IS NULL AND seal_authority_session_id IS NULL AND seal_authority_revision IS NULL) OR (seal_authority_kind='LOCAL_OPERATOR' AND seal_authority_agent_id IS NULL AND seal_authority_session_id IS NULL AND seal_authority_revision IS NULL) OR (seal_authority_kind='COORDINATOR' AND seal_authority_agent_id IS NOT NULL AND seal_authority_session_id IS NOT NULL AND seal_authority_revision IS NOT NULL)), CHECK((seal_observation_kind IS NULL AND seal_current_activity_id IS NULL AND seal_current_state IS NULL AND seal_current_revision IS NULL) OR (seal_observation_kind='ABSENT_NOW_SEALED' AND seal_current_activity_id IS NULL AND seal_current_state IS NULL AND seal_current_revision IS NULL) OR (seal_observation_kind IN('FOREIGN_ACTIVITY','LEGACY_TERMINAL_SAME_ACTIVITY') AND seal_current_activity_id IS NOT NULL AND seal_current_state IS NOT NULL AND seal_current_revision IS NOT NULL)))";
 const ASSIGNMENT_AFFINITY_SCOPE_INDEX: &str = "CREATE INDEX ops_assignment_team_affinities_node_scope_idx ON ops_assignment_team_affinities(workspace_id,activity_id,node_goal_id,goal_created_at_ms,node_dag_revision,node_dag_base_goal_revision,node_id,disposition)";
 
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -51,6 +52,22 @@ pub(crate) fn schema_objects_v35() -> Vec<(&'static str, &'static str, &'static 
     )]
 }
 
+/// Exact affinity schema at catalog versions 36 through 47.
+pub(crate) fn schema_objects_v47() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        (
+            "table",
+            "ops_assignment_team_affinities",
+            ASSIGNMENT_AFFINITY_V47_SQL,
+        ),
+        (
+            "index",
+            "ops_assignment_team_affinities_node_scope_idx",
+            ASSIGNMENT_AFFINITY_SCOPE_INDEX,
+        ),
+    ]
+}
+
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsError> {
     for (_, _, sql) in schema_objects() {
         connection.execute_batch(sql)?;
@@ -72,6 +89,46 @@ pub(crate) fn migrate_v35_to_v36(tx: &Transaction<'_>) -> Result<(), OperationsE
     Ok(())
 }
 
+/// Add the exact native Coordinator requester shape while preserving every
+/// v47 affinity column and its original evidence bytes.
+pub(crate) fn migrate_v47_to_v48(tx: &Transaction<'_>) -> Result<(), OperationsError> {
+    tx.execute_batch(
+        "ALTER TABLE ops_assignment_team_affinities RENAME TO ops_assignment_team_affinities_v47;
+         DROP INDEX ops_assignment_team_affinities_node_scope_idx;",
+    )?;
+    create_schema(tx)?;
+    tx.execute(
+        "INSERT INTO ops_assignment_team_affinities(
+            workspace_id,assignment_id,activity_id,target_agent_id,target_session_id,
+            target_participation_id,target_participant_id,team_id,team_membership_revision,
+            requester_activity_id,requester_agent_id,requester_session_id,
+            requester_participation_id,requester_profile_id,requester_participant_id,
+            requester_key,requester_display_name,assignment_payload_fingerprint,
+            observed_at_ms,node_goal_id,goal_created_at_ms,node_dag_revision,
+            node_dag_base_goal_revision,node_id,node_binding_revision,disposition,
+            original_offer_payload,seal_sealed_at_ms,seal_applied_at_ms,
+            seal_authority_kind,seal_authority_agent_id,seal_authority_session_id,
+            seal_authority_revision,seal_observation_kind,seal_current_activity_id,
+            seal_current_state,seal_current_revision
+         ) SELECT
+            workspace_id,assignment_id,activity_id,target_agent_id,target_session_id,
+            target_participation_id,target_participant_id,team_id,team_membership_revision,
+            requester_activity_id,requester_agent_id,requester_session_id,
+            requester_participation_id,requester_profile_id,requester_participant_id,
+            requester_key,requester_display_name,assignment_payload_fingerprint,
+            observed_at_ms,node_goal_id,goal_created_at_ms,node_dag_revision,
+            node_dag_base_goal_revision,node_id,node_binding_revision,disposition,
+            original_offer_payload,seal_sealed_at_ms,seal_applied_at_ms,
+            seal_authority_kind,seal_authority_agent_id,seal_authority_session_id,
+            seal_authority_revision,seal_observation_kind,seal_current_activity_id,
+            seal_current_state,seal_current_revision
+         FROM ops_assignment_team_affinities_v47",
+        [],
+    )?;
+    tx.execute_batch("DROP TABLE ops_assignment_team_affinities_v47")?;
+    Ok(())
+}
+
 /// The caller's trusted admission input.  The payload fingerprint is supplied
 /// by the Forge-facing boundary and is never recomputed from a partial copy of
 /// the assignment payload here.
@@ -83,6 +140,8 @@ pub struct AssignmentAffinityCommand {
     pub activity_id: ActivityId,
     pub target_agent_id: AgentInstanceId,
     pub target_session_id: AgentSessionId,
+    /// Principal fixed by the immutable Source offer for its exact target.
+    pub expected_target_principal: forge_domain::AuthenticatedPrincipal,
     pub requester: crate::OperationalActor,
     pub team_id: Option<Uuid>,
     pub node_scope: NodeTeamBindingScope,
@@ -174,7 +233,81 @@ pub struct AssignmentAffinityActor {
     display_name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignmentAffinityRequesterIdentity {
+    Operator,
+    ProfileParticipant {
+        activity_id: ActivityId,
+        agent_id: AgentInstanceId,
+        session_id: AgentSessionId,
+        participation_id: WorkspaceParticipationId,
+        profile_id: Uuid,
+        participant_id: Uuid,
+    },
+    NativeParticipant {
+        activity_id: ActivityId,
+        agent_id: AgentInstanceId,
+        session_id: AgentSessionId,
+        participant_id: Uuid,
+    },
+}
+
 impl AssignmentAffinityActor {
+    fn requester_identity(&self) -> Result<AssignmentAffinityRequesterIdentity, OperationsError> {
+        match (
+            self.activity_id,
+            self.agent_id,
+            self.session_id,
+            self.participation_id,
+            self.profile_id,
+            self.participant_id,
+        ) {
+            (None, None, None, None, None, None) if self.key == "operator" => {
+                Ok(AssignmentAffinityRequesterIdentity::Operator)
+            }
+            (
+                Some(activity_id),
+                Some(agent_id),
+                Some(session_id),
+                Some(participation_id),
+                Some(profile_id),
+                Some(participant_id),
+            ) => Ok(AssignmentAffinityRequesterIdentity::ProfileParticipant {
+                activity_id,
+                agent_id,
+                session_id,
+                participation_id,
+                profile_id,
+                participant_id,
+            }),
+            (
+                Some(activity_id),
+                Some(agent_id),
+                Some(session_id),
+                None,
+                None,
+                Some(participant_id),
+            ) if self.key == format!("native-participant:{participant_id}") => {
+                Ok(AssignmentAffinityRequesterIdentity::NativeParticipant {
+                    activity_id,
+                    agent_id,
+                    session_id,
+                    participant_id,
+                })
+            }
+            _ => Err(OperationsError::Corrupt(
+                "assignment affinity requester identity",
+            )),
+        }
+    }
+
+    fn is_native_participant(&self) -> bool {
+        matches!(
+            self.requester_identity(),
+            Ok(AssignmentAffinityRequesterIdentity::NativeParticipant { .. })
+        )
+    }
+
     #[must_use]
     pub const fn activity_id(&self) -> Option<ActivityId> {
         self.activity_id
@@ -419,12 +552,42 @@ fn actor_input(actor: crate::OperationalActor) -> ActorInput {
     }
 }
 
+fn native_requester_matches(
+    resolved: &ResolvedOperationalActor,
+    input: ActorInput,
+    expected: &AssignmentAffinityActor,
+) -> Result<bool, OperationsError> {
+    let AssignmentAffinityRequesterIdentity::NativeParticipant {
+        activity_id,
+        agent_id,
+        session_id,
+        participant_id,
+    } = expected.requester_identity()?
+    else {
+        return Ok(false);
+    };
+    let ResolvedOperationalActor::NativeParticipant {
+        participant_id: current_participant_id,
+        session_id: current_session_id,
+        ..
+    } = resolved
+    else {
+        return Ok(false);
+    };
+    Ok(input.activity == Some(activity_id)
+        && input.agent == Some(agent_id)
+        && input.session == Some(session_id)
+        && *current_participant_id == participant_id
+        && *current_session_id == session_id)
+}
+
 impl OperationsCatalog {
     /// Record or exactly replay one immutable assignment Team-affinity decision.
     ///
     /// New rows require a current Ready target and, when a Team is supplied, an
-    /// active same-Workspace Team membership observed as `JOINED`. Replays use
-    /// only the stored identity and therefore remain readable after departure.
+    /// active same-Workspace Team membership observed as `JOINED`. A native
+    /// requester is accepted only with an exact explicit non-Team Node binding.
+    /// Profile and operator replays keep their stored-identity behavior.
     ///
     /// # Errors
     /// Rejects invalid or conflicting identity, unavailable evidence and catalog failures.
@@ -452,6 +615,26 @@ impl OperationsCatalog {
             workspace_id,
             assignment_id,
         )
+    }
+
+    /// Re-resolve a stored native Coordinator against its current Ready
+    /// Registration and exact Workspace effect binding.
+    ///
+    /// # Errors
+    /// Rejects malformed persisted identities and propagates current binding,
+    /// Registration or catalog failures.
+    pub fn current_native_assignment_affinity_requester_matches(
+        &self,
+        workspace_id: WorkspaceId,
+        requester: crate::OperationalActor,
+        stored: &AssignmentAffinityActor,
+    ) -> Result<bool, OperationsError> {
+        if !stored.is_native_participant() {
+            return Ok(false);
+        }
+        let resolved =
+            crate::operational_actor::resolve_actor(&self.connection, workspace_id, requester)?;
+        native_requester_matches(&resolved, actor_input(requester), stored)
     }
 
     /// Reconcile one trusted Forge assignment observation into the durable
@@ -526,6 +709,7 @@ pub fn record_assignment_affinity(
     if let Some(existing) =
         load_affinity(&transaction, command.workspace_id, command.assignment_id)?
     {
+        validate_native_affinity_replay(&transaction, command, existing.receipt.requester())?;
         return replay_or_conflict(transaction, command, existing);
     }
     if affinity_exists_other_workspace(&transaction, command.assignment_id, command.workspace_id)? {
@@ -558,15 +742,18 @@ pub fn record_assignment_affinity(
         command.workspace_id,
         command.requester,
     )?;
-    let target_participant_id = effect_binding::exact(
+    if actor.is_native_participant() {
+        validate_native_admission_scope(&transaction, command)?;
+    }
+    let target_participant_id = crate::presence::resolve_ready_logical_binding(
         &transaction,
         command.workspace_id,
         command.activity_id,
         command.target_agent_id,
         command.target_session_id,
+        command.expected_target_principal,
     )?
-    .map(effect_binding::CurrentEffectBinding::participant_id)
-    .ok_or(OperationsError::Conflict("assignment target is not Ready"))?;
+    .participant_id;
     let target_participation_id = mapped_participation(
         &transaction,
         command.workspace_id,
@@ -610,6 +797,52 @@ pub fn record_assignment_affinity(
             source,
         })?;
     Ok(receipt)
+}
+
+fn validate_native_affinity_replay(
+    transaction: &Transaction<'_>,
+    command: &AssignmentAffinityCommand,
+    stored: &AssignmentAffinityActor,
+) -> Result<(), OperationsError> {
+    if !stored.is_native_participant() {
+        return Ok(());
+    }
+    validate_node_binding(transaction, command)?;
+    let resolved = crate::operational_actor::resolve_actor(
+        transaction,
+        command.workspace_id,
+        command.requester,
+    )?;
+    if !native_requester_matches(&resolved, actor_input(command.requester), stored)? {
+        return Err(OperationsError::Conflict("assignment affinity replay"));
+    }
+    validate_native_admission_scope(transaction, command)
+}
+
+fn validate_native_admission_scope(
+    transaction: &Transaction<'_>,
+    command: &AssignmentAffinityCommand,
+) -> Result<(), OperationsError> {
+    if command.team_id.is_some() {
+        return Err(OperationsError::Conflict(
+            "native assignment requester requires non-Team scope",
+        ));
+    }
+    if has_legacy_unknown_affinity_for_workspace(transaction, command.workspace_id)? {
+        return Err(OperationsError::Conflict(
+            "native assignment scope has unresolved legacy affinity",
+        ));
+    }
+    if has_other_pending_or_active_affinity_for_scope(
+        transaction,
+        command.node_scope,
+        command.assignment_id,
+    )? {
+        return Err(OperationsError::Conflict(
+            "native assignment scope has another pending or active affinity",
+        ));
+    }
+    Ok(())
 }
 
 /// Return the immutable affinity row for one exact Workspace/assignment.
@@ -849,6 +1082,27 @@ pub(crate) fn has_pending_or_active_affinity_for_scope(
             scope.dag_revision().get(),
             scope.dag_base_goal_revision().get(),
             scope.node_id().into_uuid().as_bytes(),
+        ],
+        |row| row.get(0),
+    )?)
+}
+
+fn has_other_pending_or_active_affinity_for_scope(
+    tx: &Transaction<'_>,
+    scope: NodeTeamBindingScope,
+    excluded_assignment_id: AgentAssignmentId,
+) -> Result<bool, OperationsError> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ops_assignment_team_affinities WHERE workspace_id=?1 AND activity_id=?2 AND node_goal_id=?3 AND goal_created_at_ms=?4 AND node_dag_revision=?5 AND node_dag_base_goal_revision=?6 AND node_id=?7 AND assignment_id!=?8 AND disposition IN('PENDING','ACTIVE'))",
+        params![
+            scope.workspace_id().into_uuid().as_bytes(),
+            scope.activity_id().into_uuid().as_bytes(),
+            scope.goal_id().into_uuid().as_bytes(),
+            scope.goal_created_at().get(),
+            scope.dag_revision().get(),
+            scope.dag_base_goal_revision().get(),
+            scope.node_id().into_uuid().as_bytes(),
+            excluded_assignment_id.into_uuid().as_bytes(),
         ],
         |row| row.get(0),
     )?)
@@ -1245,11 +1499,11 @@ fn insert_affinity(
             actor_input.activity.map(|id| id.into_uuid().into_bytes().to_vec()),
             actor_input.agent.map(|id| id.into_uuid().into_bytes().to_vec()),
             actor_input.session.map(|id| id.into_uuid().into_bytes().to_vec()),
-            actor.participation_id.map(|id| id.into_uuid().into_bytes().to_vec()),
-            actor.profile_id.map(|id| id.into_bytes().to_vec()),
-            actor.participant_id.map(|id| id.into_bytes().to_vec()),
+            actor.participation_id().map(|id| id.into_uuid().into_bytes().to_vec()),
+            actor.profile_id().map(|id| id.into_bytes().to_vec()),
+            actor.participant_id().map(|id| id.into_bytes().to_vec()),
             actor.key(),
-            actor.display_name.as_str(),
+            actor.display_name(),
             command.assignment_payload_fingerprint.as_slice(),
             command.observed_at.get(),
             command.node_scope.goal_id().into_uuid().as_bytes(),
@@ -1534,6 +1788,7 @@ fn decode_affinity_requester(
         key: raw.key,
         display_name: raw.display_name,
     };
+    requester.requester_identity()?;
     Ok((requester, requester_input))
 }
 
@@ -2033,6 +2288,7 @@ mod tests {
             activity_id: fixture.activity,
             target_agent_id: fixture.agent,
             target_session_id: fixture.session,
+            expected_target_principal: forge_domain::AuthenticatedPrincipal::TrustedStdio,
             requester: OperationalActor::LocalOperator,
             team_id,
             node_scope: if team_id.is_some() {
@@ -2114,6 +2370,43 @@ mod tests {
                 .record_assignment_affinity(&departed_target_command)
                 .is_err()
         );
+        drop(fixture.catalog);
+        fs::remove_dir_all(fixture.root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn target_principal_must_match_current_ready_member_before_pending()
+    -> Result<(), Box<dyn Error>> {
+        let mut fixture = fixture()?;
+        let target_principal = forge_domain::AuthenticatedPrincipal::DirectToken(
+            forge_domain::DirectTokenId::from_uuid(Uuid::from_u128(0xAF10)),
+        );
+        fixture.catalog.connection.execute(
+            "UPDATE ops_logical_members SET principal_kind=1,principal_id=?1
+             WHERE workspace_id=?2 AND session_id=?3",
+            params![
+                Uuid::from_u128(0xAF10).as_bytes(),
+                fixture.workspace.into_uuid().as_bytes(),
+                fixture.session.into_uuid().as_bytes(),
+            ],
+        )?;
+        let command = command(&fixture, 0xA0F0, None)?;
+        assert_ne!(command.expected_target_principal, target_principal);
+        assert!(matches!(
+            fixture.catalog.record_assignment_affinity(&command),
+            Err(OperationsError::Conflict("logical binding principal"))
+        ));
+        let count: i64 = fixture.catalog.connection.query_row(
+            "SELECT COUNT(*) FROM ops_assignment_team_affinities
+             WHERE workspace_id=?1 AND assignment_id=?2",
+            params![
+                fixture.workspace.into_uuid().as_bytes(),
+                command.assignment_id.into_uuid().as_bytes(),
+            ],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 0);
         drop(fixture.catalog);
         fs::remove_dir_all(fixture.root)?;
         Ok(())

@@ -116,6 +116,12 @@ impl CurrentEffectBinding {
     pub(crate) const fn activity_id(self) -> ActivityId {
         self.activity_id
     }
+    pub(crate) const fn source(self) -> EffectBindingSource {
+        self.source
+    }
+    pub(crate) const fn source_request_id(self) -> Uuid {
+        self.source_request_id
+    }
 }
 
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {

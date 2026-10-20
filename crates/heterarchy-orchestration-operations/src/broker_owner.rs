@@ -59,6 +59,72 @@ pub enum BrokerOwnerAuthorityError {
     Unconfirmed,
 }
 
+/// Linearizable, read-only Broker owner evidence. It carries no mutation
+/// authority; the Broker is the only source of these values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerOwnerObservation {
+    owner_epoch: Option<u64>,
+    owner_instance_id: Option<String>,
+    applied_index: u64,
+}
+
+impl BrokerOwnerObservation {
+    /// Committed owner epoch, absent when the Broker has never seen this session.
+    #[must_use]
+    pub const fn owner_epoch(&self) -> Option<u64> {
+        self.owner_epoch
+    }
+
+    /// Committed owner instance, absent for an unknown or ownerless session.
+    #[must_use]
+    pub fn owner_instance_id(&self) -> Option<&str> {
+        self.owner_instance_id.as_deref()
+    }
+
+    /// Replicated-log index applied when the linearizable read was confirmed.
+    #[must_use]
+    pub const fn applied_index(&self) -> u64 {
+        self.applied_index
+    }
+}
+
+/// Explicit operator approval to replace exactly one Broker-confirmed owner.
+///
+/// The approval names the epoch and instance the operator inspected. Recovery
+/// re-reads Broker status and refuses when the live owner differs, so an
+/// approval can never be reused against a different owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerOwnerRecoveryApproval {
+    owner_epoch: u64,
+    owner_instance_id: String,
+}
+
+impl BrokerOwnerRecoveryApproval {
+    #[must_use]
+    pub fn new(owner_epoch: u64, owner_instance_id: impl Into<String>) -> Self {
+        Self {
+            owner_epoch,
+            owner_instance_id: owner_instance_id.into(),
+        }
+    }
+}
+
+/// Fail-closed recovery outcomes. Authority failures keep their original
+/// classification; no variant authorizes automatic retry with a new request.
+#[derive(Debug, Error)]
+pub enum BrokerOwnerRecoveryError {
+    #[error(transparent)]
+    Authority(#[from] BrokerOwnerAuthorityError),
+    #[error("Broker owner state matches the local receipt; recovery is not required")]
+    NotRequired,
+    #[error("Broker owner state is inconsistent with the local receipt")]
+    ReceiptMismatch,
+    #[error("recovery approval does not match the live Broker owner")]
+    ApprovalMismatch,
+    #[error("an unresolved local command blocks owner recovery")]
+    Blocked,
+}
+
 /// One host-owned durable Broker command session. The local state file is the
 /// write-ahead source for exact acquisition recovery; the Broker remains the
 /// authority for the epoch itself.
@@ -169,6 +235,122 @@ impl BrokerOwnerAuthority {
             }
             Some(_) | None => self.acquire_for_current_process(&store).await,
         }
+    }
+
+    /// Read the Broker-committed owner for this destination's command session.
+    ///
+    /// The read is linearizable, never touches local owner state, never
+    /// advances an epoch, and grants no mutation authority. A stale local
+    /// process may call it.
+    ///
+    /// # Errors
+    /// Fails closed with `Unconfirmed` when the Broker cannot establish a
+    /// linearizable read (for example quorum loss or a protocol-incompatible
+    /// node).
+    pub async fn owner_status(&self) -> Result<BrokerOwnerObservation, BrokerOwnerAuthorityError> {
+        let status = self
+            .router
+            .owner_status(self.session_id.clone(), self.process_instance_id.clone())
+            .await
+            .map_err(classify_routing_error)?;
+        Ok(BrokerOwnerObservation {
+            owner_epoch: status.owner.as_ref().map(|owner| owner.owner_epoch.get()),
+            owner_instance_id: status
+                .owner
+                .and_then(|owner| owner.owner_instance_id)
+                .map(|id| id.as_str().to_owned()),
+            applied_index: status.applied_index,
+        })
+    }
+
+    /// Operator-approved recovery of a stale local owner receipt.
+    ///
+    /// Order of authority: resolve any pending acquisition by its exact
+    /// original request, read linearizable Broker status, compare it with the
+    /// local durable receipt, require the explicit approval to name the live
+    /// owner, then perform the official compare-and-set acquisition using the
+    /// Broker-observed epoch as the expectation. The epoch is never guessed and
+    /// no new request identity is used for an unknown outcome.
+    ///
+    /// # Errors
+    /// Refuses (`ReceiptMismatch`, `ApprovalMismatch`, `NotRequired`,
+    /// `Blocked`) or fails closed with the Broker authority classification.
+    pub async fn recover_stale_owner(
+        &mut self,
+        approval: &BrokerOwnerRecoveryApproval,
+    ) -> Result<BrokerOwnerLease, BrokerOwnerRecoveryError> {
+        let store = self.store().await?;
+        if store
+            .in_flight()
+            .await
+            .map_err(BrokerOwnerAuthorityError::LocalState)?
+            .is_some()
+        {
+            return Err(BrokerOwnerRecoveryError::Blocked);
+        }
+        if let Some(pending) = store
+            .pending_owner_acquisition()
+            .await
+            .map_err(BrokerOwnerAuthorityError::LocalState)?
+        {
+            match self.submit_pending(&pending).await {
+                Ok(epoch) => {
+                    let owner = store
+                        .confirm_owner_acquisition(epoch)
+                        .await
+                        .map_err(BrokerOwnerAuthorityError::LocalState)?;
+                    return Ok(owner_lease(&owner));
+                }
+                Err(BrokerOwnerAuthorityError::Stale | BrokerOwnerAuthorityError::Rejected) => {
+                    store
+                        .release_rejected_owner_acquisition(pending)
+                        .await
+                        .map_err(BrokerOwnerAuthorityError::LocalState)?;
+                }
+                Err(other) => return Err(other.into()),
+            }
+        }
+        let status = self.owner_status().await?;
+        let (Some(broker_epoch), Some(broker_instance)) =
+            (status.owner_epoch, status.owner_instance_id)
+        else {
+            return Err(BrokerOwnerRecoveryError::ReceiptMismatch);
+        };
+        if let Some(local) = store
+            .owner()
+            .await
+            .map_err(BrokerOwnerAuthorityError::LocalState)?
+        {
+            let local_epoch = local.owner_epoch().get();
+            if broker_epoch < local_epoch {
+                return Err(BrokerOwnerRecoveryError::ReceiptMismatch);
+            }
+            if broker_epoch == local_epoch {
+                return if broker_instance == local.owner_instance_id().as_str() {
+                    Err(BrokerOwnerRecoveryError::NotRequired)
+                } else {
+                    Err(BrokerOwnerRecoveryError::ReceiptMismatch)
+                };
+            }
+        }
+        if broker_instance == self.process_instance_id.as_str() {
+            return Err(BrokerOwnerRecoveryError::ReceiptMismatch);
+        }
+        if approval.owner_epoch != broker_epoch || approval.owner_instance_id != broker_instance {
+            return Err(BrokerOwnerRecoveryError::ApprovalMismatch);
+        }
+        let observed = SessionOwnerEpoch::new(broker_epoch)
+            .map_err(|_| BrokerOwnerRecoveryError::ReceiptMismatch)?;
+        let pending = store
+            .begin_owner_acquisition_at_observed_epoch(self.process_instance_id.clone(), observed)
+            .await
+            .map_err(BrokerOwnerAuthorityError::LocalState)?;
+        let epoch = self.submit_pending(&pending).await?;
+        let owner = store
+            .confirm_owner_acquisition(epoch)
+            .await
+            .map_err(BrokerOwnerAuthorityError::LocalState)?;
+        Ok(owner_lease(&owner))
     }
 
     async fn store(&mut self) -> Result<AsyncDurableClientSessionStore, BrokerOwnerAuthorityError> {

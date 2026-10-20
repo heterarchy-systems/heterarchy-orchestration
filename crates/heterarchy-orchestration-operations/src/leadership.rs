@@ -5284,6 +5284,8 @@ mod tests {
                         target_session_id: forge_domain::AgentSessionId::from_uuid(
                             Uuid::from_slice(&session_id)?,
                         ),
+                        expected_target_principal:
+                            forge_domain::AuthenticatedPrincipal::TrustedStdio,
                         requester: crate::OperationalActor::LocalOperator,
                         team_id: Some(team_id),
                         node_scope,
@@ -7773,11 +7775,17 @@ mod tests {
         );
 
         let path = fixture.root.join("catalog.sqlite3");
+        crate::binding_rejection::drop_schema_for_legacy_fixture(&fixture.catalog.connection)?;
         work_roster::drop_schema_for_legacy_fixture(&fixture.catalog.connection)?;
         fixture.catalog.connection.execute_batch(
-            "DROP TABLE ops_registration_profile_scopes;
+            "DROP TABLE ops_agent_provision_uncertainty_retirements;
+             DROP TABLE ops_registration_profile_scopes;
              DROP INDEX ops_leadership_work_exchanges_pending;
              DROP TABLE ops_leadership_work_exchanges;",
+        )?;
+        crate::catalog::restore_v46_message_schema_for_legacy_fixture(&fixture.catalog.connection)?;
+        crate::catalog::restore_v47_assignment_schema_for_legacy_fixture(
+            &fixture.catalog.connection,
         )?;
         fixture
             .catalog

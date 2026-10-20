@@ -11,10 +11,15 @@ use uuid::Uuid;
 
 use crate::wire::WorkspaceQueryScope;
 use crate::wire::membership::{
-    MemberActivateRequest, MemberActivateResponse, MemberActivationWire, MemberCommitWire,
-    MemberConfirmRequest, MemberConfirmResponse, MemberPhaseWire, MemberProgressWire,
-    MemberRegisterRequest, MemberRegisterResponse, MemberRegistrationQueryRequest,
-    MemberRegistrationQueryResponse, MemberTarget,
+    DurableRequestIdPolicyWire, LegacyEnvelopeRequestIdPolicyWire, MemberActivateRequest,
+    MemberActivateResponse, MemberActivationWire, MemberBindingRejectRequest,
+    MemberBindingRejectResponse, MemberBindingRejectionQueryRequest,
+    MemberBindingRejectionQueryResponse, MemberBindingRejectionReasonWire,
+    MemberBindingRejectionReconcileRequest, MemberBindingRejectionReconcileResponse,
+    MemberBindingRejectionWire, MemberCommitWire, MemberConfirmRequest, MemberConfirmResponse,
+    MemberPhaseWire, MemberPrincipalWire, MemberProgressWire, MemberRegisterRequest,
+    MemberRegisterResponse, MemberRegistrationQueryRequest, MemberRegistrationQueryResponse,
+    MemberTarget, SourceRequestIdPolicyWire,
 };
 
 use super::{ClientError, OrchestrationHttpClient, ReadbackTarget, require_identity};
@@ -154,6 +159,121 @@ impl OrchestrationHttpClient {
         }
         Ok(response)
     }
+
+    /// Settle one exact committed binding with its Source rejection receipt.
+    ///
+    /// # Errors
+    /// Returns invalid input, typed service rejection, bounded transport
+    /// failure, or an uncertain outcome carrying the rejection readback key.
+    pub async fn reject_member_binding(
+        &self,
+        authorization: &HeaderValue,
+        request: &MemberBindingRejectRequest,
+    ) -> Result<MemberBindingRejectResponse, ClientError> {
+        validate_registration_request(&request.target, request.request_id)?;
+        let readback = rejection_readback(&request.target, request.request_id);
+        let response: MemberBindingRejectResponse = self
+            .call(
+                authorization,
+                Method::POST,
+                member_path(&request.target, "binding-rejection/settle"),
+                Some(request),
+                Some(readback.clone()),
+            )
+            .await?;
+        if response.target != request.target
+            || !valid_rejection(&response.rejection, &request.target, request.request_id)
+        {
+            return Err(ClientError::UnknownOutcome { readback });
+        }
+        Ok(response)
+    }
+
+    /// Read exact historical terminal rejection evidence.
+    ///
+    /// # Errors
+    /// Returns invalid input, typed service rejection, bounded transport
+    /// failure, or a protocol error for malformed evidence.
+    pub async fn member_binding_rejection(
+        &self,
+        authorization: &HeaderValue,
+        request: &MemberBindingRejectionQueryRequest,
+    ) -> Result<MemberBindingRejectionQueryResponse, ClientError> {
+        validate_registration_request(&request.target, request.request_id)?;
+        let response: MemberBindingRejectionQueryResponse = self
+            .call(
+                authorization,
+                Method::POST,
+                member_path(&request.target, "binding-rejection/query"),
+                Some(request),
+                None,
+            )
+            .await?;
+        if response.target != request.target
+            || response.request_id != request.request_id
+            || response.rejection.as_ref().is_some_and(|rejection| {
+                !valid_rejection(rejection, &request.target, request.request_id)
+            })
+        {
+            return Err(ClientError::Protocol);
+        }
+        Ok(response)
+    }
+
+    /// Persist or replay the operator-approved no-effect reconciliation proof.
+    ///
+    /// # Errors
+    /// Returns invalid input, typed service rejection, bounded transport
+    /// failure, an unknown outcome requiring exact readback, or malformed
+    /// response evidence.
+    pub async fn reconcile_member_binding_rejection_attempt(
+        &self,
+        authorization: &HeaderValue,
+        request: &MemberBindingRejectionReconcileRequest,
+    ) -> Result<MemberBindingRejectionReconcileResponse, ClientError> {
+        validate_registration_request(&request.target, request.request_id)?;
+        require_identity(request.resolution_request_id)?;
+        if !valid_digest(&request.expected_attempt_request_digest)
+            || !valid_digest(&request.expected_legacy_artifact_digest)
+        {
+            return Err(ClientError::InvalidRequest);
+        }
+        let readback = ReadbackTarget::MemberBindingRejectionResolution {
+            workspace_id: request.target.scope.workspace_id,
+            activity_id: request.target.activity_id,
+            session_id: request.target.session_id,
+            request_id: request.request_id,
+            resolution_request_id: request.resolution_request_id,
+        };
+        let response: MemberBindingRejectionReconcileResponse = self
+            .call(
+                authorization,
+                Method::POST,
+                member_path(
+                    &request.target,
+                    "binding-rejection/reconcile-pre-admission-no-effect",
+                ),
+                Some(request),
+                Some(readback.clone()),
+            )
+            .await?;
+        if response.target != request.target
+            || response.request_id != request.request_id
+            || response.resolution_request_id != request.resolution_request_id
+            || response.attempt_request_digest != request.expected_attempt_request_digest
+            || response.legacy_artifact_digest != request.expected_legacy_artifact_digest
+            || response.legacy_envelope_request_id_policy
+                != LegacyEnvelopeRequestIdPolicyWire::GeneratedUuidV7
+            || response.durable_request_id_policy != DurableRequestIdPolicyWire::PersistedUuidV8
+            || response.source_request_id_policy != SourceRequestIdPolicyWire::BodyEqualsEnvelope
+            || response.source_get_observed_at_ms < 0
+            || response.resolved_at_ms < response.source_get_observed_at_ms
+            || response.consumed
+        {
+            return Err(ClientError::UnknownOutcome { readback });
+        }
+        Ok(response)
+    }
 }
 
 fn member_path(target: &MemberTarget, stage: &str) -> String {
@@ -165,6 +285,15 @@ fn member_path(target: &MemberTarget, stage: &str) -> String {
 
 fn member_readback(target: &MemberTarget, request_id: Uuid) -> ReadbackTarget {
     ReadbackTarget::MemberRegistration {
+        workspace_id: target.scope.workspace_id,
+        activity_id: target.activity_id,
+        session_id: target.session_id,
+        request_id,
+    }
+}
+
+fn rejection_readback(target: &MemberTarget, request_id: Uuid) -> ReadbackTarget {
+    ReadbackTarget::MemberBindingRejection {
         workspace_id: target.scope.workspace_id,
         activity_id: target.activity_id,
         session_id: target.session_id,
@@ -316,6 +445,59 @@ fn valid_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn valid_rejection(
+    value: &MemberBindingRejectionWire,
+    target: &MemberTarget,
+    request_id: Uuid,
+) -> bool {
+    value.request_id == request_id
+        && request_id == expected_member_request_id(target)
+        && value.workspace_id == target.scope.workspace_id
+        && !value.participant_id.is_nil()
+        && value.activity_id == target.activity_id
+        && value.agent_id == expected_member_agent_id(target)
+        && value.session_id == target.session_id
+        && valid_principal_wire(&value.principal)
+        && !value.migration_id.is_nil()
+        && !value.destination_id.is_nil()
+        && value.expected_freeze_revision > 0
+        && valid_digest(&value.manifest_digest)
+        && !value.issuer_id.is_nil()
+        && value.workspace_root_fingerprint.len() == 32
+        && value.workspace_root_fingerprint.bytes().all(is_lower_hex)
+        && valid_digest(&value.binding_digest)
+        && valid_digest(&value.delegation_digest)
+        && valid_digest(&value.membership_digest)
+        && valid_member_text(&value.display_name)
+        && valid_member_text(&value.declared_role)
+        && value.reason == MemberBindingRejectionReasonWire::PrincipalTransportMismatch
+        && value.requested_at_ms >= 0
+        && value.reserved_at_ms >= value.requested_at_ms
+        && value.observed_at_ms >= 0
+        && value.observed_at_ms >= value.reserved_at_ms
+        && value.rejected_at_ms >= value.observed_at_ms
+        && valid_digest(&value.request_digest)
+        && valid_digest(&value.receipt_digest)
+}
+
+fn valid_principal_wire(value: &MemberPrincipalWire) -> bool {
+    match value {
+        MemberPrincipalWire::TrustedStdio => true,
+        MemberPrincipalWire::DirectToken { token_id } => !token_id.is_nil(),
+        MemberPrincipalWire::OAuthGrant { grant_id } => !grant_id.is_nil(),
+    }
+}
+
+fn valid_member_text(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_MEMBER_METADATA_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+fn is_lower_hex(byte: u8) -> bool {
+    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+}
+
 pub(super) fn valid_query_response(
     response: &MemberRegistrationQueryResponse,
     request: &MemberRegistrationQueryRequest,
@@ -444,6 +626,39 @@ mod tests {
         }
     }
 
+    fn rejection(target: &MemberTarget) -> MemberBindingRejectionWire {
+        MemberBindingRejectionWire {
+            request_id: expected_member_request_id(target),
+            workspace_id: target.scope.workspace_id,
+            participant_id: Uuid::from_u128(7),
+            activity_id: target.activity_id,
+            agent_id: expected_member_agent_id(target),
+            session_id: target.session_id,
+            principal: MemberPrincipalWire::DirectToken {
+                token_id: Uuid::from_u128(8),
+            },
+            migration_id: Uuid::from_u128(9),
+            destination_id: Uuid::from_u128(10),
+            expected_freeze_revision: 1,
+            manifest_digest: "11".repeat(32),
+            issuer_id: Uuid::from_u128(11),
+            workspace_root_fingerprint: "22".repeat(16),
+            binding_digest: "33".repeat(32),
+            delegation_digest: "44".repeat(32),
+            membership_digest: "55".repeat(32),
+            display_name: "Ada".to_owned(),
+            declared_role: "reviewer".to_owned(),
+            transport: MemberTransportWire::Other,
+            reason: MemberBindingRejectionReasonWire::PrincipalTransportMismatch,
+            reserved_at_ms: 2,
+            requested_at_ms: 1,
+            observed_at_ms: 3,
+            rejected_at_ms: 4,
+            request_digest: "66".repeat(32),
+            receipt_digest: "77".repeat(32),
+        }
+    }
+
     #[test]
     fn member_requests_reject_invalid_scope_session_metadata_and_recipient_sets() {
         assert!(validate_register_request(&register_request()).is_ok());
@@ -565,6 +780,35 @@ mod tests {
         assert!(!valid_query_response(&ready, &request));
     }
 
+    #[test]
+    fn rejection_validation_binds_target_and_closed_evidence() {
+        let target = target();
+        let request_id = expected_member_request_id(&target);
+        let valid = rejection(&target);
+        assert!(valid_rejection(&valid, &target, request_id));
+        assert_eq!(
+            rejection_readback(&target, request_id),
+            ReadbackTarget::MemberBindingRejection {
+                workspace_id: target.scope.workspace_id,
+                activity_id: target.activity_id,
+                session_id: target.session_id,
+                request_id,
+            }
+        );
+
+        let mut foreign = valid.clone();
+        foreign.activity_id = Uuid::from_u128(99);
+        assert!(!valid_rejection(&foreign, &target, request_id));
+        let mut uppercase = valid.clone();
+        uppercase.request_digest = "AA".repeat(32);
+        assert!(!valid_rejection(&uppercase, &target, request_id));
+        let mut nil_principal = valid;
+        nil_principal.principal = MemberPrincipalWire::DirectToken {
+            token_id: Uuid::nil(),
+        };
+        assert!(!valid_rejection(&nil_principal, &target, request_id));
+    }
+
     #[tokio::test]
     async fn malformed_register_reply_returns_exact_server_derived_readback()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -616,6 +860,45 @@ mod tests {
                 && activity_id == expected.activity_id
                 && session_id == expected.session_id
                 && request_id == expected_request_id
+        ));
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binding_rejection_deadline_returns_exact_readback_without_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let client = OrchestrationHttpClient::new(
+            listener.local_addr()?,
+            std::time::Duration::from_millis(10),
+        )?;
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await?;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok::<_, std::io::Error>(())
+        });
+        let target = target();
+        let request_id = expected_member_request_id(&target);
+        let request = MemberBindingRejectRequest {
+            target: target.clone(),
+            request_id,
+        };
+        assert!(matches!(
+            client
+                .reject_member_binding(&HeaderValue::from_static("Bearer fixture"), &request)
+                .await,
+            Err(ClientError::UnknownOutcome {
+                readback: ReadbackTarget::MemberBindingRejection {
+                    workspace_id,
+                    activity_id,
+                    session_id,
+                    request_id: observed_request_id,
+                }
+            }) if workspace_id == target.scope.workspace_id
+                && activity_id == target.activity_id
+                && session_id == target.session_id
+                && observed_request_id == request_id
         ));
         server.await??;
         Ok(())

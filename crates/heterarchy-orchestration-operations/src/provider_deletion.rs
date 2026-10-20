@@ -17,8 +17,9 @@ use uuid::Uuid;
 
 use crate::{
     AgentProfileDeletionBarrier, AgentProfileDeletionInFlightCounts, AgentProvisionEffectKind,
-    AgentProvisionProviderFamily, AgentProvisionState, OperationsCatalog, OperationsError,
-    ProviderMessageState, ProviderMessageTarget, WorkspaceParticipationId, profile_deletion, wire,
+    AgentProvisionProviderFamily, AgentProvisionState, ChatGptProjectId, OperationsCatalog,
+    OperationsError, ProviderMessageState, ProviderMessageTarget, WorkspaceParticipationId,
+    WorkspaceProjectBindingRevision, WorkspaceProjectReference, profile_deletion, wire,
 };
 
 /// Maximum rows returned by one reference or target read.
@@ -305,6 +306,7 @@ pub struct AgentProfileDeletionProvisionReference {
     runtime_session_id: Option<AgentProfileRuntimeSessionId>,
     state: AgentProvisionState,
     provider_conversation_id: Option<String>,
+    project: Option<WorkspaceProjectReference>,
     prepared_at: TimestampMillis,
     updated_at: TimestampMillis,
     revision: u64,
@@ -346,6 +348,10 @@ impl AgentProfileDeletionProvisionReference {
     #[must_use]
     pub fn provider_conversation_id(&self) -> Option<&str> {
         self.provider_conversation_id.as_deref()
+    }
+    #[must_use]
+    pub const fn project(&self) -> Option<WorkspaceProjectReference> {
+        self.project
     }
     #[must_use]
     pub const fn prepared_at(&self) -> TimestampMillis {
@@ -3637,15 +3643,18 @@ fn provision_reference_page(
     let runtime = runtime_session_id.map(|id| id.into_uuid().as_bytes().to_vec());
     let after = after_operation_id.map(|id| id.as_bytes().to_vec());
     let mut statement = connection.prepare(
-        "SELECT substr(operation_id,1,17),substr(request_id,1,17),slot_ordinal,
+        "SELECT substr(operation.operation_id,1,17),substr(operation.request_id,1,17),slot_ordinal,
                 effect_kind,provider_family,substr(profile_id,1,17),
                 substr(runtime_session_id,1,17),state,
                 CAST(substr(CAST(provider_conversation_id AS BLOB),1,513) AS TEXT),
-                prepared_at_ms,updated_at_ms,revision
-         FROM ops_agent_provision_operations
+                prepared_at_ms,updated_at_ms,revision,
+                project_route.project_id,project_route.binding_revision
+         FROM ops_agent_provision_operations AS operation
+         LEFT JOIN ops_agent_provision_project_routes AS project_route
+           ON project_route.operation_id=operation.operation_id
          WHERE profile_id=?1 AND (?2 IS NULL OR runtime_session_id=?2)
-           AND (?3 IS NULL OR operation_id>?3)
-         ORDER BY operation_id LIMIT ?4",
+           AND (?3 IS NULL OR operation.operation_id>?3)
+         ORDER BY operation.operation_id LIMIT ?4",
     )?;
     let rows = statement.query_map(
         params![
@@ -3692,16 +3701,20 @@ fn provider_message_reference_page(
     let runtime = runtime_session_id.map(|id| id.into_uuid().as_bytes().to_vec());
     let after = after_message_id.map(|id| id.as_bytes().to_vec());
     let mut statement = connection.prepare(
-        "SELECT substr(message_id,1,17),substr(workspace_id,1,17),
-                substr(recipient_profile_id,1,17),
-                substr(recipient_participation_id,1,17),provider_family,
-                substr(runtime_session_id,1,17),
-                CAST(substr(CAST(provider_conversation_id AS BLOB),1,513) AS TEXT),
-                state,queued_at_ms,updated_at_ms,revision
-         FROM ops_provider_message_outbox
-         WHERE recipient_profile_id=?1 AND (?2 IS NULL OR runtime_session_id=?2)
-           AND (?3 IS NULL OR message_id>?3)
-         ORDER BY message_id LIMIT ?4",
+        "SELECT substr(outbox.message_id,1,17),substr(outbox.workspace_id,1,17),
+                substr(outbox.recipient_profile_id,1,17),
+                substr(outbox.recipient_participation_id,1,17),outbox.provider_family,
+                substr(outbox.runtime_session_id,1,17),
+                CAST(substr(CAST(outbox.provider_conversation_id AS BLOB),1,513) AS TEXT),
+                outbox.state,outbox.queued_at_ms,outbox.updated_at_ms,outbox.revision,
+                project_route.project_id,project_route.binding_revision
+         FROM ops_provider_message_outbox AS outbox
+         LEFT JOIN ops_provider_message_project_routes AS project_route
+           ON project_route.message_id=outbox.message_id
+         WHERE outbox.recipient_profile_id=?1
+           AND (?2 IS NULL OR outbox.runtime_session_id=?2)
+           AND (?3 IS NULL OR outbox.message_id>?3)
+         ORDER BY outbox.message_id LIMIT ?4",
     )?;
     let rows = statement.query_map(
         params![
@@ -3745,6 +3758,8 @@ struct RawProvisionReference {
     prepared_at_ms: i64,
     updated_at_ms: i64,
     revision: i64,
+    project_id: Option<String>,
+    project_binding_revision: Option<i64>,
 }
 
 fn decode_raw_provision_reference(
@@ -3763,6 +3778,8 @@ fn decode_raw_provision_reference(
         prepared_at_ms: row.get(9)?,
         updated_at_ms: row.get(10)?,
         revision: row.get(11)?,
+        project_id: row.get(12)?,
+        project_binding_revision: row.get(13)?,
     })
 }
 
@@ -3792,6 +3809,11 @@ fn decode_provision_reference(
     if updated_at < prepared_at {
         return Err(OperationsError::Corrupt("Agent provision reference clock"));
     }
+    let project = decode_project_reference(
+        raw.project_id,
+        raw.project_binding_revision,
+        "Agent provision reference Project",
+    )?;
     Ok(AgentProfileDeletionProvisionReference {
         operation_id: Uuid::from_bytes(wire::id(raw.operation_id)?),
         request_id: Uuid::from_bytes(wire::id(raw.request_id)?),
@@ -3802,6 +3824,7 @@ fn decode_provision_reference(
         runtime_session_id,
         state: decode_provision_state(raw.state)?,
         provider_conversation_id: raw.provider_conversation_id,
+        project,
         prepared_at,
         updated_at,
         revision,
@@ -3820,6 +3843,8 @@ struct RawProviderMessageReference {
     queued_at_ms: i64,
     updated_at_ms: i64,
     revision: i64,
+    project_id: Option<String>,
+    project_binding_revision: Option<i64>,
 }
 
 fn decode_raw_provider_message_reference(
@@ -3837,6 +3862,8 @@ fn decode_raw_provider_message_reference(
         queued_at_ms: row.get(8)?,
         updated_at_ms: row.get(9)?,
         revision: row.get(10)?,
+        project_id: row.get(11)?,
+        project_binding_revision: row.get(12)?,
     })
 }
 
@@ -3849,12 +3876,19 @@ fn decode_provider_message_reference(
     )?))
     .map_err(|_| OperationsError::Corrupt("provider message reference Runtime ID"))?;
     validate_provider_conversation_id(&raw.provider_conversation_id)?;
-    let target = ProviderMessageTarget::new(
+    let project = decode_project_reference(
+        raw.project_id,
+        raw.project_binding_revision,
+        "provider message reference Project",
+    )?;
+    let target = ProviderMessageTarget::new_with_project_route(
         WorkspaceId::from_uuid(Uuid::from_bytes(wire::id(raw.workspace_id)?)),
         profile_id,
         WorkspaceParticipationId::from_uuid(Uuid::from_bytes(wire::id(raw.participation_id)?))?,
+        AgentProfileProviderFamily::ChatGpt,
         runtime_session_id,
         raw.provider_conversation_id,
+        project,
     )?;
     let queued_at = decode_timestamp(raw.queued_at_ms, "provider message reference queued time")?;
     let updated_at =
@@ -3873,6 +3907,27 @@ fn decode_provider_message_reference(
         updated_at,
         revision,
     })
+}
+
+fn decode_project_reference(
+    project_id: Option<String>,
+    binding_revision: Option<i64>,
+    description: &'static str,
+) -> Result<Option<WorkspaceProjectReference>, OperationsError> {
+    match (project_id, binding_revision) {
+        (None, None) => Ok(None),
+        (Some(project_id), Some(binding_revision)) => {
+            let project_id = ChatGptProjectId::try_from(project_id.as_str())
+                .map_err(|_| OperationsError::Corrupt(description))?;
+            let binding_revision = WorkspaceProjectBindingRevision::new(binding_revision)
+                .map_err(|_| OperationsError::Corrupt("provider route Project revision"))?;
+            Ok(Some(WorkspaceProjectReference::new(
+                project_id,
+                binding_revision,
+            )))
+        }
+        _ => Err(OperationsError::Corrupt("provider route Project shape")),
+    }
 }
 
 #[cfg(test)]

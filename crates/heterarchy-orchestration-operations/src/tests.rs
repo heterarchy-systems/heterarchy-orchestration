@@ -3,13 +3,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use forge_domain::{
-    ActivityCoordinatorActor, ActivityCoordinatorRevision, ActivityId, AgentDeclaredRole,
-    AgentDisplayName, AgentEventId, AgentHandoff, AgentInstanceId, AgentInstanceRevision,
-    AgentPresenceRevision, AgentSessionId, AgentSessionOpenRequestId, AgentTransportKind,
-    AuthenticatedPrincipal, BootstrapActivity, ClaimActivityCoordinator, CoordinationSnapshot,
-    DetachAgent, EstablishWorkspace, InboxReceiptRevision, LocationId, OpenAgentSession,
-    RegisteredAgentSession, RuntimeInstanceId, TimestampMillis, WorkspaceId, WorkspaceRevision,
-    WorkspaceRoot,
+    ActivityCoordinatorActor, ActivityCoordinatorRevision, ActivityId, AgentBindingRejectionReason,
+    AgentDeclaredRole, AgentDisplayName, AgentEventId, AgentHandoff, AgentInstanceId,
+    AgentInstanceRevision, AgentPresenceRevision, AgentSessionId, AgentSessionOpenRequestId,
+    AgentTransportKind, AuthenticatedPrincipal, BootstrapActivity, ClaimActivityCoordinator,
+    CoordinationSnapshot, DetachAgent, DirectTokenId, EstablishWorkspace, InboxReceiptRevision,
+    LocationId, OpenAgentSession, RegisteredAgentSession, RuntimeInstanceId, TimestampMillis,
+    WorkspaceId, WorkspaceRevision, WorkspaceRoot, WorkspaceRootFingerprint,
 };
 use forge_persistence::{
     AgentBindingActivationRequest, AgentBindingReservationRequest, AgentDepartureCommand,
@@ -29,13 +29,549 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    ImportPhase, ImportProgress, LogicalDepartureKind, LogicalDetachCommand, LogicalHandoffCommand,
-    LogicalInboxAck, LogicalInboxEntry, LogicalInboxQuery, LogicalInboxTarget,
-    LogicalPresenceTarget, LogicalPresenceTouch, OperationsCatalog, OperationsError,
-    RegistrationPhase, RegistrationRequest, WorkspaceParticipationId,
-    WorkspaceParticipationReplacementActivationReceipt,
+    BindingActivationObservation, BindingRejectionAttemptDisposition,
+    BindingRejectionAttemptRequest, BindingRejectionObservation,
+    BindingRejectionSourceRequestPolicy, BindingReservationObservation, ImportPhase,
+    ImportProgress, LegacyBindingRejectionEnvelopePolicy, LogicalDepartureKind,
+    LogicalDetachCommand, LogicalHandoffCommand, LogicalInboxAck, LogicalInboxEntry,
+    LogicalInboxQuery, LogicalInboxTarget, LogicalPresenceTarget, LogicalPresenceTouch,
+    OperationsCatalog, OperationsError, RegistrationPhase, RegistrationRequest,
+    ResolveBindingRejectionAttempt, TrustedLegacyBindingRejectionDeployment,
+    WorkspaceParticipationId, WorkspaceParticipationReplacementActivationReceipt,
     WorkspaceParticipationReplacementCommitReceipt, WorkspaceParticipationSessionRebindCommand,
 };
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keeps attempt custody, terminal replay, activation exclusion, and reopen evidence in one end-to-end regression."
+)]
+fn binding_rejection_attempt_is_readback_only_and_preserves_membership_history()
+-> Result<(), Box<dyn Error>> {
+    let destination = Uuid::from_u128(0xEB00);
+    let seed = 0xEB10_u128;
+    let mut source = source_fixture(seed, 1, false, destination)?;
+    let activity_id = ActivityId::from_uuid(Uuid::from_u128(seed + 2));
+    let (catalog_root, catalog_path) = catalog_root(seed)?;
+    let mut catalog = OperationsCatalog::open(&catalog_path, destination)?;
+    let _prepared = catalog.prepare(&source.freeze)?;
+    import_all(&mut catalog, &source)?;
+    verify_all(&mut catalog, &source)?;
+
+    let principal =
+        AuthenticatedPrincipal::DirectToken(DirectTokenId::from_uuid(Uuid::from_u128(0xEB20)));
+    let binding_request_id = Uuid::parse_str("00000000-0000-8000-8000-00000000eb21")?;
+    let binding = AgentBindingReservationRequest::new(
+        binding_request_id,
+        activity_id,
+        AgentInstanceId::from_uuid(Uuid::from_u128(0xEB22)),
+        AgentSessionId::from_uuid(Uuid::from_u128(0xEB23)),
+        principal,
+        timestamp(1_000)?,
+    )?;
+    let registration = RegistrationRequest::new(
+        Uuid::from_u128(0xEB24),
+        binding.clone(),
+        AgentDisplayName::new("terminal worker".to_owned())?,
+        AgentDeclaredRole::new("reviewer".to_owned())?,
+        AgentTransportKind::Other,
+    )?;
+    let _pending = catalog.prepare_registration(source.migration, &registration)?;
+    let reservation =
+        source
+            .store
+            .reserve_agent_binding(&source.freeze, &binding, timestamp(1_100)?)?;
+    let _reserved = catalog.record_registration_reservation(&reservation)?;
+    let commit =
+        catalog.commit_registration_membership(binding.request_id(), &[], timestamp(1_200)?)?;
+    let import = catalog
+        .progress(source.migration)?
+        .ok_or("import missing")?;
+    let attempt = BindingRejectionAttemptRequest::for_registration(
+        source.workspace,
+        Uuid::from_u128(0xEB25),
+        destination,
+        source.migration,
+        source.freeze.revision(),
+        import.digest(),
+        &registration,
+        commit.commit_digest(),
+        timestamp(1_300)?,
+    )?;
+    assert_eq!(
+        catalog.prepare_registration_binding_rejection_attempt(&attempt)?,
+        BindingRejectionAttemptDisposition::DispatchAllowed
+    );
+    let later_replay = BindingRejectionAttemptRequest::for_registration(
+        source.workspace,
+        attempt.issuer_id(),
+        destination,
+        source.migration,
+        source.freeze.revision(),
+        import.digest(),
+        &registration,
+        commit.commit_digest(),
+        timestamp(1_350)?,
+    )?;
+    assert_eq!(
+        catalog.prepare_registration_binding_rejection_attempt(&attempt)?,
+        BindingRejectionAttemptDisposition::ReadbackRequired,
+        "exact replay after a possible dispatch must remain readback-only"
+    );
+    assert!(matches!(
+        catalog.prepare_registration_binding_rejection_attempt(&later_replay),
+        Err(OperationsError::Conflict(
+            "binding rejection attempt replay"
+        ))
+    ));
+    let attempt_before_resolution: Vec<rusqlite::types::Value> = catalog.connection.query_row(
+        "SELECT * FROM ops_binding_rejection_attempts WHERE request_id=?1",
+        params![binding.request_id().as_bytes()],
+        |row| {
+            (0..row.as_ref().column_count())
+                .map(|index| row.get(index))
+                .collect()
+        },
+    )?;
+    drop(catalog);
+    let legacy = Connection::open(&catalog_path)?;
+    legacy.execute_batch(
+        "DROP TABLE ops_agent_provision_uncertainty_retirements;
+         DROP TABLE ops_binding_rejection_attempt_resolutions;",
+    )?;
+    crate::catalog::restore_v46_message_schema_for_legacy_fixture(&legacy)?;
+    crate::catalog::restore_v47_assignment_schema_for_legacy_fixture(&legacy)?;
+    legacy.pragma_update(None, "user_version", 44_i64)?;
+    drop(legacy);
+    let mut catalog = OperationsCatalog::open(&catalog_path, destination)?;
+    assert_eq!(
+        catalog
+            .connection
+            .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))?,
+        crate::catalog::VERSION
+    );
+    let migrated_attempt: Vec<rusqlite::types::Value> = catalog.connection.query_row(
+        "SELECT * FROM ops_binding_rejection_attempts WHERE request_id=?1",
+        params![binding.request_id().as_bytes()],
+        |row| {
+            (0..row.as_ref().column_count())
+                .map(|index| row.get(index))
+                .collect()
+        },
+    )?;
+    assert_eq!(migrated_attempt, attempt_before_resolution);
+    assert!(
+        catalog
+            .registration_binding_rejection_attempt_resolution(binding.request_id())?
+            .is_none(),
+        "a migrated uncertain attempt without an explicit resolution remains readback-only"
+    );
+    assert_eq!(
+        catalog.prepare_registration_binding_rejection_attempt(&attempt)?,
+        BindingRejectionAttemptDisposition::ReadbackRequired
+    );
+    let resolution_request_id = Uuid::from_u128(0xEB26);
+    let resolution = ResolveBindingRejectionAttempt {
+        request_id: binding.request_id(),
+        resolution_request_id,
+        expected_attempt_request_digest: attempt.request_digest(),
+        expected_legacy_client_artifact_digest: [0x94; 32],
+        source_get_observed_at: timestamp(1_360)?,
+        operator_principal: principal,
+        resolved_at: timestamp(1_361)?,
+    };
+    let trusted_deployment = TrustedLegacyBindingRejectionDeployment::new(
+        [0x94; 32],
+        LegacyBindingRejectionEnvelopePolicy::GeneratedUuidV7,
+        8,
+        BindingRejectionSourceRequestPolicy::BodyEqualsEnvelope,
+    )?;
+    let untrusted_deployment = TrustedLegacyBindingRejectionDeployment::new(
+        [0x95; 32],
+        LegacyBindingRejectionEnvelopePolicy::GeneratedUuidV7,
+        8,
+        BindingRejectionSourceRequestPolicy::BodyEqualsEnvelope,
+    )?;
+    assert!(matches!(
+        catalog.resolve_registration_binding_rejection_attempt(&resolution, untrusted_deployment),
+        Err(OperationsError::Conflict(
+            "binding rejection resolution identity"
+        ))
+    ));
+    let proof =
+        catalog.resolve_registration_binding_rejection_attempt(&resolution, trusted_deployment)?;
+    assert_eq!(
+        proof.envelope_policy(),
+        LegacyBindingRejectionEnvelopePolicy::GeneratedUuidV7
+    );
+    assert_eq!(proof.durable_uuid_version(), 8);
+    assert_eq!(
+        proof.source_request_policy(),
+        BindingRejectionSourceRequestPolicy::BodyEqualsEnvelope
+    );
+    assert_eq!(
+        catalog.resolve_registration_binding_rejection_attempt(&resolution, trusted_deployment)?,
+        proof
+    );
+    let mut changed_resolution = resolution.clone();
+    changed_resolution.expected_legacy_client_artifact_digest = [0x95; 32];
+    assert!(matches!(
+        catalog.resolve_registration_binding_rejection_attempt(
+            &changed_resolution,
+            trusted_deployment
+        ),
+        Err(OperationsError::Conflict(_))
+    ));
+    drop(catalog);
+    let mut reopened = OperationsCatalog::open(&catalog_path, destination)?;
+    assert_eq!(
+        reopened.resolve_registration_binding_rejection_attempt(&resolution, trusted_deployment)?,
+        proof
+    );
+    for (column, corrupt, original) in [
+        (
+            "attempt_request_digest",
+            vec![0x96_u8; 32],
+            attempt.request_digest().to_vec(),
+        ),
+        (
+            "legacy_client_artifact_digest",
+            vec![0x97_u8; 32],
+            trusted_deployment.artifact_digest().to_vec(),
+        ),
+        (
+            "operator_principal_id",
+            Uuid::from_u128(0xEB27).as_bytes().to_vec(),
+            Uuid::from_u128(0xEB20).as_bytes().to_vec(),
+        ),
+    ] {
+        reopened.connection.execute(
+            &format!("UPDATE ops_binding_rejection_attempt_resolutions SET {column}=?1 WHERE request_id=?2"),
+            params![corrupt, binding.request_id().as_bytes()],
+        )?;
+        assert!(matches!(
+            reopened.consume_registration_binding_rejection_resolution(
+                binding.request_id(),
+                principal,
+                trusted_deployment,
+                timestamp(1_362)?,
+            ),
+            Err(OperationsError::Corrupt(_))
+        ));
+        reopened.connection.execute(
+            &format!("UPDATE ops_binding_rejection_attempt_resolutions SET {column}=?1 WHERE request_id=?2"),
+            params![original, binding.request_id().as_bytes()],
+        )?;
+    }
+    reopened
+        .connection
+        .pragma_update(None, "ignore_check_constraints", true)?;
+    reopened.connection.execute(
+        "UPDATE ops_binding_rejection_attempt_resolutions SET resolved_at_ms=1359 WHERE request_id=?1",
+        params![binding.request_id().as_bytes()],
+    )?;
+    assert!(matches!(
+        reopened.consume_registration_binding_rejection_resolution(
+            binding.request_id(),
+            principal,
+            trusted_deployment,
+            timestamp(1_362)?,
+        ),
+        Err(OperationsError::Corrupt(_))
+    ));
+    reopened.connection.execute(
+        "UPDATE ops_binding_rejection_attempt_resolutions SET resolved_at_ms=1361,consume_request_id=?1,consumed_at_ms=1360 WHERE request_id=?2",
+        params![resolution_request_id.as_bytes(), binding.request_id().as_bytes()],
+    )?;
+    assert!(matches!(
+        reopened.consume_registration_binding_rejection_resolution(
+            binding.request_id(),
+            principal,
+            trusted_deployment,
+            timestamp(1_362)?,
+        ),
+        Err(OperationsError::Corrupt(_))
+    ));
+    reopened.connection.execute(
+        "UPDATE ops_binding_rejection_attempt_resolutions SET consume_request_id=NULL,consumed_at_ms=NULL WHERE request_id=?1",
+        params![binding.request_id().as_bytes()],
+    )?;
+    reopened.connection.execute(
+        "UPDATE ops_binding_rejection_attempt_resolutions SET source_get_observed_at_ms=1299 WHERE request_id=?1",
+        params![binding.request_id().as_bytes()],
+    )?;
+    assert!(matches!(
+        reopened.consume_registration_binding_rejection_resolution(
+            binding.request_id(),
+            principal,
+            trusted_deployment,
+            timestamp(1_362)?,
+        ),
+        Err(OperationsError::Corrupt(_))
+    ));
+    reopened.connection.execute(
+        "UPDATE ops_binding_rejection_attempt_resolutions SET source_get_observed_at_ms=1360,consume_request_id=?1,consumed_at_ms=1362 WHERE request_id=?2",
+        params![Uuid::from_u128(0xEB28).as_bytes(), binding.request_id().as_bytes()],
+    )?;
+    assert!(matches!(
+        reopened.consume_registration_binding_rejection_resolution(
+            binding.request_id(),
+            principal,
+            trusted_deployment,
+            timestamp(1_362)?,
+        ),
+        Err(OperationsError::Corrupt(_))
+    ));
+    reopened.connection.execute(
+        "UPDATE ops_binding_rejection_attempt_resolutions SET consume_request_id=NULL,consumed_at_ms=NULL WHERE request_id=?1",
+        params![binding.request_id().as_bytes()],
+    )?;
+    reopened
+        .connection
+        .pragma_update(None, "ignore_check_constraints", false)?;
+    drop(reopened);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let consumers = [1_362_i64, 1_363_i64].map(|at| {
+        let path = catalog_path.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        std::thread::spawn(move || -> Result<_, String> {
+            let mut catalog =
+                OperationsCatalog::open(&path, destination).map_err(|error| error.to_string())?;
+            barrier.wait();
+            catalog
+                .consume_registration_binding_rejection_resolution(
+                    binding_request_id,
+                    principal,
+                    trusted_deployment,
+                    TimestampMillis::new(at).map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())
+        })
+    });
+    let mut dispositions = Vec::with_capacity(consumers.len());
+    for consumer in consumers {
+        dispositions.push(consumer.join().map_err(|_| "consumer panicked")??);
+    }
+    dispositions.sort_by_key(|disposition| match disposition {
+        BindingRejectionAttemptDisposition::DispatchAllowed => 0,
+        BindingRejectionAttemptDisposition::ReadbackRequired => 1,
+        BindingRejectionAttemptDisposition::Recorded(_) => 2,
+    });
+    assert!(matches!(
+        dispositions.as_slice(),
+        [
+            BindingRejectionAttemptDisposition::DispatchAllowed,
+            BindingRejectionAttemptDisposition::ReadbackRequired
+        ]
+    ));
+    let mut catalog = OperationsCatalog::open(&catalog_path, destination)?;
+    catalog
+        .connection
+        .pragma_update(None, "ignore_check_constraints", true)?;
+    for (column, corrupt, original) in [
+        ("envelope_policy", 9_i64, 0_i64),
+        ("durable_uuid_version", 7_i64, 8_i64),
+        ("source_contract", 9_i64, 0_i64),
+    ] {
+        catalog.connection.execute(
+            &format!("UPDATE ops_binding_rejection_attempt_resolutions SET {column}=?1 WHERE request_id=?2"),
+            params![corrupt, binding.request_id().as_bytes()],
+        )?;
+        assert!(matches!(
+            catalog.resolve_registration_binding_rejection_attempt(&resolution, trusted_deployment),
+            Err(OperationsError::Corrupt(_))
+        ));
+        catalog.connection.execute(
+            &format!("UPDATE ops_binding_rejection_attempt_resolutions SET {column}=?1 WHERE request_id=?2"),
+            params![original, binding.request_id().as_bytes()],
+        )?;
+    }
+    catalog
+        .connection
+        .pragma_update(None, "ignore_check_constraints", false)?;
+    let attempt_after_resolution: Vec<rusqlite::types::Value> = catalog.connection.query_row(
+        "SELECT * FROM ops_binding_rejection_attempts WHERE request_id=?1",
+        params![binding.request_id().as_bytes()],
+        |row| {
+            (0..row.as_ref().column_count())
+                .map(|index| row.get(index))
+                .collect()
+        },
+    )?;
+    assert_eq!(attempt_after_resolution, attempt_before_resolution);
+
+    let root_fingerprint = WorkspaceRootFingerprint::from_bytes([0x31; 16]);
+    let binding_digest = [0x32; 32];
+    let delegation_digest = [0x33; 32];
+    let observed_at = timestamp(1_400)?;
+    let rejected_at = timestamp(1_401)?;
+    let mut receipt_hasher = Sha256::new();
+    receipt_hasher.update(b"forge.agent.binding.rejection.receipt.v1\0");
+    receipt_hasher.update(attempt.request_digest());
+    receipt_hasher.update(binding.request_id().as_bytes());
+    receipt_hasher.update(source.workspace.into_uuid().as_bytes());
+    receipt_hasher.update(binding.activity_id().into_uuid().as_bytes());
+    receipt_hasher.update(binding.agent_id().into_uuid().as_bytes());
+    receipt_hasher.update(binding.session_id().into_uuid().as_bytes());
+    receipt_hasher.update([1]);
+    let AuthenticatedPrincipal::DirectToken(token_id) = principal else {
+        return Err("expected DirectToken".into());
+    };
+    receipt_hasher.update(token_id.into_uuid().as_bytes());
+    receipt_hasher.update(source.migration.as_bytes());
+    receipt_hasher.update(destination.as_bytes());
+    receipt_hasher.update(source.freeze.revision().to_le_bytes());
+    receipt_hasher.update(import.digest());
+    receipt_hasher.update(attempt.issuer_id().as_bytes());
+    receipt_hasher.update(root_fingerprint.as_bytes());
+    receipt_hasher.update(binding_digest);
+    receipt_hasher.update(delegation_digest);
+    receipt_hasher.update(commit.commit_digest());
+    for text in [
+        registration.display_name().as_str(),
+        registration.declared_role().as_str(),
+    ] {
+        receipt_hasher.update((text.len() as u64).to_le_bytes());
+        receipt_hasher.update(text.as_bytes());
+    }
+    receipt_hasher.update([3]);
+    receipt_hasher.update(reservation.reserved_at().get().to_le_bytes());
+    receipt_hasher.update(binding.requested_at().get().to_le_bytes());
+    receipt_hasher.update(observed_at.get().to_le_bytes());
+    receipt_hasher.update(rejected_at.get().to_le_bytes());
+    let receipt_digest: [u8; 32] = receipt_hasher.finalize().into();
+    let observation = BindingRejectionObservation::new(
+        binding.request_id(),
+        source.workspace,
+        binding.activity_id(),
+        binding.agent_id(),
+        binding.session_id(),
+        binding.principal(),
+        source.migration,
+        destination,
+        source.freeze.revision(),
+        import.digest(),
+        attempt.issuer_id(),
+        root_fingerprint,
+        binding_digest,
+        delegation_digest,
+        commit.commit_digest(),
+        registration.display_name().clone(),
+        registration.declared_role().clone(),
+        registration.transport(),
+        AgentBindingRejectionReason::PrincipalTransportMismatch,
+        reservation.reserved_at(),
+        binding.requested_at(),
+        observed_at,
+        rejected_at,
+        attempt.request_digest(),
+        receipt_digest,
+    )?;
+    let receipt = catalog.record_registration_binding_rejection_observation(&observation)?;
+    assert_eq!(receipt.membership_digest(), commit.commit_digest());
+    assert_eq!(receipt.binding(), &binding);
+    assert_eq!(
+        catalog.record_registration_binding_rejection_observation(&observation)?,
+        receipt
+    );
+    assert_eq!(
+        catalog.prepare_registration_binding_rejection_attempt(&attempt)?,
+        BindingRejectionAttemptDisposition::Recorded(Box::new(receipt.clone()))
+    );
+    assert_eq!(
+        catalog
+            .registration_progress(binding.request_id())?
+            .ok_or("registration missing")?
+            .phase(),
+        RegistrationPhase::MembershipCommitted
+    );
+    assert!(
+        catalog
+            .registration_activation(binding.request_id())?
+            .is_none()
+    );
+
+    let activation = BindingActivationObservation::new(
+        BindingReservationObservation::from_native(&reservation)?,
+        commit.commit_digest(),
+        registration.display_name().clone(),
+        registration.declared_role().clone(),
+        registration.transport(),
+        timestamp(1_500)?,
+    )?;
+    assert!(matches!(
+        catalog.record_registration_activation_observation(&activation),
+        Err(OperationsError::Conflict(
+            "binding rejection already recorded"
+        ))
+    ));
+
+    drop(catalog);
+    let reopened = OperationsCatalog::open(&catalog_path, destination)?;
+    assert_eq!(
+        reopened.registration_binding_rejection(binding.request_id())?,
+        Some(receipt.clone())
+    );
+    drop(reopened);
+
+    for (column, corrupt, original) in [
+        (
+            "request_digest",
+            vec![0x91_u8; 32],
+            receipt.request_digest().to_vec(),
+        ),
+        (
+            "receipt_digest",
+            vec![0x92_u8; 32],
+            receipt.receipt_digest().to_vec(),
+        ),
+        (
+            "binding_digest",
+            vec![0x93_u8; 32],
+            receipt.binding_digest().to_vec(),
+        ),
+    ] {
+        let connection = Connection::open(&catalog_path)?;
+        connection.execute(
+            &format!("UPDATE ops_binding_rejections SET {column}=?1 WHERE request_id=?2"),
+            params![&corrupt, binding.request_id().as_bytes()],
+        )?;
+        if column == "request_digest" {
+            connection.execute(
+                "UPDATE ops_binding_rejection_attempts SET request_digest=?1 WHERE request_id=?2",
+                params![&corrupt, binding.request_id().as_bytes()],
+            )?;
+        }
+        drop(connection);
+        let corrupted = OperationsCatalog::open(&catalog_path, destination)?;
+        assert!(matches!(
+            corrupted.registration_binding_rejection(binding.request_id()),
+            Err(OperationsError::Corrupt(_))
+        ));
+        drop(corrupted);
+        let connection = Connection::open(&catalog_path)?;
+        connection.execute(
+            &format!("UPDATE ops_binding_rejections SET {column}=?1 WHERE request_id=?2"),
+            params![&original, binding.request_id().as_bytes()],
+        )?;
+        if column == "request_digest" {
+            connection.execute(
+                "UPDATE ops_binding_rejection_attempts SET request_digest=?1 WHERE request_id=?2",
+                params![&original, binding.request_id().as_bytes()],
+            )?;
+        }
+    }
+    let restored = OperationsCatalog::open(&catalog_path, destination)?;
+    assert_eq!(
+        restored.registration_binding_rejection(binding.request_id())?,
+        Some(receipt)
+    );
+    drop(restored);
+    source.cleanup()?;
+    fs::remove_dir_all(catalog_root)?;
+    Ok(())
+}
 
 struct SourceFixture {
     root: PathBuf,
@@ -308,14 +844,17 @@ fn source_fixture(
         &format!("operations test Agent {}", seed + 0x10),
         timestamp(3)?,
     )?;
-    let _ = store.claim_activity_coordinator(ClaimActivityCoordinator::new(
-        workspace,
-        activity,
-        coordinator_id,
-        AuthenticatedPrincipal::TrustedStdio,
+    let _ = store.claim_activity_coordinator(
+        ClaimActivityCoordinator::new(
+            workspace,
+            activity,
+            coordinator_id,
+            AuthenticatedPrincipal::TrustedStdio,
+            timestamp(4)?,
+            coordinator_session,
+        ),
         timestamp(4)?,
-        coordinator_session,
-    ))?;
+    )?;
 
     for ordinal in 0..participant_count {
         let participant_seed = seed + 0x100 + u128::from(ordinal);
@@ -924,6 +1463,517 @@ fn historical_event_snapshots_preserve_distinct_revisions_without_live_members()
     assert_ne!(crate::events::event_digest(&changed)?, expected);
     drop(catalog);
     fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "Keeps the real Source import, native registration activation, append, replay, and reopen evidence together."
+)]
+fn ready_native_participant_can_append_enqueue_replay_and_read_back_node_message()
+-> Result<(), Box<dyn Error>> {
+    let destination = Uuid::from_u128(0xFC00);
+    let seed = 0xFC01;
+    let mut source = source_fixture(seed, 1, false, destination)?;
+    let (catalog_root, catalog_path) = catalog_root(seed)?;
+    let mut catalog = OperationsCatalog::open(&catalog_path, destination)?;
+    let _prepared = catalog.prepare(&source.freeze)?;
+    import_all(&mut catalog, &source)?;
+    assert_eq!(
+        verify_all(&mut catalog, &source)?.phase(),
+        ImportPhase::Verified
+    );
+
+    let workspace = source.workspace;
+    let activity = ActivityId::from_uuid(Uuid::from_u128(seed + 2));
+    let session = AgentSessionId::from_uuid(Uuid::from_u128(seed + 0x100));
+    let agent = AgentInstanceId::from_uuid(Uuid::from_u128(seed + 0x101));
+    let participant_id =
+        crate::native_session_participation_id(workspace.into_uuid(), session.into_uuid());
+    let principal = AuthenticatedPrincipal::DirectToken(DirectTokenId::from_uuid(Uuid::from_u128(
+        seed + 0x103,
+    )));
+    let binding = AgentBindingReservationRequest::new(
+        Uuid::from_u128(seed + 0x104),
+        activity,
+        agent,
+        session,
+        principal,
+        timestamp(1_001)?,
+    )?;
+    let request = RegistrationRequest::new(
+        participant_id,
+        binding.clone(),
+        AgentDisplayName::new("Native Main".to_owned())?,
+        AgentDeclaredRole::new("coordinator".to_owned())?,
+        AgentTransportKind::StreamableHttp,
+    )?;
+    let pending = catalog.prepare_registration(source.migration, &request)?;
+    assert_eq!(pending.participant_id(), participant_id);
+    assert_eq!(
+        catalog.registration_profile_scope(binding.request_id())?,
+        None
+    );
+
+    let committed = reserve_and_commit_registration(
+        &mut source,
+        &mut catalog,
+        &binding,
+        &[],
+        timestamp(1_002)?,
+        timestamp(2_000)?,
+    )?;
+    let delegation =
+        source
+            .store
+            .delegate_agent_operations(&source.freeze, [0xFC; 32], timestamp(2_500)?)?;
+    activate_registration(
+        &mut source,
+        &mut catalog,
+        &delegation,
+        &binding,
+        &committed,
+        timestamp(3_000)?,
+    )?;
+    assert_eq!(
+        catalog.ready_participant_for_agent(workspace, activity, agent)?,
+        Some(participant_id)
+    );
+    let logical = catalog
+        .logical_identity_for_session(workspace, session)?
+        .ok_or("native logical Session missing")?;
+    assert_eq!(logical.participant_id(), participant_id);
+    assert_eq!(logical.session_id(), session);
+
+    let message_id = Uuid::from_u128(seed + 0x105);
+    let command = crate::AppendWorkspaceMessageCommand {
+        message_id,
+        workspace_id: workspace,
+        channel: crate::MessageChannel::Workspace,
+        actor: crate::OperationalActor::Participant {
+            activity_id: activity,
+            agent_id: agent,
+            session_id: session,
+        },
+        body: "Native Main joined the workspace discussion".to_owned(),
+        submitted_at: timestamp(3_001)?,
+        context: crate::MessageContext::default(),
+    };
+    let appended = catalog.append_workspace_message(command.clone())?;
+    assert!(appended.created());
+    assert_eq!(appended.message().author_display_name(), "Native Main");
+    assert!(matches!(
+        appended.message().author(),
+        crate::MessageAuthor::NativeParticipant {
+            participant_id: stored_participant,
+            session_id: stored_session,
+        } if *stored_participant == participant_id && *stored_session == session
+    ));
+
+    drop(catalog);
+    let mut reopened = OperationsCatalog::open(&catalog_path, destination)?;
+    let stored = reopened
+        .workspace_message(message_id)?
+        .ok_or("native message missing after reopen")?;
+    assert_eq!(stored.author_display_name(), "Native Main");
+    assert_eq!(stored.body(), "Native Main joined the workspace discussion");
+    let replay = reopened.append_workspace_message(command.clone())?;
+    assert!(!replay.created());
+    assert_eq!(replay.message(), &stored);
+
+    let node_context = crate::MessageContext::new(
+        Some(activity),
+        Some(forge_domain::GoalId::from_uuid(Uuid::from_u128(
+            seed + 0x109,
+        ))),
+        Some(timestamp(3_002)?),
+        Some(forge_domain::DagRevisionNumber::INITIAL),
+        Some(forge_domain::GoalRevision::INITIAL),
+        Some(forge_domain::DagNodeId::from_uuid(Uuid::from_u128(
+            seed + 0x10A,
+        ))),
+    )?;
+    let (target, node_witness, leadership_revision) = seed_native_node_route(
+        &mut reopened,
+        &source,
+        destination,
+        command.actor,
+        participant_id,
+        node_context,
+        seed,
+    )?;
+    let node_command = crate::AppendWorkspaceMessageCommand {
+        message_id: Uuid::from_u128(seed + 0x10B),
+        workspace_id: workspace,
+        channel: crate::MessageChannel::Direct(target.participation_id()),
+        actor: command.actor,
+        body: "Native Main node conversation".to_owned(),
+        submitted_at: timestamp(5_002)?,
+        context: node_context,
+    };
+    let node_first = reopened.append_and_enqueue_provider_message(
+        node_command.clone(),
+        target.clone(),
+        Some(node_witness.clone()),
+    )?;
+    assert!(node_first.created());
+    assert_eq!(
+        node_first.outbox().state(),
+        crate::ProviderMessageState::Queued
+    );
+    assert_eq!(
+        node_first.outbox().node_route_witness(),
+        Some(&node_witness)
+    );
+    let node_message = reopened
+        .workspace_message(node_command.message_id)?
+        .ok_or("native node message missing after append")?;
+    assert!(matches!(
+        node_message.author(),
+        crate::MessageAuthor::NativeParticipant {
+            participant_id: stored_participant,
+            session_id: stored_session,
+        } if *stored_participant == participant_id && *stored_session == session
+    ));
+
+    let mut stale_command = node_command.clone();
+    stale_command.message_id = Uuid::from_u128(seed + 0x120);
+    let stale_leadership_revision = leadership_revision
+        .checked_add(1)
+        .ok_or("leadership revision overflow")?;
+    let stale_witness = crate::NodeMessageRouteWitness::new(
+        node_witness.operation_id(),
+        node_witness.participation_revision(),
+        node_witness.runtime_revision(),
+        stale_command.actor,
+        Some(stale_leadership_revision),
+        node_witness.target(),
+    )?;
+    assert!(matches!(
+        reopened.append_and_enqueue_provider_message(
+            stale_command.clone(),
+            target.clone(),
+            Some(stale_witness),
+        ),
+        Err(OperationsError::Conflict("node message sender leadership"))
+    ));
+    assert!(
+        reopened
+            .workspace_message(stale_command.message_id)?
+            .is_none()
+    );
+    assert!(
+        reopened
+            .provider_message_outbox(stale_command.message_id)?
+            .is_none()
+    );
+
+    let replay = reopened.append_and_enqueue_provider_message(
+        node_command.clone(),
+        target.clone(),
+        Some(node_witness.clone()),
+    )?;
+    assert!(!replay.created());
+    assert_eq!(replay.outbox(), node_first.outbox());
+    assert_eq!(
+        reopened
+            .workspace_message(node_command.message_id)?
+            .as_ref(),
+        Some(&node_message)
+    );
+
+    drop(reopened);
+    let mut reopened = OperationsCatalog::open(&catalog_path, destination)?;
+    let stored_message = reopened
+        .workspace_message(node_command.message_id)?
+        .ok_or("native node message missing after reopen")?;
+    let stored_outbox = reopened
+        .provider_message_outbox(node_command.message_id)?
+        .ok_or("native node outbox missing after reopen")?;
+    assert_eq!(stored_message, node_message);
+    assert_eq!(stored_outbox, *node_first.outbox());
+    let replay = reopened.append_and_enqueue_provider_message(
+        node_command.clone(),
+        target,
+        Some(node_witness),
+    )?;
+    assert!(!replay.created());
+    assert_eq!(replay.outbox(), &stored_outbox);
+    let message_count: i64 = reopened.connection.query_row(
+        "SELECT count(*) FROM ops_workspace_messages WHERE message_id=?1",
+        rusqlite::params![node_command.message_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    let outbox_count: i64 = reopened.connection.query_row(
+        "SELECT count(*) FROM ops_provider_message_outbox WHERE message_id=?1",
+        rusqlite::params![node_command.message_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    assert_eq!(message_count, 1);
+    assert_eq!(outbox_count, 1);
+    drop(reopened);
+    source.cleanup()?;
+    fs::remove_dir_all(catalog_root)?;
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "Builds one real Operations recipient route, node assignment, and current native leadership witness for the queue regression."
+)]
+fn seed_native_node_route(
+    catalog: &mut OperationsCatalog,
+    source: &SourceFixture,
+    destination: Uuid,
+    sender: crate::OperationalActor,
+    sender_participant: Uuid,
+    context: crate::MessageContext,
+    seed: u128,
+) -> Result<
+    (
+        crate::ProviderMessageTarget,
+        crate::NodeMessageRouteWitness,
+        i64,
+    ),
+    Box<dyn Error>,
+> {
+    let workspace = source.workspace;
+    let migration_id = source.migration;
+    let (activity, sender_agent, sender_session) = match sender {
+        crate::OperationalActor::Participant {
+            activity_id,
+            agent_id,
+            session_id,
+        } => (activity_id, agent_id, session_id),
+        crate::OperationalActor::LocalOperator => return Err("native sender required".into()),
+    };
+    let operation_id = Uuid::from_u128(seed + 0x200);
+    let request_id = Uuid::from_u128(seed + 0x201);
+    let recipient_participant = Uuid::from_u128(seed + 0x202);
+    let recipient_agent = AgentInstanceId::from_uuid(Uuid::from_u128(seed + 0x203));
+    let recipient_session = AgentSessionId::from_uuid(Uuid::from_u128(seed + 0x204));
+    let profile_id = AgentProfileId::from_uuid(Uuid::from_u128(seed + 0x205))?;
+    let participation_id = WorkspaceParticipationId::from_uuid(Uuid::from_u128(seed + 0x206))?;
+    let runtime_session_id =
+        heterarchy_orchestration_sessions::AgentProfileRuntimeSessionId::from_uuid(
+            Uuid::from_u128(seed + 0x207),
+        )?;
+    let assignment_id = Uuid::from_u128(seed + 0x208);
+    let leadership_assignment_id = Uuid::from_u128(seed + 0x209);
+
+    catalog.connection.execute(
+        "INSERT INTO ops_workspace_participations(workspace_id,agent_profile_id,participation_id,created_at_ms,revision) VALUES(?1,?2,?3,4000,1)",
+        rusqlite::params![workspace.into_uuid().as_bytes(), profile_id.into_uuid().as_bytes(), participation_id.into_uuid().as_bytes()],
+    )?;
+    catalog.connection.execute(
+        "INSERT INTO ops_logical_members(workspace_id,participant_id,session_id,principal_kind,principal_id,display_name,declared_role,transport_kind,membership_revision,created_at_ms) VALUES(?1,?2,?3,0,NULL,'Node target','worker',1,1,4000)",
+        rusqlite::params![workspace.into_uuid().as_bytes(), recipient_participant.as_bytes(), recipient_session.into_uuid().as_bytes()],
+    )?;
+    catalog.connection.execute(
+        "INSERT INTO ops_current_effect_bindings(workspace_id,participant_id,activity_id,session_id,agent_id,source_kind,source_request_id) VALUES(?1,?2,?3,?4,?5,0,?6)",
+        rusqlite::params![workspace.into_uuid().as_bytes(), recipient_participant.as_bytes(), activity.into_uuid().as_bytes(), recipient_session.into_uuid().as_bytes(), recipient_agent.into_uuid().as_bytes(), operation_id.as_bytes()],
+    )?;
+    catalog.connection.execute(
+        "INSERT INTO ops_workspace_participation_mappings(request_id,workspace_id,participation_id,agent_profile_id,profile_revision,profile_mapping_request_id,session_id,session_revision,participant_id,participant_membership_revision,mapped_at_ms) VALUES(?1,?2,?3,?4,1,?5,?6,1,?7,1,4000)",
+        rusqlite::params![Uuid::from_u128(seed + 0x20A).as_bytes(), workspace.into_uuid().as_bytes(), participation_id.into_uuid().as_bytes(), profile_id.into_uuid().as_bytes(), operation_id.as_bytes(), recipient_session.into_uuid().as_bytes(), recipient_participant.as_bytes()],
+    )?;
+    catalog.connection.execute(
+        "INSERT INTO ops_agent_requests(request_id,workspace_id,activity_id,requester_agent_id,requester_session_id,coordinator_revision,objective,capability,requested_count,effect_scope,independence_requirement,reason,state,created_at_ms,revision) VALUES(?1,?2,?3,?4,?5,1,'node','worker',1,0,0,'native node conversation',1,4000,1)",
+        rusqlite::params![request_id.as_bytes(), workspace.into_uuid().as_bytes(), activity.into_uuid().as_bytes(), sender_agent.into_uuid().as_bytes(), sender_session.into_uuid().as_bytes()],
+    )?;
+    catalog.connection.execute(
+        "INSERT INTO ops_agent_request_resolutions(request_id,slot_ordinal,resolution_kind,claim_id,profile_id,profile_revision,runtime_session_id,runtime_session_revision,policy_revision,reserved_at_ms) VALUES(?1,0,2,?2,?3,1,?4,1,1,4000)",
+        rusqlite::params![request_id.as_bytes(), Uuid::from_u128(seed + 0x20B).as_bytes(), profile_id.into_uuid().as_bytes(), runtime_session_id.into_uuid().as_bytes()],
+    )?;
+    catalog.connection.execute(
+        "INSERT INTO ops_agent_provision_operations(operation_id,request_id,slot_ordinal,effect_kind,provider_family,profile_id,runtime_session_id,state,provider_conversation_id,prepared_at_ms,updated_at_ms,revision) VALUES(?1,?2,0,1,1,?3,?4,5,'native-node-conversation',4000,4000,1)",
+        rusqlite::params![operation_id.as_bytes(), request_id.as_bytes(), profile_id.into_uuid().as_bytes(), runtime_session_id.into_uuid().as_bytes()],
+    )?;
+
+    let scope = crate::NodeTeamBindingScope::new(
+        workspace,
+        activity,
+        context.goal_id().ok_or("node Goal missing")?,
+        context
+            .goal_created_at()
+            .ok_or("node creation timestamp missing")?,
+        context.dag_revision().ok_or("node DAG revision missing")?,
+        context
+            .dag_base_goal_revision()
+            .ok_or("node base Goal revision missing")?,
+        context.node_id().ok_or("node ID missing")?,
+    )?;
+    let _assignment_affinity =
+        catalog.record_assignment_affinity(&crate::AssignmentAffinityCommand {
+            workspace_id: workspace,
+            assignment_id: forge_domain::AgentAssignmentId::from_uuid(assignment_id),
+            activity_id: activity,
+            target_agent_id: recipient_agent,
+            target_session_id: recipient_session,
+            expected_target_principal: forge_domain::AuthenticatedPrincipal::TrustedStdio,
+            requester: crate::OperationalActor::LocalOperator,
+            team_id: None,
+            assignment_payload_fingerprint: [0xD1; 32],
+            original_offer_payload: b"native-node-fixture".to_vec(),
+            observed_at: timestamp(4_100)?,
+            node_scope: scope,
+            expected_binding_revision: None,
+        })?;
+
+    let offered_at = 5_000;
+    catalog.connection.execute(
+        "INSERT INTO ops_effect_fact_consumers(migration_id,workspace_id,destination_id,last_sequence,applied_count) VALUES(?1,?2,?3,0,0)",
+        rusqlite::params![migration_id.as_bytes(), workspace.into_uuid().as_bytes(), destination.as_bytes()],
+    )?;
+    catalog.connection.execute(
+        "INSERT INTO ops_assignment_offer_projection(migration_id,source_sequence,fact_digest,assignment_id,workspace_id,activity_id,goal_id,node_id,target_agent_id,target_session_id,credit_budget,offered_at_ms) VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?10)",
+        rusqlite::params![migration_id.as_bytes(), [0xD1_u8; 32].as_slice(), leadership_assignment_id.as_bytes(), workspace.into_uuid().as_bytes(), activity.into_uuid().as_bytes(), context.goal_id().ok_or("node Goal missing")?.into_uuid().as_bytes(), context.node_id().ok_or("node ID missing")?.into_uuid().as_bytes(), sender_agent.into_uuid().as_bytes(), sender_session.into_uuid().as_bytes(), offered_at],
+    )?;
+    {
+        let transaction = catalog.connection.transaction()?;
+        crate::leadership::bootstrap_from_offer(
+            &transaction,
+            crate::leadership::OfferBootstrapObservation {
+                workspace_id: workspace,
+                activity_id: activity,
+                assignment_id: forge_domain::AgentAssignmentId::from_uuid(leadership_assignment_id),
+                target_agent_id: sender_agent,
+                offered_at_ms: offered_at,
+            },
+        )?;
+        transaction.commit()?;
+    }
+    let leadership_scope = crate::LeadershipScope::workspace(workspace);
+    let bootstrapped = catalog
+        .leadership_scope_view(leadership_scope, offered_at)?
+        .ok_or("native Workspace leadership bootstrap missing")?;
+    let confirmed = catalog.confirm_bootstrap_evidence(crate::ConfirmBootstrapEvidenceCommand {
+        scope: leadership_scope,
+        assignment_id: forge_domain::AgentAssignmentId::from_uuid(leadership_assignment_id),
+        expected_revision: bootstrapped.leadership_revision(),
+        now_ms: offered_at + 1,
+    })?;
+    let authority = catalog
+        .current_leadership_authority(leadership_scope)?
+        .ok_or("native Workspace leader missing")?;
+    assert_eq!(authority.participant_id(), sender_participant);
+    assert_eq!(
+        authority.leadership_revision(),
+        confirmed.leadership_revision()
+    );
+
+    let target = crate::ProviderMessageTarget::new(
+        workspace,
+        profile_id,
+        participation_id,
+        runtime_session_id,
+        "native-node-conversation".to_owned(),
+    )?;
+    let witness = crate::NodeMessageRouteWitness::new(
+        operation_id,
+        1,
+        1,
+        sender,
+        Some(authority.leadership_revision()),
+        crate::NodeMessageRouteTarget::Agent {
+            assignment_id,
+            assignment_revision: 1,
+            agent_id: recipient_agent.into_uuid(),
+            session_id: recipient_session.into_uuid(),
+        },
+    )?;
+    Ok((target, witness, authority.leadership_revision()))
+}
+
+#[test]
+fn ready_registration_without_canonical_native_marker_cannot_claim_native_actor()
+-> Result<(), Box<dyn Error>> {
+    let destination = Uuid::from_u128(0xFC10);
+    let seed = 0xFC11;
+    let mut source = source_fixture(seed, 1, false, destination)?;
+    let (catalog_root, catalog_path) = catalog_root(seed)?;
+    let mut catalog = OperationsCatalog::open(&catalog_path, destination)?;
+    let _prepared = catalog.prepare(&source.freeze)?;
+    import_all(&mut catalog, &source)?;
+    verify_all(&mut catalog, &source)?;
+
+    let workspace = source.workspace;
+    let activity = ActivityId::from_uuid(Uuid::from_u128(seed + 2));
+    let session = AgentSessionId::from_uuid(Uuid::from_u128(seed + 0x100));
+    let agent = AgentInstanceId::from_uuid(Uuid::from_u128(seed + 0x101));
+    let participant_id = Uuid::from_u128(seed + 0x102);
+    assert_ne!(
+        participant_id,
+        crate::native_session_participation_id(workspace.into_uuid(), session.into_uuid())
+    );
+    let principal = AuthenticatedPrincipal::DirectToken(DirectTokenId::from_uuid(Uuid::from_u128(
+        seed + 0x103,
+    )));
+    let binding = AgentBindingReservationRequest::new(
+        Uuid::from_u128(seed + 0x104),
+        activity,
+        agent,
+        session,
+        principal,
+        timestamp(1_001)?,
+    )?;
+    let request = RegistrationRequest::new(
+        participant_id,
+        binding.clone(),
+        AgentDisplayName::new("Unmarked participant".to_owned())?,
+        AgentDeclaredRole::new("coordinator".to_owned())?,
+        AgentTransportKind::StreamableHttp,
+    )?;
+    let _pending = catalog.prepare_registration(source.migration, &request)?;
+    let committed = reserve_and_commit_registration(
+        &mut source,
+        &mut catalog,
+        &binding,
+        &[],
+        timestamp(1_002)?,
+        timestamp(2_000)?,
+    )?;
+    let delegation =
+        source
+            .store
+            .delegate_agent_operations(&source.freeze, [0xFC; 32], timestamp(2_500)?)?;
+    activate_registration(
+        &mut source,
+        &mut catalog,
+        &delegation,
+        &binding,
+        &committed,
+        timestamp(3_000)?,
+    )?;
+    assert_eq!(
+        catalog.ready_participant_for_agent(workspace, activity, agent)?,
+        Some(participant_id)
+    );
+
+    let result = catalog.append_workspace_message(crate::AppendWorkspaceMessageCommand {
+        message_id: Uuid::from_u128(seed + 0x105),
+        workspace_id: workspace,
+        channel: crate::MessageChannel::Workspace,
+        actor: crate::OperationalActor::Participant {
+            activity_id: activity,
+            agent_id: agent,
+            session_id: session,
+        },
+        body: "Must not infer native identity from an absent Profile scope".to_owned(),
+        submitted_at: timestamp(3_001)?,
+        context: crate::MessageContext::default(),
+    });
+    assert!(matches!(
+        result,
+        Err(OperationsError::Conflict(
+            "operational actor has no current logical participation"
+        ))
+    ));
+
+    drop(catalog);
+    source.cleanup()?;
+    fs::remove_dir_all(catalog_root)?;
     Ok(())
 }
 
@@ -3051,10 +4101,11 @@ fn detach_ready_replacement_fixture(
         fixture.old_binding.principal(),
         departure_digest(request_id),
     )?;
-    let source_receipt = fixture
-        .source
-        .store
-        .reconcile_agent_departure(&fixture.delegation, &departure_request)?;
+    let source_receipt = fixture.source.store.reconcile_agent_departure(
+        &fixture.delegation,
+        &departure_request,
+        timestamp(4_000)?,
+    )?;
     let command = LogicalDetachCommand::new(
         fixture.source.workspace,
         fixture.old_binding.activity_id(),
@@ -3260,10 +4311,11 @@ fn replacement_departure_readback_uses_its_immutable_registration_request()
         binding.principal(),
         departure_digest(request_id),
     )?;
-    let source_receipt = fixture
-        .source
-        .store
-        .reconcile_agent_departure(&fixture.delegation, &departure_request)?;
+    let source_receipt = fixture.source.store.reconcile_agent_departure(
+        &fixture.delegation,
+        &departure_request,
+        timestamp(6_000)?,
+    )?;
     let command = LogicalDetachCommand::new(
         fixture.source.workspace,
         binding.activity_id(),
@@ -3626,9 +4678,11 @@ fn logical_detach_uses_forge_departure_receipt_without_legacy_operational_writes
         binding.principal(),
         departure_digest(request_id),
     )?;
-    let source_receipt = source
-        .store
-        .reconcile_agent_departure(&delegation, &departure_request)?;
+    let source_receipt = source.store.reconcile_agent_departure(
+        &delegation,
+        &departure_request,
+        timestamp(4_000)?,
+    )?;
     let counts_after_forge = source_legacy_operational_counts(&source)?;
     assert_eq!(counts_after_forge[0], legacy_counts_before[0]);
     assert_eq!(counts_after_forge[1], legacy_counts_before[1]);
@@ -3860,16 +4914,17 @@ fn logical_handoff_records_events_and_single_unacknowledged_target_receipt()
         workspace_leadership.leader_participant_id(),
         Some(participants[0])
     );
-    let _claimed = source
-        .store
-        .claim_activity_coordinator(ClaimActivityCoordinator::new(
+    let _claimed = source.store.claim_activity_coordinator(
+        ClaimActivityCoordinator::new(
             source.workspace,
             activity_id,
             source_binding.agent_id(),
             source_binding.principal(),
             timestamp(3_200)?,
             source_binding.session_id(),
-        ))?;
+        ),
+        timestamp(3_200)?,
+    )?;
     let source_touch = catalog.touch_logical_presence(logical_presence_touch(
         source.workspace,
         &source_binding,
@@ -3916,9 +4971,11 @@ fn logical_handoff_records_events_and_single_unacknowledged_target_receipt()
         source_binding.principal(),
         departure_digest(request_id),
     )?;
-    let source_receipt = source
-        .store
-        .reconcile_agent_departure(&delegation, &departure_request)?;
+    let source_receipt = source.store.reconcile_agent_departure(
+        &delegation,
+        &departure_request,
+        timestamp(4_000)?,
+    )?;
     let counts_after_forge = source_legacy_operational_counts(&source)?;
     assert_eq!(counts_after_forge[0], legacy_counts_before[0]);
     assert_eq!(counts_after_forge[1], legacy_counts_before[1]);

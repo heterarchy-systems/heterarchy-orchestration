@@ -15,11 +15,11 @@ use heterarchy_orchestration_operations::{
     AppendWorkspaceMessageCommand, LeadershipScope, MessageAuthor, MessageChannel, MessageContext,
     MessageId, MessageReadScope, NodeMessageRouteWitness, OperationalActor, OperationsCatalog,
     OperationsError, ProviderMessageState, ProviderMessageTarget, WorkspaceMessage,
-    validate_chat_text,
+    WorkspaceProjectReference, validate_chat_text,
 };
 use heterarchy_orchestration_sessions::{
     AgentProfileCatalog, AgentProfileError, AgentProfileId, AgentProfileLifecycleState,
-    AgentProfileRuntimeSessionState,
+    AgentProfileProviderFamily, AgentProfileRuntimeSessionState,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -32,6 +32,13 @@ const CHAT_TARGET_LIMIT: usize = 8;
 #[cfg(test)]
 mod auth_tests {
     use super::*;
+    use crate::{
+        access::OperatorPolicy,
+        provider_chat::{ProviderIncomingCommand, ProviderIncomingRole},
+        provisioning::AgentRequestSubmit,
+    };
+    use heterarchy_orchestration_operations::{AgentRequestEffectScope, AgentRequestIndependence};
+    use rusqlite::{Connection, params};
     #[test]
     fn participant_cannot_use_operator_or_foreign_or_closed_session()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -82,6 +89,260 @@ mod auth_tests {
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
+
+    #[test]
+    fn direct_participant_intent_uses_no_node_or_leadership_witness()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(1));
+        let activity_id = Uuid::from_u128(2);
+        let agent_id = Uuid::from_u128(3);
+        let session_id = Uuid::from_u128(4);
+        let profile_id = AgentProfileId::from_uuid(Uuid::from_u128(5))?;
+        let actor = OperationalActor::Participant {
+            activity_id: ActivityId::from_uuid(activity_id),
+            agent_id: AgentInstanceId::from_uuid(agent_id),
+            session_id: AgentSessionId::from_uuid(session_id),
+        };
+        let request = ChatSend {
+            query: ChatQuery {
+                workspace_id: workspace,
+                agent_profile_id: Some(profile_id),
+                runtime: None,
+                node_scope: None,
+                before_sequence: None,
+            },
+            message_id: Uuid::from_u128(6),
+            text: "direct research request".to_owned(),
+            target_fence: ChatTargetFence {
+                operation_id: Uuid::from_u128(7),
+                profile_id: profile_id.into_uuid(),
+                profile_name: "researcher".to_owned(),
+                participation_id: Uuid::from_u128(8),
+                participation_revision: 1,
+                runtime_session_id: Uuid::from_u128(9),
+                runtime_revision: 1,
+                provider_conversation_id: "conversation".to_owned(),
+                project: None,
+                leadership_revision: None,
+                node_target: None,
+            },
+        };
+        let prepared = prepare_send(&request, actor, None)?;
+        assert_eq!(prepared.context, MessageContext::default());
+        assert!(prepared.witness.is_none());
+        assert!(matches!(
+            prepare_send(&request, actor, Some(1)),
+            Err(ChatError::Identity)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "The composed fixture keeps provisioning, direct delivery, incoming turn and restart proof in one lifecycle."
+    )]
+    fn direct_participant_send_and_recovery_preserve_empty_node_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("direct-chat-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root)?;
+        let principal = AuthenticatedPrincipal::DirectToken(
+            forge_domain::DirectTokenId::from_uuid(Uuid::from_u128(10)),
+        );
+        let runtime = OrchestrationRuntime::open(&root)?
+            .with_operator_policy(OperatorPolicy::new(vec![principal])?);
+        let session = runtime
+            .open_session(Uuid::from_u128(11), principal, 1)?
+            .session;
+        let workspace = WorkspaceId::from_uuid(Uuid::from_u128(12));
+        crate::test_support::ensure_workspace_project_binding(&runtime, workspace.into_uuid(), 1)?;
+        let activity_id = Uuid::from_u128(13);
+        let request_id = Uuid::from_u128(14);
+        runtime.submit_agent_request(AgentRequestSubmit {
+            workspace_id: workspace.into_uuid(),
+            activity_id,
+            requester_agent_id: Uuid::from_u128(15),
+            requester_session_id: session.session_id,
+            coordinator_revision: 1,
+            request_id,
+            objective: "direct chat fixture".to_owned(),
+            capability: "chat".to_owned(),
+            count: 1,
+            effect_scope: AgentRequestEffectScope::ReadOnly,
+            independence: AgentRequestIndependence::None,
+            reason: "verify direct route".to_owned(),
+            created_at_ms: 2,
+        })?;
+        runtime.reserve_agent_request_resolution(request_id, 3, 4)?;
+        runtime.prepare_agent_request_effect_targets(request_id, 5, 6)?;
+        let action = runtime
+            .provider_worker_next_provision(principal, 7)?
+            .ok_or("provider fixture dispatch")?;
+        let operation = runtime.provider_worker_confirm_provision_with_project(
+            principal,
+            action.operation().operation_id(),
+            action.operation().revision(),
+            "conversation-direct",
+            Some("g-p-6ad231f7ad7c8191bfc1d5ff782c171f"),
+            8,
+        )?;
+        let operation_id = operation.operation_id();
+        let profile_id = operation.profile_id().ok_or("provider Profile")?;
+        let runtime_id = operation.runtime_session_id().ok_or("provider Runtime")?;
+        let _link = runtime.bind_profile_session(
+            operation_id,
+            profile_id.into_uuid(),
+            session.session_id,
+            principal,
+            9,
+        )?;
+        let participant_id = Uuid::from_u128(16);
+        let participation_id = Uuid::from_u128(17);
+        let sender_agent = crate::leadership::member_agent_id(
+            workspace.into_uuid(),
+            activity_id,
+            session.session_id,
+        );
+        let seed = Connection::open(root.join("agent-operations.sqlite3"))?;
+        seed.execute(
+            "INSERT INTO ops_imports(migration_id,workspace_id,destination_id,source_revision,phase,next_cursor,page_count,record_count,import_digest,verified_pages,verify_digest) VALUES(?1,?2,?3,1,2,NULL,5,0,?4,5,?4)",
+            params![
+                Uuid::from_u128(18).as_bytes(),
+                workspace.into_uuid().as_bytes(),
+                runtime.destination_id().as_bytes(),
+                [0_u8; 32].as_slice()
+            ],
+        )?;
+        seed.execute(
+            "INSERT INTO ops_workspace_participations(workspace_id,agent_profile_id,participation_id,created_at_ms,revision) VALUES(?1,?2,?3,10,1)",
+            params![
+                workspace.into_uuid().as_bytes(),
+                profile_id.into_uuid().as_bytes(),
+                participation_id.as_bytes()
+            ],
+        )?;
+        seed.execute(
+            "INSERT INTO ops_logical_members(workspace_id,participant_id,session_id,principal_kind,principal_id,display_name,declared_role,transport_kind,membership_revision,created_at_ms) VALUES(?1,?2,?3,1,?4,'sender','researcher',2,1,10)",
+            params![
+                workspace.into_uuid().as_bytes(),
+                participant_id.as_bytes(),
+                session.session_id.as_bytes(),
+                Uuid::from_u128(10).as_bytes()
+            ],
+        )?;
+        seed.execute(
+            "INSERT INTO ops_workspace_participation_mappings(request_id,workspace_id,participation_id,agent_profile_id,profile_revision,profile_mapping_request_id,session_id,session_revision,participant_id,participant_membership_revision,mapped_at_ms) VALUES(?1,?2,?3,?4,1,?1,?5,1,?6,1,10)",
+            params![
+                operation_id.as_bytes(),
+                workspace.into_uuid().as_bytes(),
+                participation_id.as_bytes(),
+                profile_id.into_uuid().as_bytes(),
+                session.session_id.as_bytes(),
+                participant_id.as_bytes()
+            ],
+        )?;
+        seed.execute(
+            "INSERT INTO ops_current_effect_bindings(workspace_id,participant_id,activity_id,session_id,agent_id,source_kind,source_request_id) VALUES(?1,?2,?3,?4,?5,0,?6)",
+            params![
+                workspace.into_uuid().as_bytes(),
+                participant_id.as_bytes(),
+                activity_id.as_bytes(),
+                session.session_id.as_bytes(),
+                sender_agent.into_uuid().as_bytes(),
+                operation_id.as_bytes()
+            ],
+        )?;
+        drop(seed);
+
+        let caller = ParticipationTarget {
+            workspace_id: workspace.into_uuid(),
+            activity_id,
+            agent_id: sender_agent.into_uuid(),
+            session_id: session.session_id,
+        };
+        let query = ChatQuery {
+            workspace_id: workspace,
+            agent_profile_id: Some(profile_id),
+            runtime: Some(runtime_id.into_uuid()),
+            node_scope: None,
+            before_sequence: None,
+        };
+        let snapshot =
+            runtime.read_chat(caller, principal, &query, None, TimestampMillis::new(11)?)?;
+        let target_fence = snapshot.target.ok_or("direct target")?;
+        assert_eq!(
+            target_fence
+                .project
+                .map(|project| project.project_id().to_string())
+                .as_deref(),
+            Some("g-p-6ad231f7ad7c8191bfc1d5ff782c171f")
+        );
+        let request = ChatSend {
+            query,
+            message_id: Uuid::from_u128(19),
+            text: "collect official evidence".to_owned(),
+            target_fence,
+        };
+        let sent =
+            runtime.send_workspace_chat(caller, principal, &request, TimestampMillis::new(12)?)?;
+        assert_eq!(sent.message_id, request.message_id);
+        assert_eq!(
+            runtime.recover_workspace_chat(caller, principal, &request)?,
+            Some(sent.clone())
+        );
+        let dispatch = runtime
+            .provider_worker_next_message(principal, 13)?
+            .ok_or("direct provider dispatch")?;
+        let frozen_body = dispatch.body.ok_or("direct provider body")?;
+        let delivered = runtime.provider_worker_confirm_message_delivery_with_project(
+            principal,
+            request.message_id,
+            dispatch.outbox.revision(),
+            "conversation-direct",
+            Some("g-p-6ad231f7ad7c8191bfc1d5ff782c171f"),
+            "user-turn".to_owned(),
+            frozen_body,
+            14,
+        )?;
+        assert_eq!(delivered.state(), ProviderMessageState::Delivered);
+        let incoming = runtime.provider_worker_record_incoming(
+            principal,
+            ProviderIncomingCommand {
+                reply_to_message_id: request.message_id,
+                provider_conversation_id: "conversation-direct".to_owned(),
+                provider_turn_id: "assistant-turn".to_owned(),
+                role: ProviderIncomingRole::Assistant,
+                body: "official evidence".to_owned(),
+            },
+            15,
+        )?;
+        assert_eq!(incoming.message().context(), MessageContext::default());
+        assert!(matches!(
+            incoming.message().channel(),
+            MessageChannel::Direct(id) if id.into_uuid() == participation_id
+        ));
+        let catalog = runtime.catalog()?;
+        let message = catalog
+            .workspace_message(request.message_id)?
+            .ok_or("direct message")?;
+        let outbox = catalog
+            .provider_message_outbox(request.message_id)?
+            .ok_or("direct outbox")?;
+        assert_eq!(message.context(), MessageContext::default());
+        assert!(outbox.node_route_witness().is_none());
+        drop(catalog);
+        drop(runtime);
+        let reopened = OrchestrationRuntime::open(&root)?
+            .with_operator_policy(OperatorPolicy::new(vec![principal])?);
+        let recovered = reopened
+            .recover_workspace_chat(caller, principal, &request)?
+            .ok_or("restart direct recovery")?;
+        assert_eq!(recovered.message_id, sent.message_id);
+        assert_eq!(recovered.provider_state, ProviderMessageState::Delivered);
+        drop(reopened);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }
 
 /// Validated selectors for one Workspace chat read or send.
@@ -118,6 +379,8 @@ pub struct ChatTargetFence {
     pub runtime_revision: i64,
     /// Provider conversation identity.
     pub provider_conversation_id: String,
+    /// Frozen Workspace Project identity and binding revision, when present.
+    pub project: Option<WorkspaceProjectReference>,
     /// Current target leadership revision, when routing through a leader.
     pub leadership_revision: Option<i64>,
     /// Exact node recipient identity when this is a node conversation.
@@ -360,6 +623,37 @@ impl OrchestrationRuntime {
         self.send_prepared(&mut catalog, request, observation, actor, prepared, now)
     }
 
+    /// Persist and queue one Profile-direct participant message.
+    ///
+    /// Direct Workspace chat has no Node or leadership fence. The participant
+    /// still owns an open Session and exact current Ready sender binding.
+    ///
+    /// # Errors
+    /// Distinguishes invalid direct intent, authorization failure, route change,
+    /// definite admission rejection and uncertain catalog failure.
+    pub fn send_workspace_chat(
+        &self,
+        target: ParticipationTarget,
+        principal: AuthenticatedPrincipal,
+        request: &ChatSend,
+        now: TimestampMillis,
+    ) -> Result<ChatReceipt, ChatError> {
+        require_direct_query(&request.query)?;
+        validate_participation_target(target)?;
+        if request.query.workspace_id.into_uuid() != target.workspace_id {
+            return Err(ChatError::Identity);
+        }
+        self.require_participation(target, principal)?;
+        let actor = participant_actor(target);
+        let prepared = prepare_send(request, actor, None)?;
+        let mut catalog = catalog_guard(self.catalog())?;
+        if let Some(receipt) = recover_in_catalog(&catalog, request, actor, &prepared)? {
+            return Ok(receipt);
+        }
+        require_ready_sender_binding(&catalog, target)?;
+        self.send_prepared(&mut catalog, request, None, actor, prepared, now)
+    }
+
     /// Recover one exact operator message receipt without resolving current routes.
     ///
     /// # Errors
@@ -397,6 +691,30 @@ impl OrchestrationRuntime {
         self.require_participation(target, principal)?;
         let actor = participant_actor(target);
         let prepared = prepare_send(request, actor, Some(sender_leadership_revision))?;
+        let catalog = catalog_guard(self.catalog())?;
+        recover_in_catalog(&catalog, request, actor, &prepared)
+    }
+
+    /// Recover one exact Profile-direct participant message without resolving
+    /// the current provider route or requiring a leadership fence.
+    ///
+    /// # Errors
+    /// Returns Session/Workspace authorization, immutable-intent conflict,
+    /// Operations failure or owner failure.
+    pub fn recover_workspace_chat(
+        &self,
+        target: ParticipationTarget,
+        principal: AuthenticatedPrincipal,
+        request: &ChatSend,
+    ) -> Result<Option<ChatReceipt>, ChatError> {
+        require_direct_query(&request.query)?;
+        validate_participation_target(target)?;
+        if request.query.workspace_id.into_uuid() != target.workspace_id {
+            return Err(ChatError::Identity);
+        }
+        self.require_participation(target, principal)?;
+        let actor = participant_actor(target);
+        let prepared = prepare_send(request, actor, None)?;
         let catalog = catalog_guard(self.catalog())?;
         recover_in_catalog(&catalog, request, actor, &prepared)
     }
@@ -542,6 +860,14 @@ fn validate_query(query: &ChatQuery) -> Result<WorkspaceId, ChatError> {
     Ok(workspace_id)
 }
 
+fn require_direct_query(query: &ChatQuery) -> Result<(), ChatError> {
+    let _workspace = validate_query(query)?;
+    if query.agent_profile_id.is_none() || query.node_scope.is_some() {
+        return Err(ChatError::Identity);
+    }
+    Ok(())
+}
+
 fn validate_participation_target(target: ParticipationTarget) -> Result<(), ChatError> {
     if [
         target.workspace_id,
@@ -599,14 +925,21 @@ fn prepare_send(
     if request.message_id.is_nil()
         || request.query.before_sequence.is_some()
         || request.query.node_scope.is_some() != request.target_fence.node_target.is_some()
+        || (request.query.node_scope.is_none()
+            && request.target_fence.leadership_revision.is_some())
     {
         return Err(ChatError::Identity);
     }
     validate_fence(&request.target_fence)?;
-    if let OperationalActor::Participant { .. } = actor
-        && sender_leadership_revision.is_none_or(|revision| revision <= 0)
-    {
-        return Err(ChatError::Identity);
+    if let OperationalActor::Participant { .. } = actor {
+        match (
+            request.query.node_scope.is_some(),
+            sender_leadership_revision,
+        ) {
+            (true, Some(revision)) if revision > 0 => {}
+            (false, None) => {}
+            _ => return Err(ChatError::Identity),
+        }
     }
     let context = request
         .query
@@ -646,10 +979,25 @@ fn prepare_send(
 }
 
 fn validate_fence(fence: &ChatTargetFence) -> Result<(), ChatError> {
+    if [
+        fence.operation_id,
+        fence.profile_id,
+        fence.participation_id,
+        fence.runtime_session_id,
+    ]
+    .iter()
+    .any(Uuid::is_nil)
+        || fence.participation_revision == 0
+        || fence.runtime_revision <= 0
+        || fence.profile_name.trim().is_empty()
+        || fence.provider_conversation_id.trim().is_empty()
+        || fence
+            .leadership_revision
+            .is_some_and(|revision| revision <= 0)
+    {
+        return Err(ChatError::Identity);
+    }
     if let Some(node) = &fence.node_target {
-        if fence.operation_id.is_nil() {
-            return Err(ChatError::Identity);
-        }
         match node {
             ChatNodeTarget::Agent {
                 assignment_id,
@@ -695,6 +1043,13 @@ fn recover_in_catalog(
                 session_id: original,
                 ..
             },
+        )
+        | (
+            OperationalActor::Participant { session_id, .. },
+            MessageAuthor::NativeParticipant {
+                session_id: original,
+                ..
+            },
         ) => session_id == *original,
         _ => false,
     };
@@ -729,24 +1084,8 @@ fn resolve_for_read(
     now: TimestampMillis,
 ) -> Result<ResolvedChat, ChatError> {
     if query.node_scope.is_some() {
-        return match profile_guard {
-            Ok(profiles) => Ok(node::resolve_node_chat(
-                catalog,
-                &profiles,
-                workspace_id,
-                query,
-                observation,
-                now,
-            )
-            .unwrap_or_else(|_| {
-                node::unavailable(
-                    "The node destination cannot be confirmed. History remains available.",
-                )
-            })),
-            Err(_) => Ok(node::unavailable(
-                "The provider catalog is unavailable. History remains available.",
-            )),
-        };
+        let profiles = profile_guard.map_err(map_catalog_guard_error)?;
+        return node::resolve_node_chat(catalog, &profiles, workspace_id, query, observation, now);
     }
     let profiles = profile_guard.map_err(map_catalog_guard_error)?;
     resolve_chat(catalog, &profiles, workspace_id, query, now)
@@ -944,12 +1283,14 @@ fn resolve_chat(
         {
             continue;
         }
-        let target = ProviderMessageTarget::new(
+        let target = ProviderMessageTarget::new_with_project_route(
             workspace_id,
             profile_id,
             participation.participation_id(),
+            AgentProfileProviderFamily::ChatGpt,
             runtime.id(),
             route.provider_conversation_id().to_owned(),
+            route.project(),
         )?;
         targets.push((
             ChatTargetFence {
@@ -961,6 +1302,7 @@ fn resolve_chat(
                 runtime_session_id: runtime.id().into_uuid(),
                 runtime_revision: runtime.revision().get(),
                 provider_conversation_id: route.provider_conversation_id().to_owned(),
+                project: route.project(),
                 leadership_revision,
                 node_target: None,
             },
@@ -1010,6 +1352,7 @@ fn target_matches_fence(target: &ProviderMessageTarget, fence: &ChatTargetFence)
         && target.participation_id().into_uuid() == fence.participation_id
         && target.runtime_session_id().into_uuid() == fence.runtime_session_id
         && target.provider_conversation_id() == fence.provider_conversation_id
+        && target.project() == fence.project
 }
 
 fn channel_matches_query(

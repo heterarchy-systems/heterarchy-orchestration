@@ -224,6 +224,12 @@ fn runtime_classification(error: &RuntimeError) -> (StatusCode, &'static str, &'
             "The caller must refresh canonical Orchestration state.",
             true,
         ),
+        RuntimeError::BindingRejectionTargetUnsupported => (
+            StatusCode::CONFLICT,
+            "UNSUPPORTED_BINDING_REJECTION_TARGET",
+            "Only normal committed registrations support terminal binding rejection settlement.",
+            false,
+        ),
         RuntimeError::OwnerAlreadyActive(_) => (
             StatusCode::CONFLICT,
             LaneError::OWNER_ALREADY_ACTIVE,
@@ -240,7 +246,7 @@ fn runtime_classification(error: &RuntimeError) -> (StatusCode, &'static str, &'
                     false,
                 )
             } else {
-                match source {
+                match source.as_ref() {
                     OperationsError::Conflict(_) => runtime_classification(&RuntimeError::Conflict),
                     OperationsError::Bounds(_) => runtime_classification(&RuntimeError::InvalidInput),
                     OperationsError::ResyncRequired(_) => runtime_classification(&RuntimeError::ResyncRequired),
@@ -330,6 +336,7 @@ fn operations_commit_unconfirmed(source: &OperationsError) -> bool {
             | OperationsError::LeadershipFenceUnconfirmed { .. }
             | OperationsError::AgentRequestCommitUnconfirmed { .. }
             | OperationsError::AgentProvisionCommitUnconfirmed { .. }
+            | OperationsError::BindingRejectionCommitUnconfirmed { .. }
     )
 }
 
@@ -372,6 +379,15 @@ mod tests {
         assert!(!body.retryable);
     }
 
+    #[test]
+    fn replacement_binding_rejection_target_is_explicitly_unsupported() {
+        let (status, body) =
+            runtime_error_response(&RuntimeError::BindingRejectionTargetUnsupported);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code, "UNSUPPORTED_BINDING_REJECTION_TARGET");
+        assert!(!body.retryable);
+    }
+
     fn corrupt_catalog_error() -> Result<OperationsError, Box<dyn std::error::Error>> {
         let root =
             std::env::temp_dir().join(format!("participation-commit-error-{}", Uuid::now_v7()));
@@ -388,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn uncertain_operations_commit_never_advertises_blind_retry()
     -> Result<(), Box<dyn std::error::Error>> {
-        for kind in 0..5 {
+        for kind in 0..6 {
             let OperationsError::Sqlite(source) = corrupt_catalog_error()? else {
                 return Err("expected SQLite failure fixture".into());
             };
@@ -413,6 +429,10 @@ mod tests {
                     request_id: Uuid::from_u128(3),
                     source,
                 },
+                4 => OperationsError::BindingRejectionCommitUnconfirmed {
+                    request_id: Uuid::from_u128(5),
+                    source,
+                },
                 _ => OperationsError::NodeTeamBindingCommitUnconfirmed {
                     scope: Box::new(
                         heterarchy_orchestration_operations::NodeTeamBindingScope::new(
@@ -428,7 +448,7 @@ mod tests {
                     source,
                 },
             };
-            let error = RuntimeError::Persistence(failure);
+            let error = RuntimeError::persistence(failure);
             let (status, body) = crate::runtime_error_response(&error);
             assert_eq!(status, StatusCode::CONFLICT);
             assert_eq!(body.code, "COMMITTED_BUT_UNCONFIRMED");

@@ -12,6 +12,7 @@ use crate::wire::agent_request_admission::{
 };
 use crate::wire::leadership::WorkspaceQueryScope;
 use crate::wire::provisioning_operations::ProvisionOperationWire;
+use crate::wire::workspace_project::valid_provider_project_reference;
 
 use super::{ClientError, OrchestrationHttpClient, ReadbackTarget, require_identity};
 
@@ -352,6 +353,10 @@ fn valid_operation(operation: &ProvisionOperationWire) -> bool {
         && operation.revision > 0
         && (operation.state == "prepared"
             || (operation.profile_id.is_some() && operation.runtime_session_id.is_some()))
+        && operation
+            .project
+            .as_ref()
+            .is_none_or(valid_provider_project_reference)
 }
 
 #[cfg(test)]
@@ -471,6 +476,8 @@ mod tests {
             prepared_at_ms: 10,
             updated_at_ms: 10,
             revision: 1,
+            uncertainty_retirement: None,
+            project: None,
         };
         let partial = AgentRequestAdmissionRecoverResponse {
             request: request.clone(),

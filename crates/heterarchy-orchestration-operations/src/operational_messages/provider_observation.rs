@@ -40,9 +40,17 @@ impl OperationsCatalog {
         let tx = self.connection.unchecked_transaction()?;
         let after = after_message_id.map(Uuid::into_bytes);
         let mut statement = tx.prepare(
-            "SELECT substr(message_id,1,17) FROM ops_provider_message_outbox
-             WHERE state IN(2,5) AND (?1 IS NULL OR message_id>?1)
-             ORDER BY message_id LIMIT ?2",
+            "SELECT substr(outbox.message_id,1,17) FROM ops_provider_message_outbox AS outbox
+             WHERE outbox.state IN(2,5)
+               AND NOT (
+                   outbox.state=5
+                   AND EXISTS(
+                       SELECT 1 FROM ops_provider_message_unknown_isolations AS isolation
+                        WHERE isolation.message_id=outbox.message_id
+                   )
+               )
+               AND (?1 IS NULL OR outbox.message_id>?1)
+             ORDER BY outbox.message_id LIMIT ?2",
         )?;
         let ids = statement
             .query_map(

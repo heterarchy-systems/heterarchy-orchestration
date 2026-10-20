@@ -29,6 +29,7 @@ fn exact_recovery_requires_owned_session_and_matches_full_intent() -> Result<(),
         reason: "Compare every stored intent field".to_owned(),
         created_at_ms: 100,
     };
+    crate::test_support::ensure_workspace_project_binding(&runtime, intent.workspace_id, 100)?;
     assert!(
         runtime
             .admit_agent_request(intent.clone(), Err::<i64, _>, |stage, _| stage)
@@ -116,6 +117,7 @@ fn failed_stage_clock_retains_intent_and_exact_resume_prepares_once() -> Result<
         reason: "Retain durable intent and avoid duplicate targets".to_owned(),
         created_at_ms: 100,
     };
+    crate::test_support::ensure_workspace_project_binding(&runtime, command.workspace_id, 100)?;
     let failed = runtime.admit_agent_request(command.clone(), Err::<i64, _>, |stage, _| stage);
     assert_eq!(failed, Err(AgentRequestAdmissionStage::Reserve));
     let stored = runtime

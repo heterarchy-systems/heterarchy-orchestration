@@ -62,11 +62,11 @@ impl IdentitySnapshot {
             kind,
             activity_id,
             agent_id,
-            session_id: resolved.session_id,
-            participation_id: resolved.participation_id,
-            profile_id: resolved.profile_id,
-            participant_id: resolved.participant_id,
-            display_name: resolved.display_name.clone(),
+            session_id: resolved.session_id(),
+            participation_id: resolved.participation_id(),
+            profile_id: resolved.profile_id(),
+            participant_id: resolved.participant_id(),
+            display_name: resolved.display_name().to_owned(),
         }
     }
 
@@ -648,9 +648,12 @@ impl OperationsCatalog {
             None => None,
         };
         let resolved = resolve_actor(&tx, command.scope.workspace_id(), command.actor)?;
-        let participant = resolved.participant_id.ok_or(OperationsError::Conflict(
-            "leadership proposer requires participant",
-        ))?;
+        let participant = resolved
+            .participant_id()
+            .filter(|_| resolved.is_profile_participant())
+            .ok_or(OperationsError::Conflict(
+                "leadership proposer requires participant",
+            ))?;
         let election = super::start_election_transaction(
             &tx,
             super::RecallElectionCommand {
@@ -771,9 +774,12 @@ impl OperationsCatalog {
             return Err(OperationsError::Conflict("leadership review resolved"));
         }
         let resolved = resolve_actor(&tx, review.scope.workspace_id(), command.actor)?;
-        let participant = resolved.participant_id.ok_or(OperationsError::Conflict(
-            "leadership statements require participant",
-        ))?;
+        let participant = resolved
+            .participant_id()
+            .filter(|_| resolved.is_profile_participant())
+            .ok_or(OperationsError::Conflict(
+                "leadership statements require participant",
+            ))?;
         let sources = frozen_source_subjects(&tx, command.election_id)?;
         let is_incumbent = review
             .incumbent
@@ -1444,18 +1450,23 @@ fn insert_statement(
             ));
         }
     };
-    let session_id = actor.session_id.ok_or(OperationsError::Conflict(
+    if !actor.is_profile_participant() {
+        return Err(OperationsError::Conflict(
+            "leadership statement requires Profile participation",
+        ));
+    }
+    let session_id = actor.session_id().ok_or(OperationsError::Corrupt(
         "leadership statement actor Session",
     ))?;
-    let participation_id = actor.participation_id.ok_or(OperationsError::Conflict(
+    let participation_id = actor.participation_id().ok_or(OperationsError::Corrupt(
         "leadership statement participation",
     ))?;
     let profile_id = actor
-        .profile_id
-        .ok_or(OperationsError::Conflict("leadership statement profile"))?;
-    let participant_id = actor.participant_id.ok_or(OperationsError::Conflict(
-        "leadership statement participant",
-    ))?;
+        .profile_id()
+        .ok_or(OperationsError::Corrupt("leadership statement profile"))?;
+    let participant_id = actor
+        .participant_id()
+        .ok_or(OperationsError::Corrupt("leadership statement participant"))?;
     tx.execute(
         "INSERT INTO ops_leadership_review_statements(statement_id,request_id,election_id,workspace_id,statement_kind,author_kind,author_activity_id,author_agent_id,author_session_id,author_participation_id,author_profile_id,author_participant_id,author_display_name,body,sequence,submitted_at_ms,incumbent_final) VALUES(?1,?2,?3,?4,?5,1,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
@@ -1470,7 +1481,7 @@ fn insert_statement(
             participation_id.into_uuid().as_bytes(),
             profile_id.into_bytes(),
             participant_id.as_bytes(),
-            actor.display_name,
+            actor.display_name(),
             command.body,
             i64::try_from(sequence).map_err(|_| OperationsError::Bounds("leadership statement sequence"))?,
             command.now_ms,
@@ -1838,13 +1849,14 @@ fn actor_in_frozen_electorate(
     participant_id: Uuid,
     sources: &[FrozenSource],
 ) -> bool {
-    sources.iter().any(|source| {
-        (source.subject_kind == 0
-            && resolved
-                .participation_id
-                .is_some_and(|participation| participation.into_uuid() == source.subject_id))
-            || (source.subject_kind == 1 && source.participant_id == participant_id)
-    })
+    resolved.is_profile_participant()
+        && sources.iter().any(|source| {
+            (source.subject_kind == 0
+                && resolved
+                    .participation_id()
+                    .is_some_and(|participation| participation.into_uuid() == source.subject_id))
+                || (source.subject_kind == 1 && source.participant_id == participant_id)
+        })
 }
 
 fn ensure_review_replay(
@@ -1875,14 +1887,20 @@ fn resolved_actor_matches_identity(
     resolved: &ResolvedOperationalActor,
     identity: &IdentitySnapshot,
 ) -> bool {
-    match resolved.participant_id {
-        Some(participant_id) => {
+    match resolved {
+        ResolvedOperationalActor::ProfileParticipant {
+            participant_id,
+            participation_id,
+            profile_id,
+            ..
+        } => {
             identity.kind == 1
-                && identity.participant_id == Some(participant_id)
-                && identity.participation_id == resolved.participation_id
-                && identity.profile_id == resolved.profile_id
+                && identity.participant_id == Some(*participant_id)
+                && identity.participation_id == Some(*participation_id)
+                && identity.profile_id == Some(*profile_id)
         }
-        None => identity.kind == 0,
+        ResolvedOperationalActor::Operator { .. } => identity.kind == 0,
+        ResolvedOperationalActor::NativeParticipant { .. } => false,
     }
 }
 

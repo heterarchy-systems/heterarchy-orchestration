@@ -12,12 +12,14 @@ pub mod departure;
 pub mod handoff;
 pub mod member_list;
 pub mod membership;
+pub mod node_assignment_admission;
 pub mod node_chat;
 pub mod node_team;
 pub mod operations_import;
 pub mod participation;
 pub mod team_commands;
 pub mod teams;
+pub mod workspace_project;
 pub use teams::{
     TeamCreatorWire, TeamGetQueryRequest, TeamGetQueryResponse, TeamListQueryRequest,
     TeamListQueryResponse, TeamMemberWire, TeamMutationWire, TeamWire,
@@ -31,6 +33,7 @@ pub mod provider_worker;
 pub mod provisioning_operations;
 pub mod provisioning_participation;
 pub mod work_credit;
+pub mod workspace_chat;
 pub use forge_reads::{
     DagCurrentQueryRequest, DagCurrentQueryResponse, DagCurrentWire, DagEdgeWire, DagLifecycleWire,
     DagNodeWire, DagStatusWire, DiscoveryDispositionWire, DiscoveryKindWire, DiscoveryReasonWire,
@@ -72,6 +75,18 @@ pub use approval::{
     ApprovalRequestGetResponse, ApprovalRequestWire, ApprovalSubmitRequest, ApprovalSubmitResponse,
     ListQueryResponse, PolicyQueryResponse, SetResponse,
 };
+
+/// Deserialize an optional field whose omission is legacy-compatible but whose
+/// explicit JSON `null` would be an invalid newly-admitted shape.
+pub(crate) fn deserialize_optional_non_null<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
 
 pub use crate::profile_sessions::{ProfileSessionBindRequest, ProfileSessionBindResponse};
 

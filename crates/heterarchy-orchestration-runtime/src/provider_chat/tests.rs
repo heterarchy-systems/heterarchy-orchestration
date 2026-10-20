@@ -9,7 +9,7 @@ use heterarchy_orchestration_operations::{
     ProviderMessageDeliveryReceipt, ProviderMessageTarget, WorkspaceParticipationId,
 };
 use heterarchy_orchestration_sessions::{
-    ProfileConfiguration, ProfileMutation, ProfileMutationCommand,
+    AgentProfileProviderFamily, ProfileConfiguration, ProfileMutation, ProfileMutationCommand,
 };
 use rusqlite::{Connection, params};
 use std::{error::Error, path::PathBuf};
@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const OPERATOR: AuthenticatedPrincipal = AuthenticatedPrincipal::TrustedStdio;
+const TEST_PROJECT_ID: &str = "g-p-6ad231f7ad7c8191bfc1d5ff782c171f";
 
 struct Fixture {
     root: PathBuf,
@@ -32,6 +33,7 @@ impl Fixture {
         std::fs::create_dir_all(&root)?;
         let runtime = OrchestrationRuntime::open(&root)?;
         let workspace = WorkspaceId::from_uuid(Uuid::now_v7());
+        crate::test_support::ensure_workspace_project_binding(&runtime, workspace.into_uuid(), 1)?;
         let request_id = Uuid::now_v7();
         runtime.submit_agent_request(AgentRequestSubmit {
             workspace_id: workspace.into_uuid(),
@@ -53,11 +55,12 @@ impl Fixture {
         let action = runtime
             .provider_worker_next_provision(OPERATOR, 10)?
             .ok_or("fixture dispatch")?;
-        let operation = runtime.provider_worker_confirm_provision(
+        let operation = runtime.provider_worker_confirm_provision_with_project(
             OPERATOR,
             action.operation().operation_id(),
             action.operation().revision(),
             "conversation-test",
+            Some(TEST_PROJECT_ID),
             11,
         )?;
         let profile = operation.profile_id().ok_or("profile binding")?;
@@ -72,12 +75,14 @@ impl Fixture {
             "INSERT INTO ops_workspace_participations(workspace_id,agent_profile_id,participation_id,created_at_ms,revision) VALUES(?1,?2,?3,0,1)",
             params![workspace.into_uuid().as_bytes(),profile.into_uuid().as_bytes(),participation.into_uuid().as_bytes()])?;
         drop(seed);
-        let target = ProviderMessageTarget::new(
+        let target = ProviderMessageTarget::new_with_project_route(
             workspace,
             profile,
             participation,
+            AgentProfileProviderFamily::ChatGpt,
             runtime_id,
             "conversation-test".to_owned(),
+            Some(operation.project().ok_or("frozen Project route")?),
         )?;
         let message_id = Uuid::now_v7();
         {
@@ -208,8 +213,9 @@ fn delivered_user_turn_cannot_be_relabelled_as_assistant() -> TestResult {
         .runtime
         .provider_worker_message_readback(OPERATOR, fixture.message_id)?;
     let body = before.body.ok_or("frozen provider body")?;
-    let receipt = ProviderMessageDeliveryReceipt::new(
+    let receipt = ProviderMessageDeliveryReceipt::new_with_project(
         fixture.target.clone(),
+        Some(heterarchy_orchestration_operations::ChatGptProjectId::try_from(TEST_PROJECT_ID)?),
         "user-1".to_owned(),
         body.clone(),
     )?;
@@ -240,5 +246,58 @@ fn delivered_user_turn_cannot_be_relabelled_as_assistant() -> TestResult {
         .provider_worker_record_incoming(OPERATOR, user, 17)?;
     assert!(!replay.created());
     assert_eq!(replay.message().message_id(), fixture.message_id);
+    fixture.cleanup()
+}
+
+#[test]
+fn cancel_queued_provider_message_via_runtime() -> TestResult {
+    let fixture = Fixture::ready()?;
+    let second_message = Uuid::now_v7();
+    {
+        let mut catalog = fixture.runtime.catalog()?;
+        catalog.append_workspace_message(AppendWorkspaceMessageCommand {
+            message_id: second_message,
+            workspace_id: fixture.target.workspace_id(),
+            channel: MessageChannel::Workspace,
+            actor: OperationalActor::LocalOperator,
+            body: "second prompt to cancel".to_owned(),
+            submitted_at: TimestampMillis::new(20)?,
+            context: MessageContext::default(),
+        })?;
+        catalog.enqueue_provider_message(EnqueueProviderMessageCommand {
+            message_id: second_message,
+            target: fixture.target.clone(),
+            queued_at: TimestampMillis::new(21)?,
+            node_route_witness: None,
+        })?;
+    }
+    // Verify it is queued with revision 1
+    let outbox = fixture
+        .runtime
+        .provider_worker_message_readback(OPERATOR, second_message)?;
+    assert_eq!(outbox.outbox.state(), ProviderMessageState::Queued);
+    assert_eq!(outbox.outbox.revision(), 1);
+
+    // Cancel via runtime
+    let canceled =
+        fixture
+            .runtime
+            .provider_worker_cancel_queued_message(OPERATOR, second_message, 1, 25)?;
+    assert_eq!(canceled.state(), ProviderMessageState::Failed);
+    assert_eq!(canceled.revision(), 2);
+
+    // Non-operator is rejected
+    assert!(matches!(
+        fixture.runtime.provider_worker_cancel_queued_message(
+            AuthenticatedPrincipal::DirectToken(forge_domain::DirectTokenId::from_uuid(
+                Uuid::from_u128(999)
+            )),
+            second_message,
+            2,
+            26,
+        ),
+        Err(RuntimeError::Forbidden)
+    ));
+
     fixture.cleanup()
 }

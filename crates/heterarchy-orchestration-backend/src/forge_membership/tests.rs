@@ -48,6 +48,88 @@ fn request(requested_at_ms: i64) -> Result<AgentBindingReservationRequest, Box<d
     )?)
 }
 
+fn rejection_scope() -> Result<ResolvedWorkspaceScope, Box<dyn Error>> {
+    let locator = WorkspaceLocator::new(
+        LocationId::from_uuid(Uuid::from_u128(0x302)),
+        LocationRevision::new(5)?,
+        ".",
+    )?;
+    Ok(ResolvedWorkspaceScope::from_observation(
+        WorkspaceId::from_uuid(Uuid::from_u128(0xEB10)),
+        WorkspaceRevision::new(8)?,
+        locator,
+    ))
+}
+
+fn rejection_reference() -> Result<MembershipSourceReference, ForgeSourceError> {
+    MembershipSourceReference::new(
+        Uuid::from_u128(0xEB25),
+        Uuid::from_u128(0xEB00),
+        Uuid::from_u128(0x15B10),
+        1,
+        [
+            0xa1, 0xff, 0x1c, 0xd8, 0xe5, 0xa9, 0x85, 0xfa, 0x9d, 0xc2, 0x9a, 0x4e, 0x3d, 0x84,
+            0x26, 0xaf, 0xaf, 0x17, 0xe2, 0x64, 0xf6, 0xcd, 0xfc, 0x05, 0xf3, 0xc3, 0x70, 0x39,
+            0x6f, 0xde, 0xc7, 0x72,
+        ],
+    )
+}
+
+fn rejection_binding() -> Result<AgentBindingReservationRequest, Box<dyn Error>> {
+    Ok(AgentBindingReservationRequest::new(
+        Uuid::from_u128(0xEB21),
+        ActivityId::from_uuid(Uuid::from_u128(0xEB12)),
+        AgentInstanceId::from_uuid(Uuid::from_u128(0xEB22)),
+        AgentSessionId::from_uuid(Uuid::from_u128(0xEB23)),
+        AuthenticatedPrincipal::DirectToken(DirectTokenId::from_uuid(Uuid::from_u128(0xEB20))),
+        TimestampMillis::new(1_000)?,
+    )?)
+}
+
+fn rejection_activation() -> Result<AgentBindingActivationRequest, Box<dyn Error>> {
+    Ok(AgentBindingActivationRequest::new(
+        Uuid::from_u128(0xEB21),
+        [
+            0xfa, 0xf0, 0x30, 0x48, 0x38, 0xa4, 0x20, 0x0b, 0x57, 0x72, 0x1e, 0x03, 0x63, 0xfb,
+            0x54, 0xf6, 0xc3, 0x97, 0xe6, 0x44, 0x44, 0xe6, 0xc2, 0x81, 0x7d, 0xb1, 0x41, 0x1d,
+            0xe9, 0x7f, 0xa5, 0x16,
+        ],
+        AgentDisplayName::new("terminal worker".to_owned())?,
+        AgentDeclaredRole::new("reviewer".to_owned())?,
+        AgentTransportKind::Other,
+    )?)
+}
+
+fn rejection_receipt_json(_scope: &ScopeDto, reference: MembershipSourceReference) -> Value {
+    json!({
+        "request_id": Uuid::from_u128(0xEB21),
+        "request_digest": "c2cc2ab70e4d16f7420f474d56042ca6ccfe18eb09a42940eae8bd90488086ee",
+        "workspace_id": Uuid::from_u128(0xEB10),
+        "activity_id": Uuid::from_u128(0xEB12),
+        "agent_id": Uuid::from_u128(0xEB22),
+        "session_id": Uuid::from_u128(0xEB23),
+        "principal": {"kind":"direct_token","token_id":Uuid::from_u128(0xEB20),"grant_id":null},
+        "migration_id": reference.migration_id,
+        "destination_id": reference.destination_id,
+        "expected_freeze_revision": reference.freeze_revision,
+        "manifest_digest": encode_digest(reference.manifest_digest),
+        "issuer_id": reference.issuer_id,
+        "workspace_root_fingerprint": "31".repeat(16),
+        "binding_digest": "32".repeat(32),
+        "delegation_digest": "33".repeat(32),
+        "membership_digest": "faf0304838a4200b57721e0363fb54f6c397e64444e6c2817db1411de97fa516",
+        "display_name": "terminal worker",
+        "declared_role": "reviewer",
+        "transport": "other",
+        "reason": "principal_transport_mismatch",
+        "reserved_at_ms": 1_100,
+        "requested_at_ms": 1_000,
+        "observed_at_ms": 1_400,
+        "rejected_at_ms": 1_401,
+        "receipt_digest": "535951cdbe6a81226010b8ed2da2a365c03d0807ea232c4f44795174894fbf8f",
+    })
+}
+
 fn base(
     scope: &ResolvedWorkspaceScope,
     reference: MembershipSourceReference,
@@ -134,6 +216,111 @@ fn delegation_readback_rejects_scope_source_flags_and_missing_metadata()
         None
     );
     Ok(())
+}
+
+#[test]
+fn rejection_mutation_and_get_validate_full_receipt_and_absence() -> Result<(), Box<dyn Error>> {
+    let scope = rejection_scope()?;
+    let reference = rejection_reference()?;
+    let binding = rejection_binding()?;
+    let activation = rejection_activation()?;
+    let (wire_scope, _) = forge_source::validated_scope(&scope)?;
+    let receipt = rejection_receipt_json(&wire_scope, reference);
+    let mutation = json!({
+        "scope": &wire_scope,
+        "issuer_id": reference.issuer_id,
+        "destination_id": reference.destination_id,
+        "status": "recorded",
+        "replayed": false,
+        "receipt": receipt,
+        "retry_authorized": false,
+    });
+    let observed = parse_rejection_mutation(
+        mutation.clone(),
+        &wire_scope,
+        reference,
+        &binding,
+        &activation,
+        TimestampMillis::new(1_400)?,
+    )?;
+    assert_eq!(observed.request_id(), binding.request_id());
+
+    let mut mismatched_status = mutation.clone();
+    mismatched_status["status"] = json!("replay");
+    assert_eq!(
+        parse_rejection_mutation(
+            mismatched_status,
+            &wire_scope,
+            reference,
+            &binding,
+            &activation,
+            TimestampMillis::new(1_400)?,
+        ),
+        Err(ForgeSourceError::Protocol)
+    );
+
+    let absent = json!({
+        "scope": &wire_scope,
+        "issuer_id": reference.issuer_id,
+        "destination_id": reference.destination_id,
+        "found": false,
+        "status": "historical_receipt",
+        "receipt": null,
+        "retry_authorized": false,
+        "request_equivalence_proven": false,
+    });
+    assert!(
+        parse_rejection_readback(
+            absent.clone(),
+            &wire_scope,
+            reference,
+            &binding,
+            observed.request_digest(),
+        )?
+        .is_none()
+    );
+    let mut retry_claim = absent.clone();
+    retry_claim["retry_authorized"] = json!(true);
+    let mut missing_receipt = absent;
+    let _removed = missing_receipt
+        .as_object_mut()
+        .ok_or("readback object")?
+        .remove("receipt");
+    for invalid in [retry_claim, missing_receipt] {
+        assert_eq!(
+            parse_rejection_readback(
+                invalid,
+                &wire_scope,
+                reference,
+                &binding,
+                observed.request_digest(),
+            ),
+            Err(ForgeSourceError::Protocol)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rejection_error_mapping_separates_determinate_conflict_from_unknown_outcome() {
+    assert_eq!(
+        map_rejection_command_error(ForgeHttpClientError::Service {
+            status: 409,
+            code: ForgeHttpServiceCode::ForgeUnavailable,
+        }),
+        ForgeSourceError::Stale
+    );
+    assert_eq!(
+        map_rejection_command_error(ForgeHttpClientError::Service {
+            status: 202,
+            code: ForgeHttpServiceCode::UnknownOutcome,
+        }),
+        ForgeSourceError::Unavailable
+    );
+    assert_eq!(
+        map_rejection_command_error(ForgeHttpClientError::Timeout),
+        ForgeSourceError::Unavailable
+    );
 }
 
 #[test]

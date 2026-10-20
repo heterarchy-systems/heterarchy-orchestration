@@ -8,12 +8,14 @@ use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use forge_domain::AuthenticatedPrincipal;
-use heterarchy_orchestration_operations::ImportProgress;
+use heterarchy_orchestration_operations::{ImportHandoffSealCommand, ImportProgress};
 use heterarchy_orchestration_runtime::RuntimeError;
 use uuid::Uuid;
 
 use crate::app_support::validate_workspace_reference;
 use crate::wire::operations_import::{
+    CurrentImportHandoffResponse, ImportHandoffQueryRequest, ImportHandoffReadbackResponse,
+    ImportHandoffSealRequest, ImportHandoffSealResponse, ImportHandoffSealWire,
     ImportPrepareRequest, ImportProgressResponse, ImportProgressWire, ImportStepRequest,
 };
 use crate::{ApiError, BackendState, CoordinatorAuthorityError};
@@ -36,6 +38,18 @@ pub(crate) fn routes() -> Router<BackendState> {
         .route(
             "/internal/v1/operations/imports/{migration_id}/abort",
             post(abort),
+        )
+        .route(
+            "/internal/v1/operations/imports/{migration_id}/handoff-seal",
+            post(handoff_seal),
+        )
+        .route(
+            "/internal/v1/operations/imports/{migration_id}/handoff-seal/query",
+            post(handoff_seal_query),
+        )
+        .route(
+            "/internal/v1/operations/imports/current/query",
+            post(current_import_query),
         )
 }
 
@@ -190,6 +204,77 @@ async fn abort(
     Ok(Json(ImportProgressWire::from(&progress)))
 }
 
+async fn handoff_seal(
+    State(state): State<BackendState>,
+    Path(migration): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<ImportHandoffSealRequest>,
+) -> Result<Json<ImportHandoffSealResponse>, ApiError> {
+    let migration = require_migration_text(&migration)?;
+    require_operator(&state, principal).await?;
+    validate_handoff_scope(&state, &body.scope, body.destination_id)?;
+    if body.expected_source_revision == 0 || body.expected_source_revision > i64::MAX as u64 {
+        return Err(ApiError::Runtime(RuntimeError::InvalidInput));
+    }
+    let expected_verified_digest = parse_verified_digest(&body.expected_verified_digest)?;
+    let sealed_at_ms = crate::app_support::now_millis().map_err(|_| ApiError::Unavailable)?;
+    let command = ImportHandoffSealCommand {
+        migration_id: migration,
+        workspace_id: body.scope.workspace_id,
+        destination_id: body.destination_id,
+        expected_source_revision: body.expected_source_revision,
+        expected_verified_digest,
+        sealed_at_ms,
+    };
+    let handoff_seal = state
+        .catalog_job(move |runtime| runtime.import_handoff_seal(&command))
+        .await?;
+    Ok(Json(ImportHandoffSealResponse {
+        handoff_seal: ImportHandoffSealWire::from(&handoff_seal),
+    }))
+}
+
+async fn handoff_seal_query(
+    State(state): State<BackendState>,
+    Path(migration): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<ImportHandoffQueryRequest>,
+) -> Result<Json<ImportHandoffReadbackResponse>, ApiError> {
+    let migration = require_migration_text(&migration)?;
+    require_operator(&state, principal).await?;
+    validate_handoff_scope(&state, &body.scope, body.destination_id)?;
+    let handoff_seal = state
+        .catalog_job(move |runtime| {
+            runtime.import_handoff_seal_readback(
+                migration,
+                body.scope.workspace_id,
+                body.destination_id,
+            )
+        })
+        .await?;
+    Ok(Json(ImportHandoffReadbackResponse {
+        handoff_seal: handoff_seal.as_ref().map(ImportHandoffSealWire::from),
+    }))
+}
+
+async fn current_import_query(
+    State(state): State<BackendState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<ImportHandoffQueryRequest>,
+) -> Result<Json<CurrentImportHandoffResponse>, ApiError> {
+    require_operator(&state, principal).await?;
+    validate_handoff_scope(&state, &body.scope, body.destination_id)?;
+    let current = state
+        .catalog_job(move |runtime| {
+            runtime.current_import_handoff(body.scope.workspace_id, body.destination_id)
+        })
+        .await?;
+    Ok(Json(CurrentImportHandoffResponse {
+        progress: current.progress().map(ImportProgressWire::from),
+        handoff_seal: current.handoff_seal().map(ImportHandoffSealWire::from),
+    }))
+}
+
 async fn require_operator(
     state: &BackendState,
     principal: AuthenticatedPrincipal,
@@ -214,6 +299,57 @@ fn validate_route_scope(
         .ok_or(ApiError::WorkspaceScopeUnavailable)?
         .validate_scope(scope)
         .map_err(map_authority_error)
+}
+
+fn validate_handoff_scope(
+    state: &BackendState,
+    scope: &crate::wire::WorkspaceQueryScope,
+    destination_id: Uuid,
+) -> Result<(), ApiError> {
+    validate_workspace_reference(scope, None)?;
+    if destination_id.is_nil() {
+        return Err(ApiError::InvalidIdentity);
+    }
+    if destination_id != state.runtime.destination_id() {
+        return Err(ApiError::Runtime(RuntimeError::Conflict));
+    }
+    state
+        .coordinator_authority
+        .as_ref()
+        .ok_or(ApiError::WorkspaceScopeUnavailable)?
+        .validate_scope(scope)
+        .map_err(map_authority_error)
+}
+
+fn parse_verified_digest(value: &str) -> Result<[u8; 32], ApiError> {
+    if value.len() != 64 {
+        return Err(ApiError::Runtime(RuntimeError::InvalidInput));
+    }
+    let bytes = value.as_bytes();
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(ApiError::Runtime(RuntimeError::InvalidInput));
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in pairs.iter().enumerate() {
+        let high =
+            decode_hex_nibble(pair[0]).ok_or(ApiError::Runtime(RuntimeError::InvalidInput))?;
+        let low =
+            decode_hex_nibble(pair[1]).ok_or(ApiError::Runtime(RuntimeError::InvalidInput))?;
+        digest[index] = (high << 4) | low;
+    }
+    if digest == [0; 32] {
+        return Err(ApiError::Runtime(RuntimeError::InvalidInput));
+    }
+    Ok(digest)
+}
+
+fn decode_hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
 }
 
 fn validate_expected_counts(
@@ -300,6 +436,17 @@ mod tests {
         assert!(validate_expected_counts(1, 1).is_ok());
     }
 
+    #[test]
+    fn verified_digest_parser_is_canonical_and_exact() {
+        assert_eq!(
+            parse_verified_digest(&"ab".repeat(32)).ok(),
+            Some([0xAB; 32])
+        );
+        assert!(parse_verified_digest(&"AB".repeat(32)).is_err());
+        assert!(parse_verified_digest(&"00".repeat(32)).is_err());
+        assert!(parse_verified_digest("11").is_err());
+    }
+
     #[tokio::test]
     async fn prepare_rejects_nonoperator_before_source_authority()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -320,6 +467,44 @@ mod tests {
                 scope: scope(),
                 migration_id: Uuid::from_u128(4),
                 destination_id: destination,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ApiError::Runtime(RuntimeError::Forbidden))
+        ));
+        state.stop_admission();
+        state.drain().await;
+        drop(state);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_seal_rejects_nonoperator_before_scope_or_catalog_access()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("operations-handoff-route-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root)?;
+        let runtime = OrchestrationRuntime::open(&root)?;
+        let destination = runtime.destination_id();
+        let migration = Uuid::from_u128(4);
+        let state = BackendState::new(
+            runtime,
+            std::sync::Arc::new(crate::realtime::RealtimeHub::new()),
+        );
+        let result = handoff_seal(
+            State(state.clone()),
+            Path(migration.to_string()),
+            Extension(AuthenticatedPrincipal::DirectToken(
+                DirectTokenId::from_uuid(Uuid::from_u128(3)),
+            )),
+            Json(ImportHandoffSealRequest {
+                scope: scope(),
+                destination_id: destination,
+                expected_source_revision: 1,
+                expected_verified_digest: "11".repeat(32),
             }),
         )
         .await;

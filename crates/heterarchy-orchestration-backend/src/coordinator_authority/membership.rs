@@ -7,14 +7,15 @@ use super::{
 use crate::forge_membership::{ForgeMembershipHttpClient, MembershipSourceReference};
 use crate::wire::WorkspaceQueryScope;
 use forge_control::{
-    AgentBindingActivateRequest, AgentBindingActivationReadRequest,
-    AgentBindingReservationReadRequest, AgentBindingReserveRequest,
-    AgentOperationsDelegationReadRequest,
+    AgentBindingActivateRequest, AgentBindingActivationReadRequest, AgentBindingRejectRequest,
+    AgentBindingRejectionReadRequest, AgentBindingReservationReadRequest,
+    AgentBindingReserveRequest, AgentOperationsDelegationReadRequest,
 };
-use forge_domain::TimestampMillis;
+use forge_domain::{AgentBindingRejectionReason, TimestampMillis};
 use heterarchy_orchestration_operations::{
-    AgentBindingActivationRequest, AgentBindingReservationRequest, AgentOperationsDelegation,
-    BindingActivationObservation, BindingReservationObservation,
+    AgentBindingActivationRequest, AgentBindingRejectionOperation, AgentBindingReservationRequest,
+    AgentOperationsDelegation, BindingActivationObservation, BindingRejectionObservation,
+    BindingReservationObservation,
 };
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -31,7 +32,7 @@ impl CoordinatorAuthority {
                 let _permit = permit;
                 let expected = self.trusted_scope(&scope)?;
                 let _delegation = ForgeMembershipHttpClient::new(client.commands().clone())
-                    .delegation(expected, &reference)
+                    .delegation(&expected, &reference)
                     .await
                     .map_err(map_source_error)?
                     .ok_or(CoordinatorAuthorityError::Unavailable)?;
@@ -58,8 +59,9 @@ impl CoordinatorAuthority {
         match &self.transport {
             SourceTransport::Http(client) => {
                 let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
                 ForgeMembershipHttpClient::new(client.commands().clone())
-                    .reservation(self.trusted_scope(&scope)?, &reference, &request)
+                    .reservation(&trusted, &reference, &request)
                     .await
                     .map_err(map_source_error)
             }
@@ -98,13 +100,9 @@ impl CoordinatorAuthority {
         match &self.transport {
             SourceTransport::Http(client) => {
                 let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
                 ForgeMembershipHttpClient::new(client.commands().clone())
-                    .reserve(
-                        self.trusted_scope(&scope)?,
-                        &reference,
-                        &request,
-                        observed_at.get(),
-                    )
+                    .reserve(&trusted, &reference, &request, observed_at.get())
                     .await
                     .map_err(map_source_error)
             }
@@ -140,8 +138,9 @@ impl CoordinatorAuthority {
         match &self.transport {
             SourceTransport::Http(client) => {
                 let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
                 ForgeMembershipHttpClient::new(client.commands().clone())
-                    .activation(self.trusted_scope(&scope)?, &reference, &request)
+                    .activation(&trusted, &reference, &request)
                     .await
                     .map_err(map_source_error)
             }
@@ -183,9 +182,10 @@ impl CoordinatorAuthority {
         match &self.transport {
             SourceTransport::Http(client) => {
                 let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
                 ForgeMembershipHttpClient::new(client.commands().clone())
                     .activate(
-                        self.trusted_scope(&scope)?,
+                        &trusted,
                         &reference,
                         &activation,
                         session_id.into_uuid(),
@@ -213,6 +213,103 @@ impl CoordinatorAuthority {
                         .map_err(map_control_error)?;
                     BindingActivationObservation::from_native(&receipt)
                         .map_err(|_| CoordinatorAuthorityError::Unavailable)
+                })
+                .await
+            }
+        }
+    }
+
+    pub(crate) async fn membership_rejection(
+        &self,
+        scope: WorkspaceQueryScope,
+        reference: MembershipSourceReference,
+        binding: AgentBindingReservationRequest,
+        request_digest: [u8; 32],
+        permit: OwnedSemaphorePermit,
+    ) -> Result<Option<BindingRejectionObservation>, CoordinatorAuthorityError> {
+        match &self.transport {
+            SourceTransport::Http(client) => {
+                let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
+                ForgeMembershipHttpClient::new(client.commands().clone())
+                    .rejection(&trusted, &reference, &binding, request_digest)
+                    .await
+                    .map_err(map_source_error)
+            }
+            SourceTransport::Control { .. } => {
+                let authority = self.clone();
+                control_job(permit, move || {
+                    let resolved = authority.fresh_workspace(&scope)?;
+                    authority
+                        .control()?
+                        .agent_binding_rejection(AgentBindingRejectionReadRequest {
+                            scope: resolved,
+                            request_id: binding.request_id(),
+                            request_digest,
+                            session_id: binding.session_id(),
+                            principal: binding.principal(),
+                        })
+                        .map_err(map_control_error)?
+                        .as_ref()
+                        .map(BindingRejectionObservation::from_native)
+                        .transpose()
+                        .map_err(|_| CoordinatorAuthorityError::Stale)
+                })
+                .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn membership_reject(
+        &self,
+        scope: WorkspaceQueryScope,
+        reference: MembershipSourceReference,
+        binding: AgentBindingReservationRequest,
+        activation: AgentBindingActivationRequest,
+        observed_at: TimestampMillis,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<BindingRejectionObservation, CoordinatorAuthorityError> {
+        match &self.transport {
+            SourceTransport::Http(client) => {
+                let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
+                ForgeMembershipHttpClient::new(client.commands().clone())
+                    .reject(
+                        &trusted,
+                        &reference,
+                        &binding,
+                        &activation,
+                        observed_at.get(),
+                    )
+                    .await
+                    .map_err(map_source_error)
+            }
+            SourceTransport::Control { .. } => {
+                let authority = self.clone();
+                control_job(permit, move || {
+                    let resolved = authority.fresh_workspace(&scope)?;
+                    let result = authority
+                        .control()?
+                        .reject_agent_binding(AgentBindingRejectRequest::new(
+                            resolved,
+                            reference.issuer_id(),
+                            reference.migration_id(),
+                            reference.destination_id(),
+                            reference.freeze_revision(),
+                            reference.manifest_digest(),
+                            binding,
+                            activation,
+                            AgentBindingRejectionReason::PrincipalTransportMismatch,
+                            observed_at,
+                        ))
+                        .map_err(map_control_error)?;
+                    let receipt = match result {
+                        AgentBindingRejectionOperation::Recorded(value)
+                        | AgentBindingRejectionOperation::Replay(value) => value,
+                    };
+                    BindingRejectionObservation::from_native(&receipt)
+                        .map_err(|_| CoordinatorAuthorityError::Stale)
                 })
                 .await
             }

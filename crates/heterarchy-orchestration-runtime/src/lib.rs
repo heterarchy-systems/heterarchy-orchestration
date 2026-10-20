@@ -13,8 +13,10 @@ use std::sync::{Arc, Mutex};
 use forge_domain::{TimestampMillis, WorkspaceId};
 use heterarchy_orchestration_operations::{
     AdmissionIssuerConfig, AgentRequestRecord, AgentRequestState, ApprovalPolicyView,
-    BrokerClusterConfig, BrokerOwnerAuthority, BrokerOwnerAuthorityError,
-    ConfigureAdmissionIssuerCommand, OperationsCatalog, OperationsError, TeamRecord, TeamState,
+    BrokerClusterConfig, BrokerOwnerAuthority, BrokerOwnerAuthorityError, BrokerOwnerObservation,
+    BrokerOwnerRecoveryApproval, BrokerOwnerRecoveryError, ConfigureAdmissionIssuerCommand,
+    OperationsCatalog, OperationsError, TeamRecord, TeamState,
+    TrustedLegacyBindingRejectionDeployment,
 };
 use heterarchy_orchestration_sessions::{
     AgentProfile, AgentProfileCatalog, AgentProfileCreationOrigin, AgentProfileError,
@@ -24,6 +26,47 @@ use heterarchy_orchestration_sessions::{
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
+
+mod workspace_project;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use forge_domain::TimestampMillis;
+    use heterarchy_orchestration_operations::{
+        ChatGptProjectId, WorkspaceProjectConfigureCommand, WorkspaceProjectScope,
+    };
+    use uuid::Uuid;
+
+    use super::{OrchestrationRuntime, RuntimeError};
+
+    pub(crate) fn ensure_workspace_project_binding(
+        runtime: &OrchestrationRuntime,
+        workspace_id: Uuid,
+        configured_at_ms: i64,
+    ) -> Result<(), RuntimeError> {
+        let mut catalog = runtime.catalog()?;
+        if catalog.workspace_project_binding(workspace_id)?.is_none() {
+            catalog.configure_workspace_project(
+                WorkspaceProjectConfigureCommand::new(
+                    Uuid::now_v7(),
+                    WorkspaceProjectScope::new(
+                        workspace_id,
+                        Uuid::from_u128(0xFEEE),
+                        1,
+                        1,
+                        "runtime-test-workspace".to_owned(),
+                    )?,
+                    None,
+                    ChatGptProjectId::try_from("g-p-6ad231f7ad7c8191bfc1d5ff782c171f")?,
+                    TimestampMillis::new(configured_at_ms)
+                        .map_err(|_| RuntimeError::InvalidInput)?,
+                )?,
+                &[],
+            )?;
+        }
+        Ok(())
+    }
+}
 
 pub mod access;
 pub mod approval;
@@ -35,6 +78,7 @@ pub mod leadership;
 pub mod member_list;
 pub mod membership;
 pub mod membership_source;
+pub mod node_assignment_admission;
 pub mod node_team;
 pub mod participation;
 pub mod profile_deletion;
@@ -99,6 +143,7 @@ pub struct OrchestrationRuntime {
     owner_lock: Arc<Mutex<rusqlite::Connection>>,
     catalog_bridge_slots: Arc<Semaphore>,
     operator_policy: access::OperatorPolicy,
+    trusted_binding_rejection_legacy_deployments: Vec<TrustedLegacyBindingRejectionDeployment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,7 +281,17 @@ impl OrchestrationRuntime {
             owner_lock: Arc::new(Mutex::new(owner_lock)),
             catalog_bridge_slots: Arc::new(Semaphore::new(1)),
             operator_policy: access::OperatorPolicy::default(),
+            trusted_binding_rejection_legacy_deployments: Vec::new(),
         })
+    }
+
+    #[must_use]
+    pub fn with_trusted_binding_rejection_legacy_deployments(
+        mut self,
+        deployments: Vec<TrustedLegacyBindingRejectionDeployment>,
+    ) -> Self {
+        self.trusted_binding_rejection_legacy_deployments = deployments;
+        self
     }
 
     #[must_use]
@@ -303,6 +358,34 @@ impl OrchestrationRuntime {
             .lock()
             .await
             .ensure_current_owner()
+            .await
+            .map(|_| ())
+    }
+
+    /// Read the Broker-committed owner of this destination without changing any
+    /// epoch or granting mutation authority. Safe for a stale process.
+    ///
+    /// # Errors
+    /// Returns the fail-closed Broker authority classification.
+    pub async fn broker_owner_status(
+        &self,
+    ) -> Result<BrokerOwnerObservation, BrokerOwnerAuthorityError> {
+        self.broker_owner.lock().await.owner_status().await
+    }
+
+    /// Operator-approved recovery of a stale local Broker owner receipt. Never
+    /// invoked automatically; the approval must name the live Broker owner.
+    ///
+    /// # Errors
+    /// Returns a refusal or the fail-closed Broker authority classification.
+    pub async fn recover_broker_owner(
+        &self,
+        approval: &BrokerOwnerRecoveryApproval,
+    ) -> Result<(), BrokerOwnerRecoveryError> {
+        self.broker_owner
+            .lock()
+            .await
+            .recover_stale_owner(approval)
             .await
             .map(|_| ())
     }
@@ -512,7 +595,7 @@ impl OrchestrationRuntime {
             .acquire_owned()
             .await
             .map_err(|_| {
-                RuntimeError::Persistence(OperationsError::Corrupt("catalog bridge closed"))
+                RuntimeError::persistence(OperationsError::Corrupt("catalog bridge closed"))
             })?;
         let catalog = Arc::clone(&self.operations);
         let owner = Arc::clone(&self.owner_lock);
@@ -526,7 +609,7 @@ impl OrchestrationRuntime {
         })
         .await
         .map_err(|_| {
-            RuntimeError::Persistence(OperationsError::Corrupt("catalog stage join failed"))
+            RuntimeError::persistence(OperationsError::Corrupt("catalog stage join failed"))
         })?
     }
 
@@ -666,6 +749,8 @@ pub enum RuntimeError {
     NotFound,
     #[error("Orchestration state requires resynchronization")]
     ResyncRequired,
+    #[error("Orchestration binding rejection target is unsupported")]
+    BindingRejectionTargetUnsupported,
     #[error("another mutable Orchestration runtime already owns this data-root ({0})")]
     OwnerAlreadyActive(String),
     #[error("Orchestration Agent Profile catalog failed")]
@@ -673,9 +758,17 @@ pub enum RuntimeError {
     #[error("Orchestration Broker owner authority failed")]
     BrokerOwner(#[source] BrokerOwnerAuthorityError),
     #[error("Orchestration persistence failed")]
-    Persistence(#[source] OperationsError),
+    Persistence(#[source] Box<OperationsError>),
     #[error("Orchestration filesystem failed")]
     Io(#[from] std::io::Error),
+}
+
+impl RuntimeError {
+    /// Preserve a typed Operations source behind the runtime error boundary.
+    #[must_use]
+    pub fn persistence(error: OperationsError) -> Self {
+        Self::Persistence(Box::new(error))
+    }
 }
 
 impl From<OperationsError> for RuntimeError {
@@ -685,7 +778,7 @@ impl From<OperationsError> for RuntimeError {
             OperationsError::Bounds(_) => Self::InvalidInput,
             OperationsError::Conflict(_) => Self::Conflict,
             OperationsError::ResyncRequired(_) => Self::ResyncRequired,
-            other => Self::Persistence(other),
+            other => Self::persistence(other),
         }
     }
 }
@@ -808,7 +901,7 @@ fn owner_lock_error(error: rusqlite::Error) -> RuntimeError {
     ) {
         RuntimeError::OwnerAlreadyActive("exclusive data-root lock is held".to_owned())
     } else {
-        RuntimeError::Persistence(OperationsError::Sqlite(error))
+        RuntimeError::persistence(OperationsError::Sqlite(error))
     }
 }
 

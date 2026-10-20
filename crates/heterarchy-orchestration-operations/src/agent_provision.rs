@@ -11,7 +11,18 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{AgentRequestResolutionKind, OperationsCatalog, OperationsError, wire};
+use crate::{
+    AgentRequestResolutionKind, AgentRequestResolutionSelection, ChatGptProjectId,
+    OperationsCatalog, OperationsError, WorkspaceProjectBindingRevision, WorkspaceProjectReference,
+    wire,
+};
+
+mod uncertainty_retirement;
+
+pub use uncertainty_retirement::{
+    AgentProvisionUncertaintyRetirement, AgentProvisionUncertaintyRetirementCommand,
+    AgentProvisionUncertaintyRetirementOutcome, AgentProvisionUncertaintyRetirementTarget,
+};
 
 const AGENT_PROVISION_OPERATION_DOMAIN: &[u8] =
     b"heterarchy.orchestration.agent-provision.operation.v1\0";
@@ -84,6 +95,30 @@ CREATE TABLE ops_agent_provision_failures (
     observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0),
     FOREIGN KEY(operation_id) REFERENCES ops_agent_provision_operations(operation_id)
 );
+";
+
+const AGENT_PROVISION_PROJECT_ROUTES_SQL: &str = r"
+CREATE TABLE ops_agent_provision_project_routes (
+    operation_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_agent_provision_operations(operation_id) CHECK(length(operation_id)=16 AND operation_id != zeroblob(16)),
+    project_id TEXT NOT NULL CHECK(length(CAST(project_id AS BLOB))=36 AND substr(project_id,1,4)='g-p-' AND substr(project_id,5,32) NOT GLOB '*[^0-9a-f]*'),
+    binding_revision INTEGER NOT NULL CHECK(binding_revision>=1)
+);
+";
+
+const AGENT_PROVISION_PROJECT_ROUTE_NO_UPDATE_TRIGGER: &str = r"
+CREATE TRIGGER ops_agent_provision_project_routes_no_update
+BEFORE UPDATE ON ops_agent_provision_project_routes
+BEGIN
+    SELECT RAISE(ABORT, 'Agent provision Project routes are immutable');
+END;
+";
+
+const AGENT_PROVISION_PROJECT_ROUTE_NO_DELETE_TRIGGER: &str = r"
+CREATE TRIGGER ops_agent_provision_project_routes_no_delete
+BEFORE DELETE ON ops_agent_provision_project_routes
+BEGIN
+    SELECT RAISE(ABORT, 'Agent provision Project routes are immutable');
+END;
 ";
 
 /// Provider-side effect selected by the durable resolver.
@@ -215,6 +250,7 @@ pub struct AgentProvisionDispatch {
     provider_family: AgentProvisionProviderFamily,
     profile_id: AgentProfileId,
     runtime_session_id: AgentProfileRuntimeSessionId,
+    project: Option<WorkspaceProjectReference>,
 }
 
 impl AgentProvisionDispatch {
@@ -252,6 +288,11 @@ impl AgentProvisionDispatch {
     pub const fn runtime_session_id(self) -> AgentProfileRuntimeSessionId {
         self.runtime_session_id
     }
+
+    #[must_use]
+    pub const fn project(self) -> Option<WorkspaceProjectReference> {
+        self.project
+    }
 }
 
 /// Durable operation that maps one resolver slot to at most one provider
@@ -268,6 +309,8 @@ pub struct AgentProvisionOperation {
     state: AgentProvisionState,
     provider_conversation_id: Option<String>,
     reported_failure_code: Option<AgentProvisionFailureCode>,
+    uncertainty_retirement: Option<AgentProvisionUncertaintyRetirement>,
+    project: Option<WorkspaceProjectReference>,
     prepared_at: TimestampMillis,
     updated_at: TimestampMillis,
     revision: u64,
@@ -328,6 +371,19 @@ impl AgentProvisionOperation {
     #[must_use]
     pub const fn reported_failure_code(&self) -> Option<AgentProvisionFailureCode> {
         self.reported_failure_code
+    }
+
+    /// Durable evidence that an unobservable `ProvisionNew` effect was retired
+    /// without pretending to know whether its provider-side effect occurred.
+    #[must_use]
+    pub const fn uncertainty_retirement(&self) -> Option<&AgentProvisionUncertaintyRetirement> {
+        self.uncertainty_retirement.as_ref()
+    }
+
+    /// Frozen Project route; legacy operations retain absent provenance.
+    #[must_use]
+    pub const fn project(&self) -> Option<WorkspaceProjectReference> {
+        self.project
     }
 
     #[must_use]
@@ -442,31 +498,7 @@ impl OperationsCatalog {
             .ok_or(OperationsError::Conflict(
                 "AgentRequest resolution slot missing",
             ))?;
-        let (effect_kind, profile_id, runtime_session_id) = match selection.kind() {
-            AgentRequestResolutionKind::ReuseReadyRuntime => (
-                AgentProvisionEffectKind::ReuseReadyRuntime,
-                selection.profile_id(),
-                selection.runtime_session_id(),
-            ),
-            AgentRequestResolutionKind::WakeExistingRuntime => (
-                AgentProvisionEffectKind::WakeExistingRuntime,
-                selection.profile_id(),
-                selection.runtime_session_id(),
-            ),
-            AgentRequestResolutionKind::WakeNewRuntime => (
-                AgentProvisionEffectKind::WakeNewRuntime,
-                selection.profile_id(),
-                None,
-            ),
-            AgentRequestResolutionKind::ProvisionNew => {
-                (AgentProvisionEffectKind::ProvisionNew, None, None)
-            }
-            AgentRequestResolutionKind::ReuseCurrentScope => {
-                return Err(OperationsError::Conflict(
-                    "reuse resolution has no provider provision effect",
-                ));
-            }
-        };
+        let (effect_kind, profile_id, runtime_session_id) = provision_effect_target(selection)?;
         validate_initial_target(effect_kind, profile_id, runtime_session_id)?;
         let operation_id = derived_operation_id(request_id, slot_ordinal);
         let tx = self
@@ -490,20 +522,27 @@ impl OperationsCatalog {
         if let Some(profile_id) = profile_id {
             crate::profile_deletion::require_profile_admission_open(&tx, profile_id)?;
         }
-        tx.execute(
-            "INSERT INTO ops_agent_provision_operations(operation_id,request_id,slot_ordinal,effect_kind,provider_family,profile_id,runtime_session_id,state,provider_conversation_id,prepared_at_ms,updated_at_ms,revision) VALUES(?1,?2,?3,?4,1,?5,?6,1,NULL,?7,?7,1)",
-            params![
-                operation_id.as_bytes(),
-                request_id.as_bytes(),
-                i64::from(slot_ordinal),
-                encode_effect_kind(effect_kind),
-                profile_id.map(|id| id.into_uuid().into_bytes().to_vec()),
-                runtime_session_id.map(|id| id.into_uuid().into_bytes().to_vec()),
-                prepared_at.get(),
-            ],
+        let workspace_id = operation_workspace_id(&tx, request_id)?;
+        let project = prepare_project_reference(
+            &tx,
+            workspace_id,
+            effect_kind,
+            profile_id,
+            runtime_session_id,
         )?;
-        let operation = load_operation(&tx, operation_id)?
-            .ok_or(OperationsError::Corrupt("Agent provision insert"))?;
+        let operation = insert_prepared_operation(
+            &tx,
+            PreparedProvisionOperationInsert {
+                operation_id,
+                request_id,
+                slot_ordinal,
+                effect_kind,
+                profile_id,
+                runtime_session_id,
+                prepared_at,
+                project,
+            },
+        )?;
         commit_operation(tx, operation_id)?;
         Ok(AgentProvisionPrepareOutcome {
             operation,
@@ -678,6 +717,7 @@ impl OperationsCatalog {
         observed_at: TimestampMillis,
     ) -> Result<AgentProvisionOperation, OperationsError> {
         let existing = required_operation(&self.connection, operation_id)?;
+        reject_retired_uncertainty(&existing)?;
         if existing.state == AgentProvisionState::EffectUnknown {
             return Ok(existing);
         }
@@ -707,6 +747,7 @@ impl OperationsCatalog {
     ) -> Result<AgentProvisionOperation, OperationsError> {
         validate_provider_conversation_id(provider_conversation_id)?;
         let existing = required_operation(&self.connection, operation_id)?;
+        reject_retired_uncertainty(&existing)?;
         if existing.state == AgentProvisionState::Confirmed {
             if existing.provider_conversation_id.as_deref() == Some(provider_conversation_id) {
                 return Ok(existing);
@@ -769,6 +810,7 @@ impl OperationsCatalog {
         failure_code: Option<AgentProvisionFailureCode>,
     ) -> Result<AgentProvisionOperation, OperationsError> {
         let existing = required_operation(&self.connection, operation_id)?;
+        reject_retired_uncertainty(&existing)?;
         if existing.state == AgentProvisionState::Failed {
             let Some(replayed_revision) = expected_revision.checked_add(1) else {
                 return Err(OperationsError::Conflict(
@@ -822,6 +864,87 @@ impl OperationsCatalog {
     }
 }
 
+#[derive(Clone, Copy)]
+struct PreparedProvisionOperationInsert {
+    operation_id: Uuid,
+    request_id: Uuid,
+    slot_ordinal: u8,
+    effect_kind: AgentProvisionEffectKind,
+    profile_id: Option<AgentProfileId>,
+    runtime_session_id: Option<AgentProfileRuntimeSessionId>,
+    prepared_at: TimestampMillis,
+    project: Option<WorkspaceProjectReference>,
+}
+
+fn insert_prepared_operation(
+    transaction: &rusqlite::Transaction<'_>,
+    insert: PreparedProvisionOperationInsert,
+) -> Result<AgentProvisionOperation, OperationsError> {
+    transaction.execute(
+        "INSERT INTO ops_agent_provision_operations(operation_id,request_id,slot_ordinal,effect_kind,provider_family,profile_id,runtime_session_id,state,provider_conversation_id,prepared_at_ms,updated_at_ms,revision) VALUES(?1,?2,?3,?4,1,?5,?6,1,NULL,?7,?7,1)",
+        params![
+            insert.operation_id.as_bytes(),
+            insert.request_id.as_bytes(),
+            i64::from(insert.slot_ordinal),
+            encode_effect_kind(insert.effect_kind),
+            insert
+                .profile_id
+                .map(|id| id.into_uuid().into_bytes().to_vec()),
+            insert
+                .runtime_session_id
+                .map(|id| id.into_uuid().into_bytes().to_vec()),
+            insert.prepared_at.get(),
+        ],
+    )?;
+    if let Some(project) = insert.project {
+        transaction.execute(
+            "INSERT INTO ops_agent_provision_project_routes(operation_id,project_id,binding_revision) VALUES(?1,?2,?3)",
+            params![
+                insert.operation_id.as_bytes(),
+                project.project_id().to_string(),
+                project.binding_revision().as_i64(),
+            ],
+        )?;
+    }
+    load_operation(transaction, insert.operation_id)?
+        .ok_or(OperationsError::Corrupt("Agent provision insert"))
+}
+
+fn provision_effect_target(
+    selection: AgentRequestResolutionSelection,
+) -> Result<
+    (
+        AgentProvisionEffectKind,
+        Option<AgentProfileId>,
+        Option<AgentProfileRuntimeSessionId>,
+    ),
+    OperationsError,
+> {
+    match selection.kind() {
+        AgentRequestResolutionKind::ReuseReadyRuntime => Ok((
+            AgentProvisionEffectKind::ReuseReadyRuntime,
+            selection.profile_id(),
+            selection.runtime_session_id(),
+        )),
+        AgentRequestResolutionKind::WakeExistingRuntime => Ok((
+            AgentProvisionEffectKind::WakeExistingRuntime,
+            selection.profile_id(),
+            selection.runtime_session_id(),
+        )),
+        AgentRequestResolutionKind::WakeNewRuntime => Ok((
+            AgentProvisionEffectKind::WakeNewRuntime,
+            selection.profile_id(),
+            None,
+        )),
+        AgentRequestResolutionKind::ProvisionNew => {
+            Ok((AgentProvisionEffectKind::ProvisionNew, None, None))
+        }
+        AgentRequestResolutionKind::ReuseCurrentScope => Err(OperationsError::Conflict(
+            "reuse resolution has no provider provision effect",
+        )),
+    }
+}
+
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsError> {
     connection.execute_batch(AGENT_PROVISION_OPERATIONS_SQL)?;
     Ok(())
@@ -829,6 +952,19 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsErr
 
 pub(crate) fn create_failure_schema(connection: &Connection) -> Result<(), OperationsError> {
     connection.execute_batch(AGENT_PROVISION_FAILURES_SQL)?;
+    Ok(())
+}
+
+pub(crate) fn create_uncertainty_retirement_schema(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    uncertainty_retirement::create_schema(connection)
+}
+
+pub(crate) fn create_project_route_schema(connection: &Connection) -> Result<(), OperationsError> {
+    connection.execute_batch(AGENT_PROVISION_PROJECT_ROUTES_SQL)?;
+    connection.execute_batch(AGENT_PROVISION_PROJECT_ROUTE_NO_UPDATE_TRIGGER)?;
+    connection.execute_batch(AGENT_PROVISION_PROJECT_ROUTE_NO_DELETE_TRIGGER)?;
     Ok(())
 }
 
@@ -859,6 +995,7 @@ pub(crate) fn migrate_v29_to_v30(
 pub(crate) fn drop_schema_for_legacy_fixture(
     connection: &Connection,
 ) -> Result<(), OperationsError> {
+    crate::workspace_project::drop_enrollment_schema_for_legacy_fixture(connection)?;
     crate::catalog::drop_v31_objects_for_legacy_fixture(connection)?;
     // The node-team bindings table only exists from v34 on; every legacy
     // fixture stamped below v34 must not retain it, or the exact-inventory
@@ -866,6 +1003,7 @@ pub(crate) fn drop_schema_for_legacy_fixture(
     connection.execute_batch(
         "DROP TABLE IF EXISTS ops_dag_node_team_bindings;
          DROP TABLE IF EXISTS ops_agent_provision_failures;
+         DROP TABLE IF EXISTS ops_agent_provision_uncertainty_retirements;
          DROP TABLE IF EXISTS ops_agent_provision_operations;",
     )?;
     Ok(())
@@ -885,6 +1023,31 @@ pub(crate) fn failure_schema_objects() -> Vec<(&'static str, &'static str, &'sta
         "ops_agent_provision_failures",
         AGENT_PROVISION_FAILURES_SQL,
     )]
+}
+
+pub(crate) fn uncertainty_retirement_schema_objects()
+-> Vec<(&'static str, &'static str, &'static str)> {
+    uncertainty_retirement::schema_objects()
+}
+
+pub(crate) fn project_route_schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        (
+            "table",
+            "ops_agent_provision_project_routes",
+            AGENT_PROVISION_PROJECT_ROUTES_SQL,
+        ),
+        (
+            "trigger",
+            "ops_agent_provision_project_routes_no_update",
+            AGENT_PROVISION_PROJECT_ROUTE_NO_UPDATE_TRIGGER,
+        ),
+        (
+            "trigger",
+            "ops_agent_provision_project_routes_no_delete",
+            AGENT_PROVISION_PROJECT_ROUTE_NO_DELETE_TRIGGER,
+        ),
+    ]
 }
 
 pub(crate) fn schema_objects_v29() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -966,6 +1129,15 @@ fn validate_mutation_fence(
     if observed_at < operation.updated_at {
         return Err(OperationsError::Conflict(
             "Agent provision observation time regression",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_retired_uncertainty(operation: &AgentProvisionOperation) -> Result<(), OperationsError> {
+    if operation.uncertainty_retirement.is_some() {
+        return Err(OperationsError::Conflict(
+            "Agent provision uncertainty already retired",
         ));
     }
     Ok(())
@@ -1058,6 +1230,7 @@ fn provider_dispatch(
         provider_family: operation.provider_family,
         profile_id,
         runtime_session_id,
+        project: operation.project,
     })
 }
 
@@ -1065,6 +1238,10 @@ fn in_flight_operation_ids(connection: &Connection) -> Result<Vec<Uuid>, Operati
     let mut statement = connection.prepare(
         "SELECT operation_id FROM ops_agent_provision_operations
          WHERE state IN(2,3)
+           AND NOT EXISTS(
+                SELECT 1 FROM ops_agent_provision_uncertainty_retirements AS retirement
+                 WHERE retirement.operation_id=ops_agent_provision_operations.operation_id
+           )
          ORDER BY updated_at_ms ASC, operation_id ASC
          LIMIT 2",
     )?;
@@ -1134,6 +1311,27 @@ fn admit_prepared_operation(
     existing: &AgentProvisionOperation,
     observed_at: TimestampMillis,
 ) -> Result<AgentProvisionOperation, OperationsError> {
+    if matches!(
+        existing.effect_kind,
+        AgentProvisionEffectKind::ProvisionNew | AgentProvisionEffectKind::WakeNewRuntime
+    ) && existing.project.is_none()
+    {
+        return Err(OperationsError::Conflict(
+            "ChatGPT Project binding required before new provision effect",
+        ));
+    }
+    if matches!(
+        existing.effect_kind,
+        AgentProvisionEffectKind::WakeExistingRuntime | AgentProvisionEffectKind::ReuseReadyRuntime
+    ) && existing.project.is_none()
+    {
+        let workspace_id = operation_workspace_id(transaction, existing.request_id)?;
+        if crate::workspace_project::load_binding(transaction, workspace_id)?.is_some() {
+            return Err(OperationsError::Conflict(
+                "existing Runtime Project provenance is unknown",
+            ));
+        }
+    }
     let next_revision = next_revision(existing.revision)?;
     let changed = transaction.execute(
         "UPDATE ops_agent_provision_operations SET state=2,updated_at_ms=?1,revision=?2 WHERE operation_id=?3 AND revision=?4 AND state=1",
@@ -1165,15 +1363,134 @@ fn required_operation(
     ))
 }
 
+fn operation_workspace_id(
+    connection: &Connection,
+    request_id: Uuid,
+) -> Result<Uuid, OperationsError> {
+    let bytes = connection.query_row(
+        "SELECT substr(workspace_id,1,17) FROM ops_agent_requests WHERE request_id=?1",
+        params![request_id.as_bytes()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let workspace_id = Uuid::from_bytes(wire::id(bytes)?);
+    if workspace_id.is_nil() {
+        return Err(OperationsError::Corrupt(
+            "Agent provision Workspace identity",
+        ));
+    }
+    Ok(workspace_id)
+}
+
+fn prepare_project_reference(
+    connection: &Connection,
+    workspace_id: Uuid,
+    effect_kind: AgentProvisionEffectKind,
+    profile_id: Option<AgentProfileId>,
+    runtime_session_id: Option<AgentProfileRuntimeSessionId>,
+) -> Result<Option<WorkspaceProjectReference>, OperationsError> {
+    let binding = crate::workspace_project::load_binding(connection, workspace_id)?;
+    match effect_kind {
+        AgentProvisionEffectKind::ProvisionNew | AgentProvisionEffectKind::WakeNewRuntime => {
+            binding
+                .map(|binding| Some(binding.project_reference()))
+                .ok_or(OperationsError::Conflict(
+                    "ChatGPT Project binding required for new provision",
+                ))
+        }
+        AgentProvisionEffectKind::WakeExistingRuntime
+        | AgentProvisionEffectKind::ReuseReadyRuntime => {
+            let profile_id = profile_id.ok_or(OperationsError::Corrupt(
+                "existing provision Project Profile target",
+            ))?;
+            let runtime_session_id = runtime_session_id.ok_or(OperationsError::Corrupt(
+                "existing provision Project Runtime target",
+            ))?;
+            let history = load_runtime_project_history(connection, profile_id, runtime_session_id)?;
+            match (binding, history.project, history.has_projectless_operation) {
+                (Some(binding), Some(project), false)
+                    if binding.project_id() == project.project_id() =>
+                {
+                    Ok(Some(project))
+                }
+                (Some(_), _, _) => Err(OperationsError::Conflict(
+                    "existing Runtime Project provenance is incompatible or unknown",
+                )),
+                (None, Some(project), false) => Ok(Some(project)),
+                (None, None, _) => Ok(None),
+                (None, Some(_), true) => Err(OperationsError::Conflict(
+                    "existing Runtime Project provenance is ambiguous",
+                )),
+            }
+        }
+    }
+}
+
+struct RuntimeProjectHistory {
+    project: Option<WorkspaceProjectReference>,
+    has_projectless_operation: bool,
+}
+
+fn load_runtime_project_history(
+    connection: &Connection,
+    profile_id: AgentProfileId,
+    runtime_session_id: AgentProfileRuntimeSessionId,
+) -> Result<RuntimeProjectHistory, OperationsError> {
+    let mut statement = connection.prepare(
+        "SELECT route.project_id,route.binding_revision
+           FROM ops_agent_provision_operations AS operation
+           LEFT JOIN ops_agent_provision_project_routes AS route
+             ON route.operation_id=operation.operation_id
+          WHERE operation.profile_id=?1
+            AND operation.runtime_session_id=?2
+            AND operation.state=5
+            AND operation.provider_conversation_id IS NOT NULL",
+    )?;
+    let mut rows = statement.query(params![
+        profile_id.into_uuid().as_bytes(),
+        runtime_session_id.into_uuid().as_bytes(),
+    ])?;
+    let mut history = RuntimeProjectHistory {
+        project: None,
+        has_projectless_operation: false,
+    };
+    while let Some(row) = rows.next()? {
+        let project_id = row.get::<_, Option<String>>(0)?;
+        let binding_revision = row.get::<_, Option<i64>>(1)?;
+        match (project_id, binding_revision) {
+            (None, None) => history.has_projectless_operation = true,
+            (Some(project_id), Some(binding_revision)) => {
+                let project_id = ChatGptProjectId::try_from(project_id.as_str())
+                    .map_err(|_| OperationsError::Corrupt("Agent provision Project route"))?;
+                let binding_revision = WorkspaceProjectBindingRevision::new(binding_revision)
+                    .map_err(|_| OperationsError::Corrupt("Agent provision Project revision"))?;
+                let project = WorkspaceProjectReference::new(project_id, binding_revision);
+                if history.project.is_some_and(|existing| existing != project) {
+                    return Err(OperationsError::Conflict(
+                        "existing Runtime has multiple Project provenances",
+                    ));
+                }
+                history.project = Some(project);
+            }
+            _ => {
+                return Err(OperationsError::Corrupt(
+                    "Agent provision Project route shape",
+                ));
+            }
+        }
+    }
+    Ok(history)
+}
+
 fn load_operation(
     connection: &Connection,
     operation_id: Uuid,
 ) -> Result<Option<AgentProvisionOperation>, OperationsError> {
     let raw = connection
         .query_row(
-            "SELECT substr(p.request_id,1,17),p.slot_ordinal,p.effect_kind,p.provider_family,substr(p.profile_id,1,17),substr(p.runtime_session_id,1,17),p.state,substr(p.provider_conversation_id,1,513),p.prepared_at_ms,p.updated_at_ms,p.revision,f.operation_revision,f.failure_code,f.observed_at_ms
+            "SELECT substr(p.request_id,1,17),p.slot_ordinal,p.effect_kind,p.provider_family,substr(p.profile_id,1,17),substr(p.runtime_session_id,1,17),p.state,substr(p.provider_conversation_id,1,513),p.prepared_at_ms,p.updated_at_ms,p.revision,f.operation_revision,f.failure_code,f.observed_at_ms,route.project_id,route.binding_revision
              FROM ops_agent_provision_operations AS p
              LEFT JOIN ops_agent_provision_failures AS f ON f.operation_id=p.operation_id
+             LEFT JOIN ops_agent_provision_project_routes AS route ON route.operation_id=p.operation_id
              WHERE p.operation_id=?1",
             params![operation_id.as_bytes()],
             |row| {
@@ -1192,12 +1509,20 @@ fn load_operation(
                     failure_operation_revision: row.get(11)?,
                     failure_code: row.get(12)?,
                     failure_observed_at: row.get(13)?,
+                    project_id: row.get(14)?,
+                    project_binding_revision: row.get(15)?,
                 })
             },
         )
         .optional()?;
-    raw.map(|raw| decode_operation(operation_id, raw))
-        .transpose()
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let mut operation = decode_operation(operation_id, raw)?;
+    operation.uncertainty_retirement =
+        uncertainty_retirement::load_for_operation(connection, operation_id)?;
+    uncertainty_retirement::validate_operation_projection(&operation)?;
+    Ok(Some(operation))
 }
 
 pub(crate) fn operation_for_request_slot(
@@ -1237,6 +1562,8 @@ struct RawAgentProvisionOperation {
     failure_operation_revision: Option<i64>,
     failure_code: Option<i64>,
     failure_observed_at: Option<i64>,
+    project_id: Option<String>,
+    project_binding_revision: Option<i64>,
 }
 
 fn decode_operation(
@@ -1250,21 +1577,10 @@ fn decode_operation(
     }
     let effect_kind = decode_effect_kind(raw.effect_kind)?;
     let provider_family = decode_provider_family(raw.provider_family)?;
-    let profile_id = raw
-        .profile_id
-        .map(|value| {
-            AgentProfileId::from_uuid(Uuid::from_bytes(wire::id(value)?))
-                .map_err(|_| OperationsError::Corrupt("Agent provision Profile id"))
-        })
-        .transpose()?;
-    let runtime_session_id = raw
-        .runtime_session_id
-        .map(|value| {
-            AgentProfileRuntimeSessionId::from_uuid(Uuid::from_bytes(wire::id(value)?))
-                .map_err(|_| OperationsError::Corrupt("Agent provision RuntimeSession id"))
-        })
-        .transpose()?;
     let state = decode_state(raw.state)?;
+    let reported_failure_code = decode_failure_diagnostic(&raw, state)?;
+    let (profile_id, runtime_session_id) =
+        decode_operation_target(raw.profile_id, raw.runtime_session_id)?;
     if let Some(value) = raw.provider_conversation_id.as_deref() {
         validate_provider_conversation_id(value)?;
     }
@@ -1274,44 +1590,12 @@ fn decode_operation(
         .map_err(|_| OperationsError::Corrupt("Agent provision updated time"))?;
     let revision = u64::try_from(raw.revision)
         .map_err(|_| OperationsError::Corrupt("Agent provision revision"))?;
+    let project = decode_project_route(raw.project_id, raw.project_binding_revision)?;
     if revision == 0 || updated_at < prepared_at {
         return Err(OperationsError::Corrupt("Agent provision row shape"));
     }
     validate_initial_or_bound_target(effect_kind, profile_id, runtime_session_id, state)?;
-    let has_conversation = raw.provider_conversation_id.is_some();
-    if has_conversation
-        != matches!(
-            state,
-            AgentProvisionState::Observed | AgentProvisionState::Confirmed
-        )
-    {
-        return Err(OperationsError::Corrupt(
-            "Agent provision conversation/state shape",
-        ));
-    }
-    let reported_failure_code = match (
-        raw.failure_operation_revision,
-        raw.failure_code,
-        raw.failure_observed_at,
-    ) {
-        (None, None, None) => None,
-        (Some(failure_revision), Some(failure_code), Some(failure_observed_at)) => {
-            if state != AgentProvisionState::Failed
-                || failure_revision != raw.revision
-                || failure_observed_at != raw.updated_at
-            {
-                return Err(OperationsError::Corrupt(
-                    "Agent provision failure diagnostic shape",
-                ));
-            }
-            Some(decode_failure_code(failure_code)?)
-        }
-        _ => {
-            return Err(OperationsError::Corrupt(
-                "Agent provision failure diagnostic shape",
-            ));
-        }
-    };
+    validate_conversation_state(raw.provider_conversation_id.as_deref(), state)?;
     Ok(AgentProvisionOperation {
         operation_id,
         request_id: Uuid::from_bytes(wire::id(raw.request_id)?),
@@ -1323,10 +1607,98 @@ fn decode_operation(
         state,
         provider_conversation_id: raw.provider_conversation_id,
         reported_failure_code,
+        uncertainty_retirement: None,
+        project,
         prepared_at,
         updated_at,
         revision,
     })
+}
+
+fn decode_operation_target(
+    profile_id: Option<Vec<u8>>,
+    runtime_session_id: Option<Vec<u8>>,
+) -> Result<(Option<AgentProfileId>, Option<AgentProfileRuntimeSessionId>), OperationsError> {
+    let profile_id = profile_id
+        .map(|value| {
+            AgentProfileId::from_uuid(Uuid::from_bytes(wire::id(value)?))
+                .map_err(|_| OperationsError::Corrupt("Agent provision Profile id"))
+        })
+        .transpose()?;
+    let runtime_session_id = runtime_session_id
+        .map(|value| {
+            AgentProfileRuntimeSessionId::from_uuid(Uuid::from_bytes(wire::id(value)?))
+                .map_err(|_| OperationsError::Corrupt("Agent provision RuntimeSession id"))
+        })
+        .transpose()?;
+    Ok((profile_id, runtime_session_id))
+}
+
+fn decode_project_route(
+    project_id: Option<String>,
+    binding_revision: Option<i64>,
+) -> Result<Option<WorkspaceProjectReference>, OperationsError> {
+    match (project_id, binding_revision) {
+        (None, None) => Ok(None),
+        (Some(project_id), Some(binding_revision)) => {
+            let project_id = ChatGptProjectId::try_from(project_id.as_str())
+                .map_err(|_| OperationsError::Corrupt("Agent provision Project identity"))?;
+            let binding_revision = WorkspaceProjectBindingRevision::new(binding_revision)
+                .map_err(|_| OperationsError::Corrupt("Agent provision Project revision"))?;
+            Ok(Some(WorkspaceProjectReference::new(
+                project_id,
+                binding_revision,
+            )))
+        }
+        _ => Err(OperationsError::Corrupt(
+            "Agent provision Project route shape",
+        )),
+    }
+}
+
+fn validate_conversation_state(
+    provider_conversation_id: Option<&str>,
+    state: AgentProvisionState,
+) -> Result<(), OperationsError> {
+    let has_conversation = provider_conversation_id.is_some();
+    let conversation_state = matches!(
+        state,
+        AgentProvisionState::Observed | AgentProvisionState::Confirmed
+    );
+    if has_conversation == conversation_state {
+        Ok(())
+    } else {
+        Err(OperationsError::Corrupt(
+            "Agent provision conversation/state shape",
+        ))
+    }
+}
+
+fn decode_failure_diagnostic(
+    raw: &RawAgentProvisionOperation,
+    state: AgentProvisionState,
+) -> Result<Option<AgentProvisionFailureCode>, OperationsError> {
+    match (
+        raw.failure_operation_revision,
+        raw.failure_code,
+        raw.failure_observed_at,
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(failure_revision), Some(failure_code), Some(failure_observed_at)) => {
+            if state != AgentProvisionState::Failed
+                || failure_revision != raw.revision
+                || failure_observed_at != raw.updated_at
+            {
+                return Err(OperationsError::Corrupt(
+                    "Agent provision failure diagnostic shape",
+                ));
+            }
+            Ok(Some(decode_failure_code(failure_code)?))
+        }
+        _ => Err(OperationsError::Corrupt(
+            "Agent provision failure diagnostic shape",
+        )),
+    }
 }
 
 fn validate_initial_or_bound_target(
@@ -1499,7 +1871,8 @@ mod tests {
     use super::*;
     use crate::{
         AgentRequestCommand, AgentRequestEffectScope, AgentRequestIndependence, AgentRequestIntent,
-        AgentRequestRequester, AgentRequestResolutionSelection, CommitAgentRequestResolution,
+        AgentRequestRequester, AgentRequestResolutionSelection, ChatGptProjectId,
+        CommitAgentRequestResolution, WorkspaceProjectConfigureCommand, WorkspaceProjectScope,
     };
     use forge_domain::{ActivityId, AgentInstanceId, AgentSessionId, WorkspaceId};
     use heterarchy_orchestration_sessions::{
@@ -1549,6 +1922,7 @@ mod tests {
         connection.execute_batch(
             "DROP TABLE IF EXISTS ops_dag_node_team_bindings;
              DROP TABLE ops_agent_request_fulfillments;
+             DROP TABLE IF EXISTS ops_agent_provision_uncertainty_retirements;
              DROP TABLE IF EXISTS ops_agent_provision_failures;
              DROP TABLE ops_agent_provision_operations;
              PRAGMA user_version=27;",
@@ -1568,6 +1942,7 @@ mod tests {
         crate::catalog::drop_v31_objects_for_legacy_fixture(&connection)?;
         connection.execute_batch(
             "DROP TABLE IF EXISTS ops_dag_node_team_bindings;
+             DROP TABLE IF EXISTS ops_agent_provision_uncertainty_retirements;
              DROP TABLE IF EXISTS ops_agent_provision_failures;
              ALTER TABLE ops_agent_provision_operations
                  RENAME TO ops_agent_provision_operations_v30_fixture;",
@@ -1597,6 +1972,7 @@ mod tests {
         crate::catalog::restore_v34_shapes_for_legacy_fixture(&connection)?;
         connection.execute_batch(
             "DROP TABLE IF EXISTS ops_dag_node_team_bindings;
+             DROP TABLE IF EXISTS ops_agent_provision_uncertainty_retirements;
              DROP TABLE ops_agent_provision_failures;
              PRAGMA user_version=32;",
         )?;
@@ -1608,10 +1984,12 @@ mod tests {
         request_id: Uuid,
         base_time_ms: i64,
     ) -> Result<Uuid, Box<dyn Error>> {
+        let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xE803));
+        ensure_test_project_binding(catalog, workspace_id.into_uuid(), base_time_ms)?;
         let request = AgentRequestCommand::new(
             request_id,
             AgentRequestRequester::new(
-                WorkspaceId::from_uuid(Uuid::from_u128(0xE803)),
+                workspace_id,
                 ActivityId::from_uuid(Uuid::from_u128(0xE804)),
                 AgentInstanceId::from_uuid(Uuid::from_u128(0xE805)),
                 AgentSessionId::from_uuid(Uuid::from_u128(0xE806)),
@@ -1642,6 +2020,31 @@ mod tests {
             TimestampMillis::new(base_time_ms + 2)?,
         )?;
         Ok(prepared.operation().operation_id())
+    }
+
+    fn ensure_test_project_binding(
+        catalog: &mut OperationsCatalog,
+        workspace_id: Uuid,
+        configured_at_ms: i64,
+    ) -> Result<(), Box<dyn Error>> {
+        if catalog.workspace_project_binding(workspace_id)?.is_none() {
+            let scope = WorkspaceProjectScope::new(
+                workspace_id,
+                Uuid::from_u128(0xE802),
+                1,
+                1,
+                "agent-provision-test-workspace".to_owned(),
+            )?;
+            let command = WorkspaceProjectConfigureCommand::new(
+                Uuid::now_v7(),
+                scope,
+                None,
+                ChatGptProjectId::try_from("g-p-6ad231f7ad7c8191bfc1d5ff782c171f")?,
+                TimestampMillis::new(configured_at_ms)?,
+            )?;
+            catalog.configure_workspace_project(command, &[])?;
+        }
+        Ok(())
     }
 
     fn create_bound_provision_operation(
@@ -1984,6 +2387,7 @@ mod tests {
         seed_v27_provision_resolution(&path, destination, request_id)?;
 
         let mut migrated = OperationsCatalog::open(&path, destination)?;
+        ensure_test_project_binding(&mut migrated, Uuid::from_u128(0xE803), 29)?;
         let prepared =
             migrated.prepare_agent_provision_operation(request_id, 0, TimestampMillis::new(30)?)?;
         assert!(prepared.created());
@@ -2013,6 +2417,8 @@ mod tests {
         )?;
         let confirmed =
             verify_global_admission_and_replay(&mut migrated, operation_id, second_operation_id)?;
+        let mut legacy_confirmed = confirmed.clone();
+        legacy_confirmed.project = None;
         let second_pending = migrated
             .next_agent_provision_dispatch(TimestampMillis::new(10_070)?)?
             .ok_or("second provision dispatch missing after cooldown")?;
@@ -2033,7 +2439,7 @@ mod tests {
         let reopened = OperationsCatalog::open(&path, destination)?;
         assert_eq!(
             reopened.agent_provision_operation(operation_id)?,
-            Some(confirmed.clone())
+            Some(legacy_confirmed.clone())
         );
         assert!(reopened.agent_request(request_id)?.is_some());
         drop(reopened);
@@ -2043,7 +2449,7 @@ mod tests {
         let reopened_v29 = OperationsCatalog::open(&path, destination)?;
         assert_eq!(
             reopened_v29.agent_provision_operation(operation_id)?,
-            Some(confirmed)
+            Some(legacy_confirmed)
         );
         drop(reopened_v29);
         fs::remove_dir_all(root)?;

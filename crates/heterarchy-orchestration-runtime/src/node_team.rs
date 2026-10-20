@@ -175,7 +175,7 @@ impl OrchestrationRuntime {
                 expected_sender_leadership_revision: command.expected_sender_leadership_revision,
                 observed_at: command.observed_at,
             })
-            .map_err(RuntimeError::Persistence)
+            .map_err(RuntimeError::persistence)
     }
 
     fn node_team_snapshot(
@@ -443,11 +443,13 @@ mod tests {
                 node_team_set(scope, Some(created.revision()), None)?,
                 source,
             ),
-            Err(RuntimeError::Persistence(
-                heterarchy_orchestration_operations::OperationsError::Conflict(
-                    "node binding revision",
+            Err(RuntimeError::Persistence(source))
+                if matches!(
+                    source.as_ref(),
+                    heterarchy_orchestration_operations::OperationsError::Conflict(
+                        "node binding revision"
+                    )
                 )
-            ))
         ));
         let retained = runtime
             .read_node_team_operator(AuthenticatedPrincipal::TrustedStdio, scope, None)?

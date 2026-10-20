@@ -329,5 +329,5 @@ fn profile_corrupt(label: &'static str) -> RuntimeError {
 }
 
 fn inconsistent(label: &'static str) -> RuntimeError {
-    RuntimeError::Persistence(OperationsError::Corrupt(label))
+    RuntimeError::persistence(OperationsError::Corrupt(label))
 }

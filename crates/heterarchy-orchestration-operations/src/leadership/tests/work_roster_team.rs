@@ -45,6 +45,7 @@ fn team_election_fixture()
             activity_id: fixture.activity,
             target_agent_id: AgentInstanceId::from_uuid(Uuid::from_u128(SEED + 0x202)),
             target_session_id: AgentSessionId::from_uuid(Uuid::from_u128(SEED + 0x201)),
+            expected_target_principal: forge_domain::AuthenticatedPrincipal::TrustedStdio,
             requester: OperationalActor::LocalOperator,
             team_id: Some(team),
             node_scope: node.scope,

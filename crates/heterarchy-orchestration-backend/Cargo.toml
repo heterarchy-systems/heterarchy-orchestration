@@ -21,6 +21,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream = { version = "=0.1.19", default-features = false, features = ["sync"] }
@@ -30,8 +31,12 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+agent-broker-client = { path = "../../../heterarchy-broker/crates/agent-broker-client", features = ["async"] }
+rcgen = "0.14.8"
+forge-execution = { path = "../../../heterarchy-forge/crates/forge-execution" }
 forge-persistence = { path = "../../../heterarchy-forge/crates/forge-persistence" }
 forge-workspace = { path = "../../../heterarchy-forge/crates/forge-workspace" }
+rusqlite.workspace = true
 
 [lints]
 workspace = true

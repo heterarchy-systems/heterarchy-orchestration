@@ -37,6 +37,7 @@ mod leadership_reviews;
 mod leadership_statements;
 mod member_list;
 mod membership;
+mod node_assignment_admission;
 mod node_chat;
 mod node_team;
 mod operations_import;
@@ -52,6 +53,8 @@ mod teams;
 #[cfg(test)]
 mod tests;
 mod work_credit;
+mod workspace_chat;
+mod workspace_project;
 
 const CLIENT_CONCURRENCY: usize = 4;
 const MAX_HEADERS: usize = 16;
@@ -82,10 +85,20 @@ pub enum ReadbackTarget {
     ProviderProvisionOperation { operation_id: Uuid },
     /// Pure operator readback for one exact message, without an Inspect transition.
     ProviderMessageOutbox { message_id: Uuid },
+    /// Read back one immutable UNKNOWN-isolation acknowledgement by its exact request and message IDs.
+    ProviderMessageUnknownIsolation { message_id: Uuid, request_id: Uuid },
     /// Original incoming intent; a pure turn lookup, never replaying the writer.
     ProviderIncomingTurn(Box<crate::wire::provider_worker::ProviderIncomingMessage>),
     /// Exact original capability-request intent, without retry authorization.
     AgentRequestAdmission(Box<crate::wire::agent_request_admission::AgentRequestAdmissionRequest>),
+    /// Complete immutable pre-offer intent for pure admission recovery.
+    NodeAssignmentAdmission(
+        Box<crate::wire::node_assignment_admission::NodeAssignmentAdmissionRequest>,
+    ),
+    /// Complete immutable Profile-direct message intent for pure recovery.
+    WorkspaceChat(Box<crate::wire::workspace_chat::WorkspaceChatSendRequest>),
+    /// Recover one exact Workspace-to-Project configure receipt; never retry configuration.
+    WorkspaceProjectBinding(Box<crate::wire::workspace_project::WorkspaceProjectReadbackRequest>),
     /// Recover the immutable actor, body, context and target witness of this
     /// message. An absent receipt does not authorize a blind retry.
     NodeChat(Box<crate::wire::node_chat::NodeChatSendRequest>),
@@ -114,6 +127,20 @@ pub enum ReadbackTarget {
         activity_id: Uuid,
         session_id: Uuid,
         request_id: Uuid,
+    },
+    /// Read the exact terminal binding rejection after an uncertain settle.
+    MemberBindingRejection {
+        workspace_id: Uuid,
+        activity_id: Uuid,
+        session_id: Uuid,
+        request_id: Uuid,
+    },
+    MemberBindingRejectionResolution {
+        workspace_id: Uuid,
+        activity_id: Uuid,
+        session_id: Uuid,
+        request_id: Uuid,
+        resolution_request_id: Uuid,
     },
     /// Observe the exact leadership scope after an uncertain advance.
     LeadershipScope {

@@ -4,10 +4,12 @@
 //! operation to its canonical `AgentRequest` Workspace before reading or
 //! cancelling it, so a globally unique operation ID cannot cross a scope.
 
-use forge_domain::TimestampMillis;
+use forge_domain::{AgentSessionId, AuthenticatedPrincipal, TimestampMillis, WorkspaceId};
 use heterarchy_orchestration_operations::{
     AgentProvisionEffectKind, AgentProvisionFailureCode, AgentProvisionOperation,
-    AgentProvisionProviderFamily, OperationsError,
+    AgentProvisionProviderFamily, AgentProvisionUncertaintyRetirement,
+    AgentProvisionUncertaintyRetirementCommand, AgentProvisionUncertaintyRetirementTarget,
+    OperationsError, WorkspaceProjectReference,
 };
 use uuid::Uuid;
 
@@ -30,6 +32,8 @@ pub struct ProvisionOperationFullSummary {
     pub prepared_at_ms: i64,
     pub updated_at_ms: i64,
     pub revision: u64,
+    pub uncertainty_retirement: Option<AgentProvisionUncertaintyRetirement>,
+    pub project: Option<WorkspaceProjectReference>,
 }
 
 /// Cancellation result retaining whether this call committed a state change.
@@ -37,6 +41,28 @@ pub struct ProvisionOperationFullSummary {
 pub struct ProvisionOperationCancelSummary {
     pub operation: ProvisionOperationFullSummary,
     pub changed: bool,
+}
+
+/// Durable retirement result retaining the unchanged unknown effect truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionOperationUncertaintyRetirementSummary {
+    pub operation: ProvisionOperationFullSummary,
+    pub retirement: AgentProvisionUncertaintyRetirement,
+    pub changed: bool,
+}
+
+/// Authenticated, source-scoped request to stop recovery for one unknown
+/// provider effect. Server time remains an explicit Runtime observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvisionOperationUncertaintyRetirement {
+    pub principal: AuthenticatedPrincipal,
+    pub workspace_id: Uuid,
+    pub requester_session_id: Uuid,
+    pub retirement_id: Uuid,
+    pub operation_id: Uuid,
+    pub expected_unknown_revision: u64,
+    pub recovery_version: u8,
+    pub retired_at_ms: i64,
 }
 
 impl OrchestrationRuntime {
@@ -100,6 +126,62 @@ impl OrchestrationRuntime {
             changed,
         })
     }
+
+    /// Retire recovery for one unobserved `ProvisionNew` effect while keeping
+    /// the provider outcome unknown. The exact caller-owned open Session and
+    /// canonical operation Workspace are verified before the Operations owner
+    /// receives the immutable command.
+    ///
+    /// # Errors
+    /// Returns invalid identities/timestamps, foreign or closed Session
+    /// authority, unsupported operation state/kind, stale fences, or durable
+    /// catalog failures.
+    pub fn retire_unobserved_provision_operation(
+        &self,
+        request: ProvisionOperationUncertaintyRetirement,
+    ) -> Result<ProvisionOperationUncertaintyRetirementSummary, RuntimeError> {
+        self.require_operator(request.principal)?;
+        validate_identity(request.workspace_id)?;
+        validate_identity(request.requester_session_id)?;
+        validate_identity(request.retirement_id)?;
+        validate_identity(request.operation_id)?;
+        let retired_at =
+            TimestampMillis::new(request.retired_at_ms).map_err(|_| RuntimeError::InvalidInput)?;
+        self.require_open_session(request.requester_session_id, request.principal)?;
+
+        let mut catalog = self.catalog()?;
+        let operation = catalog
+            .agent_provision_operation(request.operation_id)?
+            .ok_or(RuntimeError::NotFound)?;
+        ensure_operation_workspace(&catalog, request.workspace_id, &operation)?;
+        let target = AgentProvisionUncertaintyRetirementTarget::new(
+            request.operation_id,
+            request.expected_unknown_revision,
+            WorkspaceId::from_uuid(request.workspace_id),
+            AgentSessionId::from_uuid(request.requester_session_id),
+        )?;
+        let command = AgentProvisionUncertaintyRetirementCommand::new(
+            request.retirement_id,
+            target,
+            request.principal,
+            request.recovery_version,
+            retired_at,
+        )?;
+        let outcome = catalog.retire_agent_provision_uncertainty(command)?;
+        let changed = outcome.created();
+        let retirement = outcome.retirement().clone();
+        let operation = catalog
+            .agent_provision_operation(request.operation_id)?
+            .ok_or(OperationsError::Corrupt(
+                "retired Agent provision operation missing",
+            ))?;
+        ensure_operation_workspace(&catalog, request.workspace_id, &operation)?;
+        Ok(ProvisionOperationUncertaintyRetirementSummary {
+            operation: full_summary(&operation),
+            retirement,
+            changed,
+        })
+    }
 }
 
 fn validate_identity(value: Uuid) -> Result<(), RuntimeError> {
@@ -145,6 +227,8 @@ pub(super) fn full_summary(operation: &AgentProvisionOperation) -> ProvisionOper
         prepared_at_ms: operation.prepared_at().get(),
         updated_at_ms: operation.updated_at().get(),
         revision: operation.revision(),
+        uncertainty_retirement: operation.uncertainty_retirement().cloned(),
+        project: operation.project(),
     }
 }
 
@@ -166,10 +250,12 @@ const fn provider_family_label(family: AgentProvisionProviderFamily) -> &'static
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::OperatorPolicy;
     use crate::provisioning::{
         AgentRequestEffectScope, AgentRequestIndependence, AgentRequestSubmit,
     };
-    use heterarchy_orchestration_operations::AgentProvisionState;
+    use forge_domain::{DirectTokenId, OAuthGrantId};
+    use heterarchy_orchestration_operations::{AgentProvisionDispatchAction, AgentProvisionState};
 
     #[test]
     fn scoped_operation_query_cancel_and_cancel_noop_use_canonical_owner()
@@ -179,6 +265,7 @@ mod tests {
         std::fs::create_dir_all(&root)?;
         let runtime = OrchestrationRuntime::open(&root)?;
         let workspace_id = Uuid::from_u128(0xA101);
+        crate::test_support::ensure_workspace_project_binding(&runtime, workspace_id, 1)?;
         let request_id = Uuid::from_u128(0xA105);
         runtime.submit_agent_request(AgentRequestSubmit {
             workspace_id,
@@ -256,5 +343,216 @@ mod tests {
         drop(runtime);
         std::fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    struct RetirementFixture {
+        root: std::path::PathBuf,
+        runtime: OrchestrationRuntime,
+        owner: AuthenticatedPrincipal,
+        other_operator: AuthenticatedPrincipal,
+        session: Uuid,
+        workspace_id: Uuid,
+        unknown: AgentProvisionOperation,
+    }
+
+    impl RetirementFixture {
+        fn new() -> Result<Self, Box<dyn std::error::Error>> {
+            let root =
+                std::env::temp_dir().join(format!("provision-retirement-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&root)?;
+            let owner = AuthenticatedPrincipal::DirectToken(DirectTokenId::from_uuid(
+                Uuid::from_u128(0xB001),
+            ));
+            let other_operator = AuthenticatedPrincipal::OAuthGrant(OAuthGrantId::from_uuid(
+                Uuid::from_u128(0xB002),
+            ));
+            let runtime = OrchestrationRuntime::open(&root)?
+                .with_operator_policy(OperatorPolicy::new(vec![owner, other_operator])?);
+            let session = runtime
+                .open_session(Uuid::from_u128(0xB003), owner, 1)?
+                .session
+                .session_id;
+            let workspace_id = Uuid::from_u128(0xB004);
+            crate::test_support::ensure_workspace_project_binding(&runtime, workspace_id, 2)?;
+            let request_id = Uuid::from_u128(0xB008);
+            runtime.submit_agent_request(AgentRequestSubmit {
+                workspace_id,
+                activity_id: Uuid::from_u128(0xB005),
+                requester_agent_id: Uuid::from_u128(0xB006),
+                requester_session_id: session,
+                coordinator_revision: 1,
+                request_id,
+                objective: "prepare two independent provider targets".to_owned(),
+                capability: "chat".to_owned(),
+                count: 2,
+                effect_scope: AgentRequestEffectScope::SourceWrite,
+                independence: AgentRequestIndependence::None,
+                reason: "retire only the first unobserved effect".to_owned(),
+                created_at_ms: 2,
+            })?;
+            runtime.reserve_agent_request_resolution(request_id, 3, 4)?;
+            let prepared = runtime.prepare_agent_request_effect_targets(request_id, 5, 6)?;
+            assert_eq!(prepared.len(), 2);
+            let first = runtime
+                .provider_worker_next_provision(owner, 7)?
+                .ok_or("first provider dispatch")?;
+            let first_fence = first.dispatch().ok_or("first Execute fence")?;
+            assert_eq!(first_fence.action(), AgentProvisionDispatchAction::Execute);
+            let unknown = runtime.provider_worker_mark_provision_unknown(
+                owner,
+                first_fence.operation_id(),
+                first_fence.operation_revision(),
+                8,
+            )?;
+            assert_eq!(unknown.state(), AgentProvisionState::EffectUnknown);
+            Ok(Self {
+                root,
+                runtime,
+                owner,
+                other_operator,
+                session,
+                workspace_id,
+                unknown,
+            })
+        }
+
+        fn retirement(&self) -> ProvisionOperationUncertaintyRetirement {
+            ProvisionOperationUncertaintyRetirement {
+                principal: self.owner,
+                workspace_id: self.workspace_id,
+                requester_session_id: self.session,
+                retirement_id: Uuid::from_u128(0xB009),
+                operation_id: self.unknown.operation_id(),
+                expected_unknown_revision: self.unknown.revision(),
+                recovery_version: 1,
+                retired_at_ms: 9,
+            }
+        }
+
+        fn finish(self) -> Result<(), Box<dyn std::error::Error>> {
+            let Self { root, runtime, .. } = self;
+            drop(runtime);
+            std::fs::remove_dir_all(root)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn uncertainty_retirement_rejects_foreign_stale_and_invalid_authority()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = RetirementFixture::new()?;
+        let retirement = fixture.retirement();
+        assert!(matches!(
+            fixture.runtime.retire_unobserved_provision_operation(
+                ProvisionOperationUncertaintyRetirement {
+                    principal: fixture.other_operator,
+                    ..retirement
+                }
+            ),
+            Err(RuntimeError::Forbidden)
+        ));
+        assert!(matches!(
+            fixture.runtime.retire_unobserved_provision_operation(
+                ProvisionOperationUncertaintyRetirement {
+                    workspace_id: Uuid::from_u128(0xB999),
+                    ..retirement
+                }
+            ),
+            Err(RuntimeError::Forbidden)
+        ));
+        assert!(matches!(
+            fixture.runtime.retire_unobserved_provision_operation(
+                ProvisionOperationUncertaintyRetirement {
+                    expected_unknown_revision: fixture.unknown.revision() + 1,
+                    ..retirement
+                }
+            ),
+            Err(RuntimeError::Conflict)
+        ));
+        assert!(matches!(
+            fixture.runtime.retire_unobserved_provision_operation(
+                ProvisionOperationUncertaintyRetirement {
+                    recovery_version: 2,
+                    ..retirement
+                }
+            ),
+            Err(RuntimeError::Conflict)
+        ));
+        assert!(matches!(
+            fixture.runtime.retire_unobserved_provision_operation(
+                ProvisionOperationUncertaintyRetirement {
+                    retired_at_ms: -1,
+                    ..retirement
+                }
+            ),
+            Err(RuntimeError::InvalidInput)
+        ));
+        fixture.finish()
+    }
+
+    #[test]
+    fn uncertainty_retirement_replays_and_releases_next_candidate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = RetirementFixture::new()?;
+        let retirement = fixture.retirement();
+        let retired = fixture
+            .runtime
+            .retire_unobserved_provision_operation(retirement)?;
+        assert!(retired.changed);
+        assert_eq!(retired.operation.state, "effect_unknown");
+        assert_eq!(retired.operation.revision, fixture.unknown.revision() + 1);
+        assert_eq!(
+            retired.operation.uncertainty_retirement.as_ref(),
+            Some(&retired.retirement)
+        );
+        let replay = fixture.runtime.retire_unobserved_provision_operation(
+            ProvisionOperationUncertaintyRetirement {
+                retired_at_ms: 100,
+                ..retirement
+            },
+        )?;
+        assert!(!replay.changed);
+        assert_eq!(replay.retirement, retired.retirement);
+        assert_eq!(replay.operation, retired.operation);
+        assert!(matches!(
+            fixture.runtime.provider_worker_confirm_provision(
+                fixture.owner,
+                fixture.unknown.operation_id(),
+                retired.operation.revision,
+                "late-conversation",
+                10,
+            ),
+            Err(RuntimeError::Conflict)
+        ));
+        assert!(matches!(
+            fixture.runtime.provider_worker_fail_provision(
+                fixture.owner,
+                fixture.unknown.operation_id(),
+                retired.operation.revision,
+                10,
+                None,
+            ),
+            Err(RuntimeError::Conflict)
+        ));
+        let next = fixture
+            .runtime
+            .provider_worker_next_provision(fixture.owner, 11)?
+            .ok_or("second provider dispatch")?;
+        let next_fence = next.dispatch().ok_or("second Execute fence")?;
+        assert_eq!(next_fence.action(), AgentProvisionDispatchAction::Execute);
+        assert_ne!(next_fence.operation_id(), fixture.unknown.operation_id());
+        fixture
+            .runtime
+            .close_session(fixture.session, fixture.owner, 1, 12)?;
+        assert!(matches!(
+            fixture.runtime.retire_unobserved_provision_operation(
+                ProvisionOperationUncertaintyRetirement {
+                    retired_at_ms: 13,
+                    ..retirement
+                }
+            ),
+            Err(RuntimeError::Forbidden)
+        ));
+        fixture.finish()
     }
 }

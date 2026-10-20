@@ -75,6 +75,84 @@ pub struct MemberActivateResponse {
     pub activation: MemberActivationWire,
 }
 
+/// Operator request to settle the exact stored binding as terminally rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemberBindingRejectRequest {
+    pub target: MemberTarget,
+    pub request_id: Uuid,
+}
+
+/// Exact terminal rejection accepted from the Source binding lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemberBindingRejectResponse {
+    pub target: MemberTarget,
+    pub rejection: MemberBindingRejectionWire,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemberBindingRejectionReconcileRequest {
+    pub target: MemberTarget,
+    pub request_id: Uuid,
+    pub resolution_request_id: Uuid,
+    pub expected_attempt_request_digest: String,
+    pub expected_legacy_artifact_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemberBindingRejectionReconcileResponse {
+    pub target: MemberTarget,
+    pub request_id: Uuid,
+    pub resolution_request_id: Uuid,
+    pub attempt_request_digest: String,
+    pub legacy_artifact_digest: String,
+    pub legacy_envelope_request_id_policy: LegacyEnvelopeRequestIdPolicyWire,
+    pub durable_request_id_policy: DurableRequestIdPolicyWire,
+    pub source_request_id_policy: SourceRequestIdPolicyWire,
+    pub source_get_observed_at_ms: i64,
+    pub resolved_at_ms: i64,
+    pub consumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyEnvelopeRequestIdPolicyWire {
+    GeneratedUuidV7,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableRequestIdPolicyWire {
+    PersistedUuidV8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceRequestIdPolicyWire {
+    BodyEqualsEnvelope,
+}
+
+/// Historical owner readback selector for one terminal rejection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemberBindingRejectionQueryRequest {
+    pub target: MemberTarget,
+    pub request_id: Uuid,
+}
+
+/// Explicit nullable terminal rejection evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemberBindingRejectionQueryResponse {
+    pub target: MemberTarget,
+    pub request_id: Uuid,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub rejection: Option<MemberBindingRejectionWire>,
+}
+
 /// Exact logical registration readback selector.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -148,6 +226,54 @@ pub struct MemberActivationWire {
     pub phase: MemberPhaseWire,
 }
 
+/// Published immutable Orchestration observation of a Source rejection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemberBindingRejectionWire {
+    pub request_id: Uuid,
+    pub workspace_id: Uuid,
+    pub participant_id: Uuid,
+    pub activity_id: Uuid,
+    pub agent_id: Uuid,
+    pub session_id: Uuid,
+    pub principal: MemberPrincipalWire,
+    pub migration_id: Uuid,
+    pub destination_id: Uuid,
+    pub expected_freeze_revision: u64,
+    pub manifest_digest: String,
+    pub issuer_id: Uuid,
+    pub workspace_root_fingerprint: String,
+    pub binding_digest: String,
+    pub delegation_digest: String,
+    pub membership_digest: String,
+    pub display_name: String,
+    pub declared_role: String,
+    pub transport: MemberTransportWire,
+    pub reason: MemberBindingRejectionReasonWire,
+    pub reserved_at_ms: i64,
+    pub requested_at_ms: i64,
+    pub observed_at_ms: i64,
+    pub rejected_at_ms: i64,
+    pub request_digest: String,
+    pub receipt_digest: String,
+}
+
+/// Authenticated principal echoed only in immutable rejection evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MemberPrincipalWire {
+    TrustedStdio,
+    DirectToken { token_id: Uuid },
+    OAuthGrant { grant_id: Uuid },
+}
+
+/// Closed terminal Source rejection vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberBindingRejectionReasonWire {
+    PrincipalTransportMismatch,
+}
+
 fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -186,6 +312,39 @@ mod tests {
             phase: MemberPhaseWire::Pending,
             reserved: false,
             reserved_at_ms: None,
+        }
+    }
+
+    fn rejection() -> MemberBindingRejectionWire {
+        MemberBindingRejectionWire {
+            request_id: Uuid::from_u128(6),
+            workspace_id: Uuid::from_u128(1),
+            participant_id: Uuid::from_u128(7),
+            activity_id: Uuid::from_u128(3),
+            agent_id: Uuid::from_u128(8),
+            session_id: Uuid::from_u128(4),
+            principal: MemberPrincipalWire::DirectToken {
+                token_id: Uuid::from_u128(9),
+            },
+            migration_id: Uuid::from_u128(10),
+            destination_id: Uuid::from_u128(11),
+            expected_freeze_revision: 1,
+            manifest_digest: "11".repeat(32),
+            issuer_id: Uuid::from_u128(12),
+            workspace_root_fingerprint: "22".repeat(16),
+            binding_digest: "33".repeat(32),
+            delegation_digest: "44".repeat(32),
+            membership_digest: "55".repeat(32),
+            display_name: "Ada".to_owned(),
+            declared_role: "reviewer".to_owned(),
+            transport: MemberTransportWire::Other,
+            reason: MemberBindingRejectionReasonWire::PrincipalTransportMismatch,
+            reserved_at_ms: 2,
+            requested_at_ms: 1,
+            observed_at_ms: 3,
+            rejected_at_ms: 4,
+            request_digest: "77".repeat(32),
+            receipt_digest: "66".repeat(32),
         }
     }
 
@@ -235,6 +394,28 @@ mod tests {
             .ok_or("progress object")?
             .remove("reservedAtMs");
         assert!(serde_json::from_value::<MemberProgressWire>(missing_reserved_at).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn binding_rejection_readback_requires_explicit_nullable_and_closed_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = MemberBindingRejectionQueryResponse {
+            target: target(),
+            request_id: Uuid::from_u128(6),
+            rejection: Some(rejection()),
+        };
+        let value = serde_json::to_value(&response)?;
+        assert_eq!(value["rejection"]["reason"], "principal_transport_mismatch");
+        let mut missing = value.clone();
+        let _removed = missing
+            .as_object_mut()
+            .ok_or("response object")?
+            .remove("rejection");
+        assert!(serde_json::from_value::<MemberBindingRejectionQueryResponse>(missing).is_err());
+        let mut future = value;
+        future["rejection"]["reason"] = "future_reason".into();
+        assert!(serde_json::from_value::<MemberBindingRejectionQueryResponse>(future).is_err());
         Ok(())
     }
 

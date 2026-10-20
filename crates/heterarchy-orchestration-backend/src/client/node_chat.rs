@@ -13,6 +13,7 @@ use crate::wire::node_chat::{
     NodeChatSendRequest, NodeChatSendResponse, NodeChatTargetWire,
 };
 use crate::wire::node_team::NodeTeamScopeWire;
+use crate::wire::workspace_project::valid_provider_project_reference;
 
 use super::membership::validate_scope;
 use super::{
@@ -202,6 +203,10 @@ fn valid_target_fence(fence: &ChatTargetFenceWire) -> bool {
         || fence.runtime_session_id.is_nil()
         || fence.runtime_revision <= 0
         || !bounded_nonempty(&fence.provider_conversation_id, MAX_PROVIDER_ID_BYTES)
+        || fence
+            .project
+            .as_ref()
+            .is_some_and(|project| !valid_provider_project_reference(project))
     {
         return false;
     }
@@ -387,6 +392,7 @@ mod tests {
             runtime_session_id: Uuid::from_u128(13),
             runtime_revision: 14,
             provider_conversation_id: "conversation".to_owned(),
+            project: None,
             leadership_revision: None,
             node_target: Some(NodeChatTargetWire::Agent {
                 assignment_id: Uuid::from_u128(15),

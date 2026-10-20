@@ -17,7 +17,8 @@ use std::fmt::Write as _;
 use uuid::Uuid;
 
 use crate::{
-    OperationalActor, OperationsCatalog, OperationsError, WorkspaceParticipationId,
+    ChatGptProjectId, OperationalActor, OperationsCatalog, OperationsError,
+    WorkspaceParticipationId, WorkspaceProjectReference,
     operational_actor::{ResolvedOperationalActor, resolve_actor},
 };
 
@@ -25,6 +26,16 @@ pub(crate) mod governance;
 mod provider_observation;
 pub use provider_observation::{ProviderMessageInFlightPage, ProviderTurnObservation};
 mod node_route;
+mod unknown_isolation;
+
+pub use unknown_isolation::{
+    ProviderMessageUnknownIsolationCommand, ProviderMessageUnknownIsolationReason,
+    ProviderMessageUnknownIsolationReceipt,
+};
+pub(crate) use unknown_isolation::{
+    create_schema as create_unknown_isolation_schema,
+    schema_objects as unknown_isolation_schema_objects,
+};
 
 pub use node_route::{NodeMessageRouteTarget, NodeMessageRouteWitness};
 
@@ -134,7 +145,7 @@ CREATE TABLE ops_workspace_messages (
 );
 ";
 
-const WORKSPACE_MESSAGES_SQL: &str = r"
+const WORKSPACE_MESSAGES_SQL_V46: &str = r"
 CREATE TABLE ops_workspace_messages (
     message_id BLOB PRIMARY KEY NOT NULL CHECK(length(message_id)=16 AND message_id != zeroblob(16)),
     workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16),
@@ -166,6 +177,45 @@ CREATE TABLE ops_workspace_messages (
     UNIQUE(workspace_id, provider_conversation_id, provider_turn_id),
     CHECK((channel_kind=0 AND channel_participation_id IS NULL) OR (channel_kind=1 AND channel_participation_id IS NOT NULL)),
     CHECK((author_kind=0 AND author_participation_id IS NULL AND author_profile_id IS NULL AND author_participant_id IS NULL AND author_session_id IS NULL) OR (author_kind=1 AND author_participation_id IS NOT NULL AND author_profile_id IS NOT NULL AND author_participant_id IS NOT NULL AND author_session_id IS NOT NULL) OR (author_kind IN(2,3) AND author_participation_id IS NULL AND author_profile_id IS NULL AND author_participant_id IS NULL AND author_session_id IS NULL)),
+    CHECK((origin_kind=0 AND provider_conversation_id IS NULL AND provider_turn_id IS NULL AND provider_source_kind IS NULL AND provider_source_profile_id IS NULL AND provider_source_participation_id IS NULL AND provider_source_label IS NULL) OR (origin_kind=1 AND provider_conversation_id IS NOT NULL AND provider_turn_id IS NOT NULL AND provider_source_kind IS NOT NULL)),
+    CHECK((provider_source_kind=0 AND provider_source_profile_id IS NOT NULL AND provider_source_participation_id IS NOT NULL) OR (provider_source_kind=1 AND provider_source_profile_id IS NULL AND provider_source_participation_id IS NULL) OR provider_source_kind IS NULL),
+    CHECK((goal_id IS NOT NULL) OR (dag_revision IS NULL AND node_id IS NULL)),
+    CHECK(dag_revision IS NOT NULL OR node_id IS NULL)
+);
+";
+
+const WORKSPACE_MESSAGES_SQL: &str = r"
+CREATE TABLE ops_workspace_messages (
+    message_id BLOB PRIMARY KEY NOT NULL CHECK(length(message_id)=16 AND message_id != zeroblob(16)),
+    workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16),
+    channel_kind INTEGER NOT NULL CHECK(channel_kind IN(0,1)),
+    channel_participation_id BLOB CHECK(channel_participation_id IS NULL OR (length(channel_participation_id)=16 AND channel_participation_id != zeroblob(16))),
+    author_kind INTEGER NOT NULL CHECK(author_kind IN(0,1,2,3,4)),
+    author_participation_id BLOB CHECK(author_participation_id IS NULL OR (length(author_participation_id)=16 AND author_participation_id != zeroblob(16))),
+    author_profile_id BLOB CHECK(author_profile_id IS NULL OR (length(author_profile_id)=16 AND author_profile_id != zeroblob(16))),
+    author_participant_id BLOB CHECK(author_participant_id IS NULL OR (length(author_participant_id)=16 AND author_participant_id != zeroblob(16))),
+    author_session_id BLOB CHECK(author_session_id IS NULL OR (length(author_session_id)=16 AND author_session_id != zeroblob(16))),
+    author_display_name TEXT NOT NULL CHECK(length(CAST(author_display_name AS BLOB)) BETWEEN 1 AND 128),
+    origin_kind INTEGER NOT NULL CHECK(origin_kind IN(0,1)),
+    body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) BETWEEN 1 AND 16384),
+    sequence INTEGER NOT NULL CHECK(sequence>=1),
+    submitted_at_ms INTEGER NOT NULL CHECK(submitted_at_ms>=0),
+    activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16),
+    goal_id BLOB CHECK(goal_id IS NULL OR length(goal_id)=16),
+    dag_revision INTEGER CHECK(dag_revision IS NULL OR dag_revision>=1),
+    node_id BLOB CHECK(node_id IS NULL OR length(node_id)=16),
+    provider_conversation_id TEXT CHECK(provider_conversation_id IS NULL OR length(CAST(provider_conversation_id AS BLOB)) BETWEEN 1 AND 512),
+    provider_turn_id TEXT CHECK(provider_turn_id IS NULL OR length(CAST(provider_turn_id AS BLOB)) BETWEEN 1 AND 512),
+    provider_source_kind INTEGER CHECK(provider_source_kind IS NULL OR provider_source_kind IN(0,1)),
+    provider_source_profile_id BLOB CHECK(provider_source_profile_id IS NULL OR (length(provider_source_profile_id)=16 AND provider_source_profile_id != zeroblob(16))),
+    provider_source_participation_id BLOB CHECK(provider_source_participation_id IS NULL OR (length(provider_source_participation_id)=16 AND provider_source_participation_id != zeroblob(16))),
+    provider_source_label TEXT CHECK(provider_source_label IS NULL OR length(CAST(provider_source_label AS BLOB)) BETWEEN 1 AND 256),
+    goal_created_at_ms INTEGER CHECK(goal_created_at_ms IS NULL OR (goal_id IS NOT NULL AND goal_created_at_ms>=0)),
+    dag_base_goal_revision INTEGER CHECK(dag_base_goal_revision IS NULL OR (dag_revision IS NOT NULL AND dag_base_goal_revision>=1)),
+    UNIQUE(workspace_id, sequence),
+    UNIQUE(workspace_id, provider_conversation_id, provider_turn_id),
+    CHECK((channel_kind=0 AND channel_participation_id IS NULL) OR (channel_kind=1 AND channel_participation_id IS NOT NULL)),
+    CHECK((author_kind=0 AND author_participation_id IS NULL AND author_profile_id IS NULL AND author_participant_id IS NULL AND author_session_id IS NULL) OR (author_kind=1 AND author_participation_id IS NOT NULL AND author_profile_id IS NOT NULL AND author_participant_id IS NOT NULL AND author_session_id IS NOT NULL) OR (author_kind IN(2,3) AND author_participation_id IS NULL AND author_profile_id IS NULL AND author_participant_id IS NULL AND author_session_id IS NULL) OR (author_kind=4 AND author_participation_id IS NULL AND author_profile_id IS NULL AND author_participant_id IS NOT NULL AND author_session_id IS NOT NULL)),
     CHECK((origin_kind=0 AND provider_conversation_id IS NULL AND provider_turn_id IS NULL AND provider_source_kind IS NULL AND provider_source_profile_id IS NULL AND provider_source_participation_id IS NULL AND provider_source_label IS NULL) OR (origin_kind=1 AND provider_conversation_id IS NOT NULL AND provider_turn_id IS NOT NULL AND provider_source_kind IS NOT NULL)),
     CHECK((provider_source_kind=0 AND provider_source_profile_id IS NOT NULL AND provider_source_participation_id IS NOT NULL) OR (provider_source_kind=1 AND provider_source_profile_id IS NULL AND provider_source_participation_id IS NULL) OR provider_source_kind IS NULL),
     CHECK((goal_id IS NOT NULL) OR (dag_revision IS NULL AND node_id IS NULL)),
@@ -221,6 +271,53 @@ CREATE TABLE ops_provider_message_outbox (
 ";
 
 const OUTBOX_TARGET_INDEX: &str = "CREATE INDEX ops_provider_message_outbox_queue_idx ON ops_provider_message_outbox(state,last_dispatch_at_ms,queued_at_ms,message_id)";
+
+const PROVIDER_MESSAGE_PROJECT_ROUTES_SQL: &str = r"
+CREATE TABLE ops_provider_message_project_routes (
+    message_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_provider_message_outbox(message_id) CHECK(length(message_id)=16 AND message_id != zeroblob(16)),
+    project_id TEXT NOT NULL CHECK(length(CAST(project_id AS BLOB))=36 AND substr(project_id,1,4)='g-p-' AND substr(project_id,5,32) NOT GLOB '*[^0-9a-f]*'),
+    binding_revision INTEGER NOT NULL CHECK(binding_revision>=1)
+);
+";
+
+const PROVIDER_MESSAGE_PROJECT_RECEIPTS_SQL: &str = r"
+CREATE TABLE ops_provider_message_project_receipts (
+    message_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_provider_message_project_routes(message_id) CHECK(length(message_id)=16 AND message_id != zeroblob(16)),
+    provider_project_id TEXT NOT NULL CHECK(length(CAST(provider_project_id AS BLOB))=36 AND substr(provider_project_id,1,4)='g-p-' AND substr(provider_project_id,5,32) NOT GLOB '*[^0-9a-f]*')
+);
+";
+
+const PROJECT_ROUTE_NO_UPDATE_TRIGGER: &str = r"
+CREATE TRIGGER ops_provider_message_project_routes_no_update
+BEFORE UPDATE ON ops_provider_message_project_routes
+BEGIN
+    SELECT RAISE(ABORT, 'provider message Project routes are immutable');
+END;
+";
+
+const PROJECT_ROUTE_NO_DELETE_TRIGGER: &str = r"
+CREATE TRIGGER ops_provider_message_project_routes_no_delete
+BEFORE DELETE ON ops_provider_message_project_routes
+BEGIN
+    SELECT RAISE(ABORT, 'provider message Project routes are immutable');
+END;
+";
+
+const PROJECT_RECEIPT_NO_UPDATE_TRIGGER: &str = r"
+CREATE TRIGGER ops_provider_message_project_receipts_no_update
+BEFORE UPDATE ON ops_provider_message_project_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'provider message Project receipts are immutable');
+END;
+";
+
+const PROJECT_RECEIPT_NO_DELETE_TRIGGER: &str = r"
+CREATE TRIGGER ops_provider_message_project_receipts_no_delete
+BEFORE DELETE ON ops_provider_message_project_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'provider message Project receipts are immutable');
+END;
+";
 
 /// The public conversation channel.  Team/review channels are intentionally
 /// outside this bounded packet and can reuse the private channel primitives.
@@ -510,6 +607,7 @@ pub struct ProviderMessageTarget {
     provider_family: AgentProfileProviderFamily,
     runtime_session_id: AgentProfileRuntimeSessionId,
     provider_conversation_id: String,
+    project: Option<WorkspaceProjectReference>,
 }
 
 impl ProviderMessageTarget {
@@ -547,6 +645,31 @@ impl ProviderMessageTarget {
         runtime_session_id: AgentProfileRuntimeSessionId,
         provider_conversation_id: String,
     ) -> Result<Self, OperationsError> {
+        Self::new_with_project_route(
+            workspace_id,
+            profile_id,
+            participation_id,
+            provider_family,
+            runtime_session_id,
+            provider_conversation_id,
+            None,
+        )
+    }
+
+    /// Construct a target with its immutable Project route when the originating
+    /// provision operation was bound to a Workspace Project.
+    ///
+    /// # Errors
+    /// Rejects a nil Workspace or an empty/oversized provider conversation ID.
+    pub fn new_with_project_route(
+        workspace_id: WorkspaceId,
+        profile_id: AgentProfileId,
+        participation_id: WorkspaceParticipationId,
+        provider_family: AgentProfileProviderFamily,
+        runtime_session_id: AgentProfileRuntimeSessionId,
+        provider_conversation_id: String,
+        project: Option<WorkspaceProjectReference>,
+    ) -> Result<Self, OperationsError> {
         validate_workspace_id(workspace_id)?;
         validate_provider_id(&provider_conversation_id, "provider conversation identity")?;
         Ok(Self {
@@ -556,6 +679,7 @@ impl ProviderMessageTarget {
             provider_family,
             runtime_session_id,
             provider_conversation_id,
+            project,
         })
     }
 
@@ -588,6 +712,11 @@ impl ProviderMessageTarget {
     pub fn provider_conversation_id(&self) -> &str {
         &self.provider_conversation_id
     }
+
+    #[must_use]
+    pub const fn project(&self) -> Option<WorkspaceProjectReference> {
+        self.project
+    }
 }
 
 /// Identity and public snapshot of a message author.
@@ -598,6 +727,10 @@ pub enum MessageAuthor {
     Participant {
         participation_id: WorkspaceParticipationId,
         profile_id: Uuid,
+        participant_id: Uuid,
+        session_id: AgentSessionId,
+    },
+    NativeParticipant {
         participant_id: Uuid,
         session_id: AgentSessionId,
     },
@@ -755,6 +888,7 @@ pub struct ProviderMessageDeliveryReceipt {
     target: ProviderMessageTarget,
     provider_turn_id: String,
     body: String,
+    provider_project_id: Option<ChatGptProjectId>,
 }
 
 impl ProviderMessageDeliveryReceipt {
@@ -768,12 +902,33 @@ impl ProviderMessageDeliveryReceipt {
         provider_turn_id: String,
         body: String,
     ) -> Result<Self, OperationsError> {
+        Self::new_with_project(target, None, provider_turn_id, body)
+    }
+
+    /// Construct one receipt with the actual visible provider Project identity.
+    /// Bound routes require an exact match; legacy targets require omission.
+    ///
+    /// # Errors
+    /// Rejects missing/mismatched Project evidence, empty/oversized provider
+    /// turn IDs, and bodies outside the public message bound.
+    pub fn new_with_project(
+        target: ProviderMessageTarget,
+        provider_project_id: Option<ChatGptProjectId>,
+        provider_turn_id: String,
+        body: String,
+    ) -> Result<Self, OperationsError> {
+        match (target.project, provider_project_id) {
+            (None, None) => {}
+            (Some(expected), Some(actual)) if expected.project_id() == actual => {}
+            _ => return Err(OperationsError::Conflict("provider Project confirmation")),
+        }
         validate_provider_id(&provider_turn_id, "provider turn identity")?;
         validate_body(&body)?;
         Ok(Self {
             target,
             provider_turn_id,
             body,
+            provider_project_id,
         })
     }
 
@@ -790,6 +945,11 @@ impl ProviderMessageDeliveryReceipt {
     #[must_use]
     pub fn body(&self) -> &str {
         &self.body
+    }
+
+    #[must_use]
+    pub const fn provider_project_id(&self) -> Option<ChatGptProjectId> {
+        self.provider_project_id
     }
 }
 
@@ -1019,6 +1179,13 @@ impl OperationsCatalog {
                 (
                     OperationalActor::Participant { session_id, .. },
                     MessageAuthor::Participant {
+                        session_id: original,
+                        ..
+                    },
+                )
+                | (
+                    OperationalActor::Participant { session_id, .. },
+                    MessageAuthor::NativeParticipant {
                         session_id: original,
                         ..
                     },
@@ -1510,6 +1677,11 @@ impl OperationsCatalog {
             "provider receipt message missing",
         ))?;
         ensure_target(&existing.target, receipt.target())?;
+        match (existing.target.project, receipt.provider_project_id) {
+            (None, None) => {}
+            (Some(expected), Some(actual)) if expected.project_id() == actual => {}
+            _ => return Err(OperationsError::Conflict("provider Project receipt")),
+        }
         require_verified_workspace(&transaction, existing.target.workspace_id, self.destination)?;
         validate_recipient(&transaction, &existing.target)?;
         let message = load_message(&transaction, message_id)?
@@ -1547,6 +1719,12 @@ impl OperationsCatalog {
         if changed != 1 {
             return Err(OperationsError::Conflict("provider receipt CAS"));
         }
+        if let Some(provider_project_id) = receipt.provider_project_id {
+            transaction.execute(
+                "INSERT INTO ops_provider_message_project_receipts(message_id,provider_project_id) VALUES(?1,?2)",
+                params![message_id.as_bytes(), provider_project_id.to_string()],
+            )?;
+        }
         let outbox = load_outbox(&transaction, message_id)?
             .ok_or(OperationsError::Corrupt("provider receipt readback"))?;
         transaction.commit().map_err(|source| {
@@ -1579,6 +1757,77 @@ impl OperationsCatalog {
             ],
             ProviderMessageState::Failed,
         )
+    }
+
+    /// Cancel an undispatched Queued provider message, permanently excluding it
+    /// from outbox dispatch and marking it Failed.
+    ///
+    /// # Errors
+    /// Rejects a nil message identity, mismatched target, non-queued / already dispatched state,
+    /// stale revision/time, or CAS conflicts.
+    pub fn cancel_queued_provider_message(
+        &mut self,
+        message_id: MessageId,
+        expected_revision: u64,
+        target: &ProviderMessageTarget,
+        observed_at: TimestampMillis,
+    ) -> Result<ProviderMessageOutbox, OperationsError> {
+        validate_message_id(message_id)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = load_outbox(&transaction, message_id)?
+            .ok_or(OperationsError::Conflict("provider cancel message missing"))?;
+        ensure_target(&existing.target, target)?;
+        require_verified_workspace(&transaction, existing.target.workspace_id, self.destination)?;
+        validate_recipient(&transaction, &existing.target)?;
+        if existing.state == ProviderMessageState::Failed {
+            if existing.last_dispatch_at.get() != 0 {
+                return Err(OperationsError::Conflict(
+                    "provider cancel already dispatched",
+                ));
+            }
+            if expected_revision != existing.revision
+                && expected_revision.checked_add(1) != Some(existing.revision)
+            {
+                return Err(OperationsError::Conflict("provider message revision fence"));
+            }
+            if observed_at < existing.updated_at {
+                return Err(OperationsError::Conflict(
+                    "provider message timestamp fence",
+                ));
+            }
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        if existing.state != ProviderMessageState::Queued {
+            return Err(OperationsError::Conflict("provider cancel state"));
+        }
+        if existing.last_dispatch_at.get() != 0 {
+            return Err(OperationsError::Conflict(
+                "provider cancel already dispatched",
+            ));
+        }
+        validate_revision_and_time(&existing, expected_revision, observed_at)?;
+        let revision = next_revision(existing.revision)?;
+        let changed = transaction.execute(
+            "UPDATE ops_provider_message_outbox SET state=4,updated_at_ms=?1,revision=?2 WHERE message_id=?3 AND revision=?4 AND state=1",
+            params![
+                observed_at.get(),
+                signed_revision(revision)?,
+                message_id.as_bytes(),
+                signed_revision(expected_revision)?,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(OperationsError::Conflict("provider cancel CAS"));
+        }
+        let outbox = load_outbox(&transaction, message_id)?
+            .ok_or(OperationsError::Corrupt("provider cancel readback"))?;
+        transaction.commit().map_err(|source| {
+            operation_commit_unconfirmed(target.workspace_id, message_id, source)
+        })?;
+        Ok(outbox)
     }
 
     /// Deduplicate one provider public turn by exact conversation + turn
@@ -1855,7 +2104,11 @@ fn enqueue_provider_message_in_transaction(
         MessageReadScope::Node(message.context).validate()?;
         let sender_shape = matches!(
             (&message.author, witness.sender_leadership_revision()),
-            (MessageAuthor::Operator, None) | (MessageAuthor::Participant { .. }, Some(_))
+            (MessageAuthor::Operator, None)
+                | (
+                    MessageAuthor::Participant { .. } | MessageAuthor::NativeParticipant { .. },
+                    Some(_)
+                )
         );
         if !sender_shape {
             return Err(OperationsError::Conflict("node message sender witness"));
@@ -1878,6 +2131,16 @@ fn enqueue_provider_message_in_transaction(
             encoded_node_route,
         ],
     )?;
+    if let Some(project) = target.project {
+        transaction.execute(
+            "INSERT INTO ops_provider_message_project_routes(message_id,project_id,binding_revision) VALUES(?1,?2,?3)",
+            params![
+                message_id.as_bytes(),
+                project.project_id().to_string(),
+                project.binding_revision().as_i64(),
+            ],
+        )?;
+    }
     let outbox = load_outbox(transaction, message_id)?
         .ok_or(OperationsError::Corrupt("provider message queue insert"))?;
     Ok(ProviderMessageQueueOutcome {
@@ -1902,6 +2165,48 @@ pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)
     objects
 }
 
+pub(crate) fn create_project_route_schema(connection: &Connection) -> Result<(), OperationsError> {
+    for (_, _, sql) in project_route_schema_objects() {
+        connection.execute_batch(sql)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn project_route_schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
+    vec![
+        (
+            "table",
+            "ops_provider_message_project_routes",
+            PROVIDER_MESSAGE_PROJECT_ROUTES_SQL,
+        ),
+        (
+            "table",
+            "ops_provider_message_project_receipts",
+            PROVIDER_MESSAGE_PROJECT_RECEIPTS_SQL,
+        ),
+        (
+            "trigger",
+            "ops_provider_message_project_routes_no_update",
+            PROJECT_ROUTE_NO_UPDATE_TRIGGER,
+        ),
+        (
+            "trigger",
+            "ops_provider_message_project_routes_no_delete",
+            PROJECT_ROUTE_NO_DELETE_TRIGGER,
+        ),
+        (
+            "trigger",
+            "ops_provider_message_project_receipts_no_update",
+            PROJECT_RECEIPT_NO_UPDATE_TRIGGER,
+        ),
+        (
+            "trigger",
+            "ops_provider_message_project_receipts_no_delete",
+            PROJECT_RECEIPT_NO_DELETE_TRIGGER,
+        ),
+    ]
+}
+
 /// Exact message, outbox and governance schema at catalog versions 32 through 35.
 pub(crate) fn schema_objects_v35() -> Vec<(&'static str, &'static str, &'static str)> {
     schema_objects()
@@ -1920,6 +2225,24 @@ pub(crate) fn schema_objects_v35() -> Vec<(&'static str, &'static str, &'static 
         .collect()
 }
 
+/// Exact message/outbox schema at catalog version 46.
+pub(crate) fn schema_objects_v46() -> Vec<(&'static str, &'static str, &'static str)> {
+    schema_objects()
+        .into_iter()
+        .map(|(kind, name, sql)| {
+            (
+                kind,
+                name,
+                if name == "ops_workspace_messages" {
+                    WORKSPACE_MESSAGES_SQL_V46
+                } else {
+                    sql
+                },
+            )
+        })
+        .collect()
+}
+
 /// Preserve legacy messages and add exact Goal-generation/DAG-base provenance.
 pub(crate) fn migrate_v35_to_v36(transaction: &Transaction<'_>) -> Result<(), OperationsError> {
     transaction.execute_batch(
@@ -1927,6 +2250,47 @@ pub(crate) fn migrate_v35_to_v36(transaction: &Transaction<'_>) -> Result<(), Op
          ALTER TABLE ops_workspace_messages ADD COLUMN goal_created_at_ms INTEGER CHECK(goal_created_at_ms IS NULL OR (goal_id IS NOT NULL AND goal_created_at_ms>=0));\
          ALTER TABLE ops_workspace_messages ADD COLUMN dag_base_goal_revision INTEGER CHECK(dag_base_goal_revision IS NULL OR (dag_revision IS NOT NULL AND dag_base_goal_revision>=1))",
     )?;
+    Ok(())
+}
+
+/// Add the native message author shape while preserving every v46 message,
+/// outbox reference, explicit index, and trigger.
+///
+/// The catalog migration owner disables foreign-key enforcement around the
+/// rebuild and runs `foreign_key_check` before committing.
+pub(crate) fn migrate_v46_to_v47(transaction: &Transaction<'_>) -> Result<(), OperationsError> {
+    let has_unsupported_author_kind: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM ops_workspace_messages WHERE author_kind NOT IN(0,1,2,3))",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_unsupported_author_kind {
+        return Err(OperationsError::Corrupt(
+            "unsupported v46 workspace message author kind",
+        ));
+    }
+    let preserved_objects = {
+        let mut statement = transaction.prepare(
+            "SELECT sql FROM sqlite_schema WHERE tbl_name='ops_workspace_messages' AND type IN('index','trigger') AND sql IS NOT NULL ORDER BY type,name",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    transaction.execute_batch(&WORKSPACE_MESSAGES_SQL.replace(
+        "CREATE TABLE ops_workspace_messages ",
+        "CREATE TABLE ops_workspace_messages_v47 ",
+    ))?;
+    transaction.execute(
+        "INSERT INTO ops_workspace_messages_v47(message_id,workspace_id,channel_kind,channel_participation_id,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms,activity_id,goal_id,dag_revision,node_id,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_profile_id,provider_source_participation_id,provider_source_label,goal_created_at_ms,dag_base_goal_revision) SELECT message_id,workspace_id,channel_kind,channel_participation_id,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms,activity_id,goal_id,dag_revision,node_id,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_profile_id,provider_source_participation_id,provider_source_label,goal_created_at_ms,dag_base_goal_revision FROM ops_workspace_messages",
+        [],
+    )?;
+    transaction.execute_batch(
+        "DROP TABLE ops_workspace_messages; ALTER TABLE ops_workspace_messages_v47 RENAME TO ops_workspace_messages;",
+    )?;
+    for object in preserved_objects {
+        transaction.execute_batch(&object)?;
+    }
     Ok(())
 }
 
@@ -2415,8 +2779,8 @@ fn ensure_replay_provider(
 }
 
 fn author_matches_resolved(author: &MessageAuthor, resolved: &ResolvedOperationalActor) -> bool {
-    match (author, resolved.participation_id) {
-        (MessageAuthor::Operator, None) => true,
+    match (author, resolved) {
+        (MessageAuthor::Operator, ResolvedOperationalActor::Operator { .. }) => true,
         (
             MessageAuthor::Participant {
                 participation_id,
@@ -2424,13 +2788,30 @@ fn author_matches_resolved(author: &MessageAuthor, resolved: &ResolvedOperationa
                 participant_id,
                 session_id,
             },
-            Some(_resolved_participation),
+            ResolvedOperationalActor::ProfileParticipant {
+                participation_id: resolved_participation,
+                profile_id: resolved_profile,
+                participant_id: resolved_participant,
+                session_id: resolved_session,
+                ..
+            },
         ) => {
-            Some(*participation_id) == resolved.participation_id
-                && Some(*profile_id) == resolved.profile_id
-                && Some(*participant_id) == resolved.participant_id
-                && Some(*session_id) == resolved.session_id
+            participation_id == resolved_participation
+                && profile_id == resolved_profile
+                && participant_id == resolved_participant
+                && session_id == resolved_session
         }
+        (
+            MessageAuthor::NativeParticipant {
+                participant_id,
+                session_id,
+            },
+            ResolvedOperationalActor::NativeParticipant {
+                participant_id: resolved_participant,
+                session_id: resolved_session,
+                ..
+            },
+        ) => participant_id == resolved_participant && session_id == resolved_session,
         _ => false,
     }
 }
@@ -2447,22 +2828,33 @@ fn insert_internal_message(
     submitted_at: TimestampMillis,
     context: MessageContext,
 ) -> Result<(), OperationsError> {
-    let (author_kind, participation_id, profile_id, participant_id, session_id) =
-        if let Some(participation_id) = actor.participation_id {
-            (
-                1,
-                Some(participation_id.into_uuid().into_bytes().to_vec()),
-                actor.profile_id.map(|value| value.into_bytes().to_vec()),
-                actor
-                    .participant_id
-                    .map(|value| value.into_bytes().to_vec()),
-                actor
-                    .session_id
-                    .map(|value| value.into_uuid().into_bytes().to_vec()),
-            )
-        } else {
-            (0, None, None, None, None)
-        };
+    let (author_kind, participation_id, profile_id, participant_id, session_id) = match actor {
+        ResolvedOperationalActor::Operator { .. } => (0, None, None, None, None),
+        ResolvedOperationalActor::ProfileParticipant {
+            participation_id,
+            profile_id,
+            participant_id,
+            session_id,
+            ..
+        } => (
+            1,
+            Some(participation_id.into_uuid().into_bytes().to_vec()),
+            Some(profile_id.into_bytes().to_vec()),
+            Some(participant_id.into_bytes().to_vec()),
+            Some(session_id.into_uuid().into_bytes().to_vec()),
+        ),
+        ResolvedOperationalActor::NativeParticipant {
+            participant_id,
+            session_id,
+            ..
+        } => (
+            4,
+            None,
+            None,
+            Some(participant_id.into_bytes().to_vec()),
+            Some(session_id.into_uuid().into_bytes().to_vec()),
+        ),
+    };
     transaction.execute(
         "INSERT INTO ops_workspace_messages(message_id,workspace_id,channel_kind,channel_participation_id,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms,activity_id,goal_id,dag_revision,node_id,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_profile_id,provider_source_participation_id,provider_source_label,goal_created_at_ms,dag_base_goal_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,0,?11,?12,?13,?14,?15,?16,?17,NULL,NULL,NULL,NULL,NULL,NULL,?18,?19)",
         params![
@@ -2475,7 +2867,7 @@ fn insert_internal_message(
             profile_id,
             participant_id,
             session_id,
-            actor.display_name,
+            actor.display_name(),
             body,
             signed_counter(sequence)?,
             submitted_at.get(),
@@ -2775,6 +3167,19 @@ fn decode_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceMess
             session_id: author_session
                 .ok_or_else(|| to_sqlite_error(OperationsError::Corrupt("author session")))?,
         },
+        4 if author_participation.is_none()
+            && author_profile.is_none()
+            && author_participant.is_some()
+            && author_session.is_some() =>
+        {
+            MessageAuthor::NativeParticipant {
+                participant_id: author_participant.ok_or_else(|| {
+                    to_sqlite_error(OperationsError::Corrupt("author participant"))
+                })?,
+                session_id: author_session
+                    .ok_or_else(|| to_sqlite_error(OperationsError::Corrupt("author session")))?,
+            }
+        }
         2 if author_participation.is_none()
             && author_profile.is_none()
             && author_participant.is_none()
@@ -2842,79 +3247,76 @@ fn decode_source(
     }
 }
 
+struct RawProviderMessageOutbox {
+    message_id: Vec<u8>,
+    workspace_id: Vec<u8>,
+    profile_id: Vec<u8>,
+    participation_id: Vec<u8>,
+    provider_family: i64,
+    runtime_session_id: Vec<u8>,
+    provider_conversation_id: Vec<u8>,
+    state: i64,
+    queued_at_ms: i64,
+    last_dispatch_at_ms: i64,
+    updated_at_ms: i64,
+    revision: i64,
+    provider_turn_id: Option<Vec<u8>>,
+    provider_body: Option<Vec<u8>>,
+    node_route_witness: Option<Vec<u8>>,
+    project_id: Option<String>,
+    project_binding_revision: Option<i64>,
+    provider_project_id: Option<String>,
+}
+
 fn decode_outbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderMessageOutbox> {
-    let message_id = decode_uuid(row.get(0)?, "provider message id")?;
-    let workspace_id = WorkspaceId::from_uuid(decode_uuid(row.get(1)?, "provider Workspace")?);
-    let profile_id = AgentProfileId::from_uuid(decode_uuid(row.get(2)?, "recipient profile")?)
-        .map_err(|_| to_sqlite_error(OperationsError::Corrupt("recipient profile")))?;
-    let participation_id =
-        WorkspaceParticipationId::from_uuid(decode_uuid(row.get(3)?, "recipient participation")?)
-            .map_err(to_sqlite_error)?;
-    let provider_family = decode_provider_family(row.get(4)?)?;
-    let runtime_session_id =
-        AgentProfileRuntimeSessionId::from_uuid(decode_uuid(row.get(5)?, "runtime session")?)
-            .map_err(|_| to_sqlite_error(OperationsError::Corrupt("runtime session")))?;
-    let provider_conversation_id = decode_string(row.get(6)?, "provider conversation")?;
-    validate_provider_id(&provider_conversation_id, "provider conversation identity")
-        .map_err(to_sqlite_error)?;
-    let state = decode_state(row.get(7)?)?;
-    let queued_at = TimestampMillis::new(row.get(8)?)
-        .map_err(|_| to_sqlite_error(OperationsError::Corrupt("provider queued time")))?;
-    let last_dispatch_at = TimestampMillis::new(row.get(9)?)
-        .map_err(|_| to_sqlite_error(OperationsError::Corrupt("provider dispatch time")))?;
-    let updated_at = TimestampMillis::new(row.get(10)?)
-        .map_err(|_| to_sqlite_error(OperationsError::Corrupt("provider updated time")))?;
+    let raw = RawProviderMessageOutbox {
+        message_id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        profile_id: row.get(2)?,
+        participation_id: row.get(3)?,
+        provider_family: row.get(4)?,
+        runtime_session_id: row.get(5)?,
+        provider_conversation_id: row.get(6)?,
+        state: row.get(7)?,
+        queued_at_ms: row.get(8)?,
+        last_dispatch_at_ms: row.get(9)?,
+        updated_at_ms: row.get(10)?,
+        revision: row.get(11)?,
+        provider_turn_id: row.get(12)?,
+        provider_body: row.get(13)?,
+        node_route_witness: row.get(14)?,
+        project_id: row.get(15)?,
+        project_binding_revision: row.get(16)?,
+        provider_project_id: row.get(17)?,
+    };
+    decode_provider_message_outbox(&raw)
+}
+
+fn decode_provider_message_outbox(
+    raw: &RawProviderMessageOutbox,
+) -> rusqlite::Result<ProviderMessageOutbox> {
+    let message_id = decode_uuid(raw.message_id.clone(), "provider message id")?;
+    let target = decode_provider_message_target(raw)?;
+    let state = decode_state(raw.state)?;
+    let queued_at = decode_provider_message_time(raw.queued_at_ms, "provider queued time")?;
+    let last_dispatch_at =
+        decode_provider_message_time(raw.last_dispatch_at_ms, "provider dispatch time")?;
+    let updated_at = decode_provider_message_time(raw.updated_at_ms, "provider updated time")?;
     if updated_at < queued_at {
         return Err(to_sqlite_error(OperationsError::Corrupt(
             "provider timestamp order",
         )));
     }
-    let revision = decode_counter(row.get(11)?, "provider revision")?;
-    let provider_turn_id = row
-        .get::<_, Option<Vec<u8>>>(12)?
-        .map(|value| decode_string(value, "provider turn"))
-        .transpose()?;
-    let provider_body = row
-        .get::<_, Option<Vec<u8>>>(13)?
-        .map(|value| decode_string(value, "provider body"))
-        .transpose()?;
-    if let Some(body) = &provider_body {
-        validate_body(body).map_err(to_sqlite_error)?;
-    }
-    let receipt = match (provider_turn_id, provider_body) {
-        (None, None) => None,
-        (Some(provider_turn_id), Some(body)) => Some(ProviderMessageDeliveryReceipt {
-            target: ProviderMessageTarget {
-                workspace_id,
-                profile_id,
-                participation_id,
-                provider_family,
-                runtime_session_id,
-                provider_conversation_id: provider_conversation_id.clone(),
-            },
-            provider_turn_id,
-            body,
-        }),
-        _ => {
-            return Err(to_sqlite_error(OperationsError::Corrupt(
-                "provider receipt shape",
-            )));
-        }
-    };
-    let node_route_witness = row
-        .get::<_, Option<Vec<u8>>>(14)?
-        .map(|bytes| NodeMessageRouteWitness::decode(&bytes).map_err(to_sqlite_error))
+    let revision = decode_counter(raw.revision, "provider revision")?;
+    let receipt = decode_provider_message_receipt(raw, &target, state)?;
+    let node_route_witness = raw
+        .node_route_witness
+        .as_deref()
+        .map(|bytes| NodeMessageRouteWitness::decode(bytes).map_err(to_sqlite_error))
         .transpose()?;
     Ok(ProviderMessageOutbox {
         message_id,
-        target: ProviderMessageTarget {
-            workspace_id,
-            profile_id,
-            participation_id,
-            provider_family,
-            runtime_session_id,
-            provider_conversation_id,
-        },
+        target,
         state,
         queued_at,
         last_dispatch_at,
@@ -2925,13 +3327,142 @@ fn decode_outbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderMessag
     })
 }
 
+fn decode_provider_message_target(
+    raw: &RawProviderMessageOutbox,
+) -> rusqlite::Result<ProviderMessageTarget> {
+    let workspace_id =
+        WorkspaceId::from_uuid(decode_uuid(raw.workspace_id.clone(), "provider Workspace")?);
+    let profile_id =
+        AgentProfileId::from_uuid(decode_uuid(raw.profile_id.clone(), "recipient profile")?)
+            .map_err(|_| to_sqlite_error(OperationsError::Corrupt("recipient profile")))?;
+    let participation_id = WorkspaceParticipationId::from_uuid(decode_uuid(
+        raw.participation_id.clone(),
+        "recipient participation",
+    )?)
+    .map_err(to_sqlite_error)?;
+    let provider_family = decode_provider_family(raw.provider_family)?;
+    let runtime_session_id = AgentProfileRuntimeSessionId::from_uuid(decode_uuid(
+        raw.runtime_session_id.clone(),
+        "runtime session",
+    )?)
+    .map_err(|_| to_sqlite_error(OperationsError::Corrupt("runtime session")))?;
+    let provider_conversation_id = decode_string(
+        raw.provider_conversation_id.clone(),
+        "provider conversation",
+    )?;
+    validate_provider_id(&provider_conversation_id, "provider conversation identity")
+        .map_err(to_sqlite_error)?;
+    let project = decode_provider_message_project_route(
+        raw.project_id.clone(),
+        raw.project_binding_revision,
+    )?;
+    Ok(ProviderMessageTarget {
+        workspace_id,
+        profile_id,
+        participation_id,
+        provider_family,
+        runtime_session_id,
+        provider_conversation_id,
+        project,
+    })
+}
+
+fn decode_provider_message_project_route(
+    project_id: Option<String>,
+    binding_revision: Option<i64>,
+) -> rusqlite::Result<Option<WorkspaceProjectReference>> {
+    match (project_id, binding_revision) {
+        (None, None) => Ok(None),
+        (Some(project_id), Some(binding_revision)) => {
+            let project_id =
+                ChatGptProjectId::try_from(project_id.as_str()).map_err(to_sqlite_error)?;
+            let binding_revision = crate::WorkspaceProjectBindingRevision::new(binding_revision)
+                .map_err(to_sqlite_error)?;
+            Ok(Some(WorkspaceProjectReference::new(
+                project_id,
+                binding_revision,
+            )))
+        }
+        _ => Err(to_sqlite_error(OperationsError::Corrupt(
+            "provider message Project route shape",
+        ))),
+    }
+}
+
+fn decode_provider_message_receipt(
+    raw: &RawProviderMessageOutbox,
+    target: &ProviderMessageTarget,
+    state: ProviderMessageState,
+) -> rusqlite::Result<Option<ProviderMessageDeliveryReceipt>> {
+    let provider_project_id = raw
+        .provider_project_id
+        .as_deref()
+        .map(|value| ChatGptProjectId::try_from(value).map_err(to_sqlite_error))
+        .transpose()?;
+    validate_provider_project_receipt(state, target.project, provider_project_id)?;
+    let provider_turn_id = raw
+        .provider_turn_id
+        .clone()
+        .map(|value| decode_string(value, "provider turn"))
+        .transpose()?;
+    let provider_body = raw
+        .provider_body
+        .clone()
+        .map(|value| decode_string(value, "provider body"))
+        .transpose()?;
+    if let Some(body) = &provider_body {
+        validate_body(body).map_err(to_sqlite_error)?;
+    }
+    match (provider_turn_id, provider_body) {
+        (None, None) => Ok(None),
+        (Some(provider_turn_id), Some(body)) => Ok(Some(ProviderMessageDeliveryReceipt {
+            target: target.clone(),
+            provider_turn_id,
+            body,
+            provider_project_id,
+        })),
+        _ => Err(to_sqlite_error(OperationsError::Corrupt(
+            "provider receipt shape",
+        ))),
+    }
+}
+
+fn validate_provider_project_receipt(
+    state: ProviderMessageState,
+    project: Option<WorkspaceProjectReference>,
+    provider_project_id: Option<ChatGptProjectId>,
+) -> rusqlite::Result<()> {
+    match (state, project, provider_project_id) {
+        (ProviderMessageState::Delivered, Some(expected), Some(actual))
+            if expected.project_id() == actual =>
+        {
+            Ok(())
+        }
+        (ProviderMessageState::Delivered, None, None) => Ok(()),
+        (ProviderMessageState::Delivered, _, _) => Err(to_sqlite_error(OperationsError::Corrupt(
+            "provider delivered Project receipt shape",
+        ))),
+        (_, _, None) => Ok(()),
+        _ => Err(to_sqlite_error(OperationsError::Corrupt(
+            "provider non-delivered Project receipt shape",
+        ))),
+    }
+}
+
+fn decode_provider_message_time(
+    value: i64,
+    field: &'static str,
+) -> rusqlite::Result<TimestampMillis> {
+    TimestampMillis::new(value).map_err(|_| to_sqlite_error(OperationsError::Corrupt(field)))
+}
+
 fn load_outbox(
     connection: &Connection,
     message_id: MessageId,
 ) -> Result<Option<ProviderMessageOutbox>, OperationsError> {
     Ok(connection
         .query_row(
-            "SELECT substr(message_id,1,17),substr(workspace_id,1,17),substr(recipient_profile_id,1,17),substr(recipient_participation_id,1,17),provider_family,substr(runtime_session_id,1,17),substr(CAST(provider_conversation_id AS BLOB),1,513),state,queued_at_ms,last_dispatch_at_ms,updated_at_ms,revision,substr(CAST(provider_turn_id AS BLOB),1,513),substr(CAST(provider_body AS BLOB),1,16385),substr(node_route_witness,1,2049) FROM ops_provider_message_outbox WHERE message_id=?1",
+            "SELECT substr(outbox.message_id,1,17),substr(outbox.workspace_id,1,17),substr(outbox.recipient_profile_id,1,17),substr(outbox.recipient_participation_id,1,17),outbox.provider_family,substr(outbox.runtime_session_id,1,17),substr(CAST(outbox.provider_conversation_id AS BLOB),1,513),outbox.state,outbox.queued_at_ms,outbox.last_dispatch_at_ms,outbox.updated_at_ms,outbox.revision,substr(CAST(outbox.provider_turn_id AS BLOB),1,513),substr(CAST(outbox.provider_body AS BLOB),1,16385),substr(outbox.node_route_witness,1,2049),route.project_id,route.binding_revision,project_receipt.provider_project_id FROM ops_provider_message_outbox AS outbox LEFT JOIN ops_provider_message_project_routes AS route ON route.message_id=outbox.message_id LEFT JOIN ops_provider_message_project_receipts AS project_receipt ON project_receipt.message_id=outbox.message_id WHERE outbox.message_id=?1",
             params![message_id.as_bytes()],
             decode_outbox_row,
         )
@@ -2948,6 +3479,13 @@ fn eligible_outbox_message(
             "SELECT substr(candidate.message_id,1,17)
                FROM ops_provider_message_outbox AS candidate
               WHERE candidate.state IN(1,2,5)
+                AND NOT (
+                    candidate.state=5
+                    AND EXISTS(
+                        SELECT 1 FROM ops_provider_message_unknown_isolations AS isolation
+                         WHERE isolation.message_id=candidate.message_id
+                    )
+                )
                 AND (?1 IS NULL OR candidate.message_id=?1)
                 AND (
                     candidate.state!=1
@@ -3082,7 +3620,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
-    use forge_domain::{TimestampMillis, WorkspaceId};
+    use forge_domain::{AuthenticatedPrincipal, DirectTokenId, TimestampMillis, WorkspaceId};
     use heterarchy_orchestration_sessions::{
         AgentProfileCatalog, AgentProfileCreationOrigin, AgentProfileDeletionCommand,
         AgentProfileDeletionIntent, AgentProfileId, AgentProfileProviderFamily,
@@ -3158,6 +3696,22 @@ mod tests {
 
     fn time(value: i64) -> Result<TimestampMillis, OperationsError> {
         TimestampMillis::new(value).map_err(|_| OperationsError::Bounds("test timestamp"))
+    }
+
+    fn snapshot_rows(
+        connection: &rusqlite::Connection,
+        query: &str,
+    ) -> Result<Vec<Vec<rusqlite::types::Value>>, Box<dyn Error>> {
+        let mut statement = connection.prepare(query)?;
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|column| row.get(column))
+                    .collect::<Result<Vec<_>, _>>()
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn begin_profile_deletion_intent(
@@ -3247,6 +3801,7 @@ mod tests {
                     activity_id: activity,
                     target_agent_id: forge_domain::AgentInstanceId::from_uuid(agent),
                     target_session_id: forge_domain::AgentSessionId::from_uuid(session),
+                    expected_target_principal: forge_domain::AuthenticatedPrincipal::TrustedStdio,
                     requester: OperationalActor::LocalOperator,
                     team_id: None,
                     assignment_payload_fingerprint: [0xC1; 32],
@@ -3750,6 +4305,89 @@ mod tests {
             .catalog
             .connection
             .execute_batch("ROLLBACK TO corrupt_node_route; RELEASE corrupt_node_route")?;
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn project_route_and_actual_confirmation_survive_outbox_readback() -> Result<(), Box<dyn Error>>
+    {
+        let mut fixture = fixture()?;
+        let project_id = ChatGptProjectId::try_from("g-p-6ad231f7ad7c8191bfc1d5ff782c171f")?;
+        let binding_revision = crate::WorkspaceProjectBindingRevision::new(3)?;
+        let target = ProviderMessageTarget::new_with_project_route(
+            fixture.workspace,
+            fixture.profile_id,
+            fixture.participation_id,
+            AgentProfileProviderFamily::ChatGpt,
+            fixture.runtime_session_id,
+            "conversation-1".to_owned(),
+            Some(WorkspaceProjectReference::new(project_id, binding_revision)),
+        )?;
+        let message_id = Uuid::from_u128(0xC1A0);
+        let queued = append_and_enqueue(
+            &mut fixture.catalog,
+            fixture.workspace,
+            message_id,
+            "project-routed question",
+            MessageContext::default(),
+            target.clone(),
+            10,
+        )?;
+        assert_eq!(queued.outbox().target().project(), target.project());
+
+        let dispatch = fixture
+            .catalog
+            .next_provider_message_dispatch(time(11)?)?
+            .ok_or("project message Execute permit")?;
+        let wrong_project = ChatGptProjectId::try_from("g-p-7ad231f7ad7c8191bfc1d5ff782c171f")?;
+        let message = fixture
+            .catalog
+            .workspace_message(message_id)?
+            .ok_or("project source message")?;
+        let body = provider_message_text(&message)?;
+        assert!(
+            ProviderMessageDeliveryReceipt::new_with_project(
+                target.clone(),
+                Some(wrong_project),
+                "turn-1".to_owned(),
+                body.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            ProviderMessageDeliveryReceipt::new_with_project(
+                target.clone(),
+                None,
+                "turn-1".to_owned(),
+                body.clone(),
+            )
+            .is_err()
+        );
+        let receipt = ProviderMessageDeliveryReceipt::new_with_project(
+            target,
+            Some(project_id),
+            "turn-1".to_owned(),
+            body,
+        )?;
+        let delivered = fixture.catalog.confirm_provider_message_delivery(
+            message_id,
+            dispatch.outbox().revision(),
+            &receipt,
+            time(12)?,
+        )?;
+        assert_eq!(delivered.state(), ProviderMessageState::Delivered);
+        let readback = fixture
+            .catalog
+            .provider_message_outbox(message_id)?
+            .ok_or("project outbox readback")?;
+        assert_eq!(readback.target().project(), receipt.target().project());
+        assert_eq!(
+            readback
+                .receipt()
+                .map(super::ProviderMessageDeliveryReceipt::provider_project_id),
+            Some(Some(project_id))
+        );
         fixture.cleanup()?;
         Ok(())
     }
@@ -4449,6 +5087,335 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn unknown_isolation_receipt_is_fenced_immutable_and_replayable_after_delivery()
+    -> Result<(), Box<dyn Error>> {
+        let mut fixture = fixture()?;
+        let target = fixture.target()?;
+        let message_id = Uuid::from_u128(0xA901);
+        append_and_enqueue(
+            &mut fixture.catalog,
+            fixture.workspace,
+            message_id,
+            "preserve this uncertain message",
+            MessageContext::default(),
+            target.clone(),
+            10,
+        )?;
+        let execute = fixture
+            .catalog
+            .provider_message_dispatch(message_id, time(11)?)?
+            .ok_or("missing provider Execute")?;
+        let unknown = fixture.catalog.mark_provider_message_effect_unknown(
+            message_id,
+            execute.outbox().revision(),
+            &target,
+            time(12)?,
+        )?;
+        let original_outbox = fixture
+            .catalog
+            .provider_message_outbox(message_id)?
+            .ok_or("missing UNKNOWN outbox")?;
+        let original_message = fixture
+            .catalog
+            .workspace_message(message_id)?
+            .ok_or("missing Workspace message")?;
+        let principal =
+            AuthenticatedPrincipal::DirectToken(DirectTokenId::from_uuid(Uuid::from_u128(0xA902)));
+        let request_id = Uuid::from_u128(0xA903);
+        let command = ProviderMessageUnknownIsolationCommand::new(
+            request_id,
+            message_id,
+            unknown.revision(),
+            target.clone(),
+            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown,
+            principal,
+            time(13)?,
+        )?;
+
+        let wrong_target = ProviderMessageTarget::new(
+            fixture.workspace,
+            fixture.profile_id,
+            fixture.participation_id,
+            fixture.runtime_session_id,
+            "another-conversation".to_owned(),
+        )?;
+        let wrong_target_command = ProviderMessageUnknownIsolationCommand::new(
+            Uuid::from_u128(0xA904),
+            message_id,
+            unknown.revision(),
+            wrong_target,
+            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown,
+            principal,
+            time(13)?,
+        )?;
+        assert!(
+            fixture
+                .catalog
+                .isolate_unknown_provider_message(&wrong_target_command)
+                .is_err()
+        );
+
+        let receipt = fixture.catalog.isolate_unknown_provider_message(&command)?;
+        assert_eq!(receipt.request_id(), request_id);
+        assert_eq!(receipt.message_id(), message_id);
+        assert_eq!(receipt.expected_revision(), unknown.revision());
+        assert_eq!(receipt.expected_target(), &target);
+        assert_eq!(receipt.principal(), principal);
+        assert_eq!(receipt.acknowledged_at(), time(13)?);
+        assert_eq!(
+            fixture.catalog.isolate_unknown_provider_message(&command)?,
+            receipt
+        );
+        assert_eq!(
+            fixture
+                .catalog
+                .provider_message_unknown_isolation(message_id, Some(request_id))?,
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            fixture
+                .catalog
+                .provider_message_unknown_isolation(message_id, None)?,
+            Some(receipt.clone())
+        );
+        assert!(
+            fixture
+                .catalog
+                .provider_message_unknown_isolation(Uuid::from_u128(0xA905), Some(request_id))
+                .is_err()
+        );
+        assert_eq!(
+            fixture.catalog.provider_message_outbox(message_id)?,
+            Some(original_outbox)
+        );
+        assert_eq!(
+            fixture.catalog.workspace_message(message_id)?,
+            Some(original_message)
+        );
+
+        let changed_request = ProviderMessageUnknownIsolationCommand::new(
+            request_id,
+            message_id,
+            unknown.revision() + 1,
+            target.clone(),
+            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown,
+            principal,
+            time(13)?,
+        )?;
+        assert!(
+            fixture
+                .catalog
+                .isolate_unknown_provider_message(&changed_request)
+                .is_err()
+        );
+        let second_request = ProviderMessageUnknownIsolationCommand::new(
+            Uuid::from_u128(0xA906),
+            message_id,
+            unknown.revision(),
+            target.clone(),
+            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown,
+            principal,
+            time(13)?,
+        )?;
+        assert!(
+            fixture
+                .catalog
+                .isolate_unknown_provider_message(&second_request)
+                .is_err()
+        );
+
+        let delivery = ProviderMessageDeliveryReceipt::new(
+            target,
+            "provider-turn-after-isolation".to_owned(),
+            "preserve this uncertain message".to_owned(),
+        )?;
+        let delivered = fixture.catalog.confirm_provider_message_delivery(
+            message_id,
+            unknown.revision(),
+            &delivery,
+            time(14)?,
+        )?;
+        assert_eq!(delivered.state(), ProviderMessageState::Delivered);
+        assert_eq!(
+            fixture
+                .catalog
+                .provider_message_unknown_isolation(message_id, Some(request_id))?,
+            Some(receipt.clone())
+        );
+        assert_eq!(
+            fixture.catalog.isolate_unknown_provider_message(&command)?,
+            receipt
+        );
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn isolated_unknown_leaves_same_runtime_queue_blocked_and_other_runtime_moving()
+    -> Result<(), Box<dyn Error>> {
+        let mut fixture = fixture()?;
+        let (profile_b, participation_b, runtime_b) = insert_recipient(&fixture)?;
+        let target_a = fixture.target()?;
+        let target_b = ProviderMessageTarget::new(
+            fixture.workspace,
+            profile_b,
+            participation_b,
+            runtime_b,
+            "conversation-b".to_owned(),
+        )?;
+        let a1 = Uuid::from_u128(0xA911);
+        let a2 = Uuid::from_u128(0xA912);
+        let b1 = Uuid::from_u128(0xA913);
+        for (message_id, body, target, queued_at) in [
+            (a1, "a1", target_a.clone(), 20),
+            (a2, "a2", target_a.clone(), 21),
+            (b1, "b1", target_b, 20),
+        ] {
+            append_and_enqueue(
+                &mut fixture.catalog,
+                fixture.workspace,
+                message_id,
+                body,
+                MessageContext::default(),
+                target,
+                queued_at,
+            )?;
+        }
+
+        let execute_a1 = fixture
+            .catalog
+            .provider_message_dispatch(a1, time(22)?)?
+            .ok_or("missing runtime A Execute")?;
+        let unknown_a1 = fixture.catalog.mark_provider_message_effect_unknown(
+            a1,
+            execute_a1.outbox().revision(),
+            &target_a,
+            time(23)?,
+        )?;
+        let command = ProviderMessageUnknownIsolationCommand::new(
+            Uuid::from_u128(0xA914),
+            a1,
+            unknown_a1.revision(),
+            target_a,
+            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown,
+            AuthenticatedPrincipal::TrustedStdio,
+            time(24)?,
+        )?;
+        fixture.catalog.isolate_unknown_provider_message(&command)?;
+
+        let in_flight = fixture.catalog.provider_message_in_flight_page(None, 32)?;
+        assert!(
+            !in_flight
+                .outboxes
+                .iter()
+                .any(|outbox| outbox.message_id() == a1)
+        );
+        assert!(
+            fixture
+                .catalog
+                .provider_message_dispatch(a2, time(25)?)?
+                .is_none()
+        );
+        let other_runtime = fixture
+            .catalog
+            .next_provider_message_dispatch(time(26)?)?
+            .ok_or("different runtime did not progress")?;
+        assert_eq!(other_runtime.outbox().message_id(), b1);
+        assert_eq!(
+            other_runtime.dispatch().action(),
+            ProviderMessageDispatchAction::Execute
+        );
+
+        let late_inspection = fixture
+            .catalog
+            .provider_message_dispatch(a1, time(27)?)?
+            .ok_or("isolated UNKNOWN lost exact inspection")?;
+        assert_eq!(
+            late_inspection.dispatch().action(),
+            ProviderMessageDispatchAction::Inspect
+        );
+        assert_eq!(late_inspection.dispatch().revision(), unknown_a1.revision());
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn v50_upgrade_adds_isolation_schema_without_rewriting_message_rows()
+    -> Result<(), Box<dyn Error>> {
+        let mut fixture = fixture()?;
+        let target = fixture.target()?;
+        let message_id = Uuid::from_u128(0xA921);
+        append_and_enqueue(
+            &mut fixture.catalog,
+            fixture.workspace,
+            message_id,
+            "legacy uncertain body",
+            MessageContext::default(),
+            target.clone(),
+            10,
+        )?;
+        let execute = fixture
+            .catalog
+            .provider_message_dispatch(message_id, time(11)?)?
+            .ok_or("missing migration fixture Execute")?;
+        fixture.catalog.mark_provider_message_effect_unknown(
+            message_id,
+            execute.outbox().revision(),
+            &target,
+            time(12)?,
+        )?;
+        let workspace_rows_before = snapshot_rows(
+            &fixture.catalog.connection,
+            "SELECT * FROM ops_workspace_messages ORDER BY message_id",
+        )?;
+        let outbox_rows_before = snapshot_rows(
+            &fixture.catalog.connection,
+            "SELECT * FROM ops_provider_message_outbox ORDER BY message_id",
+        )?;
+
+        crate::import_handoff::drop_schema_for_legacy_fixture(&fixture.catalog.connection)?;
+        fixture.catalog.connection.execute_batch(
+            "DROP TRIGGER ops_provider_message_unknown_isolations_no_update;
+             DROP TRIGGER ops_provider_message_unknown_isolations_no_delete;
+             DROP TABLE ops_provider_message_unknown_isolations;
+             PRAGMA user_version=50;",
+        )?;
+        let path = fixture.path.clone();
+        let destination = fixture.destination;
+        drop(fixture.catalog);
+
+        let upgraded = OperationsCatalog::open(&path, destination)?;
+        let version: i64 = upgraded
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, crate::catalog::VERSION);
+        assert_eq!(
+            snapshot_rows(
+                &upgraded.connection,
+                "SELECT * FROM ops_workspace_messages ORDER BY message_id",
+            )?,
+            workspace_rows_before
+        );
+        assert_eq!(
+            snapshot_rows(
+                &upgraded.connection,
+                "SELECT * FROM ops_provider_message_outbox ORDER BY message_id",
+            )?,
+            outbox_rows_before
+        );
+        let after = upgraded
+            .provider_message_outbox(message_id)?
+            .ok_or("migration removed UNKNOWN outbox")?;
+        assert_eq!(after.state(), ProviderMessageState::Unknown);
+        assert_eq!(after.revision(), 3);
+        drop(upgraded);
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
     fn profile_barrier_blocks_new_messages_but_keeps_replay_inspect_and_other_profiles_moving()
     -> Result<(), Box<dyn Error>> {
         let mut fixture = fixture()?;
@@ -4963,6 +5930,509 @@ mod tests {
                 queued_at: time(15)?,
             })?;
         assert!(repeated.created());
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_queued_provider_message_lifecycle_and_exclusion() -> Result<(), Box<dyn Error>> {
+        let mut fixture = fixture()?;
+        let message_id = Uuid::now_v7();
+        let target = fixture.target()?;
+
+        append(
+            &mut fixture.catalog,
+            fixture.workspace,
+            message_id,
+            "test cancel message",
+            10,
+        )?;
+        let queued = fixture
+            .catalog
+            .enqueue_provider_message(EnqueueProviderMessageCommand {
+                node_route_witness: None,
+                message_id,
+                target: target.clone(),
+                queued_at: time(10)?,
+            })?;
+        assert!(queued.created());
+
+        // Verify initially queued
+        let initial_outbox = fixture
+            .catalog
+            .provider_message_outbox(message_id)?
+            .ok_or_else(|| std::io::Error::other("outbox row missing after enqueue"))?;
+        assert_eq!(initial_outbox.state(), ProviderMessageState::Queued);
+        assert_eq!(initial_outbox.revision(), 1);
+        assert_eq!(initial_outbox.last_dispatch_at().get(), 0);
+
+        // Cancel the queued message
+        let canceled =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(message_id, 1, &target, time(20)?)?;
+        assert_eq!(canceled.state(), ProviderMessageState::Failed);
+        assert_eq!(canceled.revision(), 2);
+        assert_eq!(canceled.updated_at().get(), 20);
+        assert_eq!(canceled.last_dispatch_at().get(), 0);
+
+        // Verification: excluded from eligible_outbox_message and dispatch
+        let next_dispatch = fixture.catalog.next_provider_message_dispatch(time(25)?)?;
+        assert!(next_dispatch.is_none());
+
+        let direct_dispatch = fixture
+            .catalog
+            .provider_message_dispatch(message_id, time(25)?)?;
+        assert!(direct_dispatch.is_none());
+
+        // Idempotency: calling cancel again with original expected_revision (1) or new revision (2)
+        let retry_orig =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(message_id, 1, &target, time(25)?)?;
+        assert_eq!(retry_orig.state(), ProviderMessageState::Failed);
+        assert_eq!(retry_orig.revision(), 2);
+
+        let retry_updated =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(message_id, 2, &target, time(30)?)?;
+        assert_eq!(retry_updated.state(), ProviderMessageState::Failed);
+        assert_eq!(retry_updated.revision(), 2);
+
+        // Idempotency rejects mismatched revision fence
+        let retry_wrong_rev =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(message_id, 99, &target, time(35)?);
+        assert!(matches!(
+            retry_wrong_rev,
+            Err(OperationsError::Conflict("provider message revision fence"))
+        ));
+
+        // Idempotency rejects stale timestamp fence
+        let retry_stale_time =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(message_id, 1, &target, time(10)?);
+        assert!(matches!(
+            retry_stale_time,
+            Err(OperationsError::Conflict(
+                "provider message timestamp fence"
+            ))
+        ));
+
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_vs_dispatch_race_and_effect_ordering() -> Result<(), Box<dyn Error>> {
+        let mut fixture = fixture()?;
+        let target = fixture.target()?;
+
+        // =========================================================================
+        // Case A: Cancel precedes Dispatch -> Dispatch Impossible (No Execute Effect)
+        // =========================================================================
+        let msg_a = Uuid::now_v7();
+        append(&mut fixture.catalog, fixture.workspace, msg_a, "msg A", 10)?;
+        fixture
+            .catalog
+            .enqueue_provider_message(EnqueueProviderMessageCommand {
+                node_route_witness: None,
+                message_id: msg_a,
+                target: target.clone(),
+                queued_at: time(10)?,
+            })?;
+
+        // Cancel executes first
+        let canceled_a =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(msg_a, 1, &target, time(15)?)?;
+        assert_eq!(canceled_a.state(), ProviderMessageState::Failed);
+        assert_eq!(canceled_a.revision(), 2);
+        assert_eq!(canceled_a.last_dispatch_at().get(), 0);
+
+        // Dispatch attempted afterwards -> MUST return None (NO provider execute effect)
+        let dispatch_a = fixture
+            .catalog
+            .provider_message_dispatch(msg_a, time(20)?)?;
+        assert!(
+            dispatch_a.is_none(),
+            "canceled message must not release dispatch action"
+        );
+
+        let next_a = fixture.catalog.next_provider_message_dispatch(time(20)?)?;
+        assert!(
+            next_a.is_none(),
+            "canceled message must be excluded from queue selection"
+        );
+
+        // =========================================================================
+        // Case B: Dispatch precedes Cancel -> Cancel Rejected (Execute In Flight)
+        // =========================================================================
+        let msg_b = Uuid::now_v7();
+        append(&mut fixture.catalog, fixture.workspace, msg_b, "msg B", 25)?;
+        fixture
+            .catalog
+            .enqueue_provider_message(EnqueueProviderMessageCommand {
+                node_route_witness: None,
+                message_id: msg_b,
+                target: target.clone(),
+                queued_at: time(25)?,
+            })?;
+
+        // Dispatch executes first -> releases Execute action to provider worker
+        let dispatch_b = fixture
+            .catalog
+            .provider_message_dispatch(msg_b, time(30)?)?
+            .ok_or_else(|| std::io::Error::other("queued message did not dispatch"))?;
+        assert_eq!(
+            dispatch_b.dispatch().action(),
+            ProviderMessageDispatchAction::Execute
+        );
+        assert_eq!(
+            dispatch_b.outbox().state(),
+            ProviderMessageState::EffectPending
+        );
+        assert_eq!(dispatch_b.outbox().revision(), 2);
+        assert_eq!(dispatch_b.outbox().last_dispatch_at().get(), 30);
+
+        // Cancel attempted afterwards -> MUST be rejected (cannot cancel in-flight message)
+        let cancel_b = fixture
+            .catalog
+            .cancel_queued_provider_message(msg_b, 2, &target, time(35)?);
+        assert!(
+            matches!(
+                cancel_b,
+                Err(OperationsError::Conflict("provider cancel state"))
+            ),
+            "cancel must reject in-flight EffectPending message"
+        );
+
+        // =========================================================================
+        // Case C: Provider Failure (Post-Dispatch) vs Queued Cancel (Requirement 4)
+        // Message failed due to external provider error -> calling cancel must NOT
+        // falsely treat this different failure cause as a successful cancel replay!
+        // =========================================================================
+        let failed_b =
+            fixture
+                .catalog
+                .fail_provider_message_delivery(msg_b, 2, &target, time(40)?)?;
+        assert_eq!(failed_b.state(), ProviderMessageState::Failed);
+        assert_eq!(failed_b.revision(), 3);
+        assert_eq!(failed_b.last_dispatch_at().get(), 30); // was dispatched!
+
+        // Calling cancel_queued_provider_message on a dispatched failure must reject
+        let cancel_post_dispatch =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(msg_b, 3, &target, time(45)?);
+        assert!(
+            matches!(
+                cancel_post_dispatch,
+                Err(OperationsError::Conflict(
+                    "provider cancel already dispatched"
+                ))
+            ),
+            "cancel must reject messages that failed post-dispatch"
+        );
+
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_on_one_connection_prevents_dispatch_on_another() -> Result<(), Box<dyn Error>> {
+        let mut fixture = fixture()?;
+        let target = fixture.target()?;
+        let mut catalog2 = OperationsCatalog::open(&fixture.path, fixture.destination)?;
+
+        let msg_1 = Uuid::now_v7();
+        append(
+            &mut fixture.catalog,
+            fixture.workspace,
+            msg_1,
+            "concurrent msg 1",
+            10,
+        )?;
+        fixture
+            .catalog
+            .enqueue_provider_message(EnqueueProviderMessageCommand {
+                node_route_witness: None,
+                message_id: msg_1,
+                target: target.clone(),
+                queued_at: time(10)?,
+            })?;
+
+        let canceled_1 =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(msg_1, 1, &target, time(15)?)?;
+        assert_eq!(canceled_1.state(), ProviderMessageState::Failed);
+        assert_eq!(canceled_1.revision(), 2);
+        assert_eq!(canceled_1.last_dispatch_at().get(), 0);
+
+        let dispatch_on_conn2 = catalog2.provider_message_dispatch(msg_1, time(20)?)?;
+        assert!(
+            dispatch_on_conn2.is_none(),
+            "dispatch on second connection must return None when message was canceled on first connection"
+        );
+
+        let outbox_readback_conn2 = catalog2.provider_message_outbox(msg_1)?.ok_or_else(|| {
+            std::io::Error::other("canceled outbox row missing on second connection")
+        })?;
+        assert_eq!(outbox_readback_conn2.state(), ProviderMessageState::Failed);
+        assert_eq!(outbox_readback_conn2.revision(), 2);
+        assert_eq!(outbox_readback_conn2.last_dispatch_at().get(), 0);
+
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_on_one_connection_rejects_cancel_on_another() -> Result<(), Box<dyn Error>> {
+        let mut fixture = fixture()?;
+        let target = fixture.target()?;
+        let mut catalog2 = OperationsCatalog::open(&fixture.path, fixture.destination)?;
+
+        let msg_2 = Uuid::now_v7();
+        append(
+            &mut fixture.catalog,
+            fixture.workspace,
+            msg_2,
+            "concurrent msg 2",
+            25,
+        )?;
+        fixture
+            .catalog
+            .enqueue_provider_message(EnqueueProviderMessageCommand {
+                node_route_witness: None,
+                message_id: msg_2,
+                target: target.clone(),
+                queued_at: time(25)?,
+            })?;
+
+        let dispatch_2 = catalog2
+            .provider_message_dispatch(msg_2, time(30)?)?
+            .ok_or_else(|| {
+                std::io::Error::other("queued message did not dispatch on second connection")
+            })?;
+        assert_eq!(
+            dispatch_2.dispatch().action(),
+            ProviderMessageDispatchAction::Execute
+        );
+        assert_eq!(
+            dispatch_2.outbox().state(),
+            ProviderMessageState::EffectPending
+        );
+        assert_eq!(dispatch_2.outbox().revision(), 2);
+        assert_eq!(dispatch_2.outbox().last_dispatch_at().get(), 30);
+
+        let cancel_on_conn1 =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(msg_2, 2, &target, time(35)?);
+        assert!(
+            matches!(
+                cancel_on_conn1,
+                Err(OperationsError::Conflict("provider cancel state"))
+            ),
+            "cancel on first connection must reject in-flight message dispatched by second connection"
+        );
+
+        let outbox_readback_conn1 =
+            fixture
+                .catalog
+                .provider_message_outbox(msg_2)?
+                .ok_or_else(|| {
+                    std::io::Error::other("dispatched outbox row missing on first connection")
+                })?;
+        assert_eq!(
+            outbox_readback_conn1.state(),
+            ProviderMessageState::EffectPending
+        );
+        assert_eq!(outbox_readback_conn1.revision(), 2);
+        assert_eq!(outbox_readback_conn1.last_dispatch_at().get(), 30);
+
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_cancel_and_dispatch_across_connections_have_one_cas_winner()
+    -> Result<(), Box<dyn Error>> {
+        let mut fixture = fixture()?;
+        let target = fixture.target()?;
+        let mut catalog2 = OperationsCatalog::open(&fixture.path, fixture.destination)?;
+
+        let msg_3 = Uuid::now_v7();
+        append(
+            &mut fixture.catalog,
+            fixture.workspace,
+            msg_3,
+            "concurrent msg 3",
+            40,
+        )?;
+        fixture
+            .catalog
+            .enqueue_provider_message(EnqueueProviderMessageCommand {
+                node_route_witness: None,
+                message_id: msg_3,
+                target: target.clone(),
+                queued_at: time(40)?,
+            })?;
+
+        let cancel_at = time(50)?;
+        let dispatch_at = time(50)?;
+        let (cancel_res, dispatch_res) = std::thread::scope(|scope| {
+            let cancel_catalog = &mut fixture.catalog;
+            let dispatch_catalog = &mut catalog2;
+            let cancel_target = &target;
+            let cancel = scope.spawn(move || {
+                cancel_catalog.cancel_queued_provider_message(msg_3, 1, cancel_target, cancel_at)
+            });
+            let dispatch =
+                scope.spawn(move || dispatch_catalog.provider_message_dispatch(msg_3, dispatch_at));
+            let cancel_result = cancel.join().map_err(|_| "cancel worker thread panicked");
+            let dispatch_result = dispatch
+                .join()
+                .map_err(|_| "dispatch worker thread panicked");
+            match (cancel_result, dispatch_result) {
+                (Ok(cancel_result), Ok(dispatch_result)) => Ok((cancel_result, dispatch_result)),
+                (Err(cancel_error), Err(dispatch_error)) => Err(std::io::Error::other(format!(
+                    "{cancel_error}; {dispatch_error}"
+                ))),
+                (Err(error), _) | (_, Err(error)) => Err(std::io::Error::other(error)),
+            }
+        })?;
+
+        let outbox_final = {
+            let read_catalog = OperationsCatalog::open(&fixture.path, fixture.destination)?;
+            read_catalog
+                .provider_message_outbox(msg_3)?
+                .ok_or_else(|| std::io::Error::other("raced outbox row missing on readback"))?
+        };
+
+        match (cancel_res, dispatch_res) {
+            (Ok(canceled), Ok(None)) => {
+                assert_eq!(canceled.state(), ProviderMessageState::Failed);
+                assert_eq!(canceled.revision(), 2);
+                assert_eq!(canceled.last_dispatch_at().get(), 0);
+                assert_eq!(outbox_final.state(), ProviderMessageState::Failed);
+                assert_eq!(outbox_final.revision(), 2);
+                assert_eq!(outbox_final.last_dispatch_at().get(), 0);
+            }
+            (Err(OperationsError::Conflict(_)), Ok(Some(dispatched))) => {
+                assert_eq!(
+                    dispatched.dispatch().action(),
+                    ProviderMessageDispatchAction::Execute
+                );
+                assert_eq!(
+                    dispatched.outbox().state(),
+                    ProviderMessageState::EffectPending
+                );
+                assert_eq!(dispatched.outbox().revision(), 2);
+                assert_eq!(dispatched.outbox().last_dispatch_at().get(), 50);
+                assert_eq!(outbox_final.state(), ProviderMessageState::EffectPending);
+                assert_eq!(outbox_final.revision(), 2);
+            }
+            (c, d) => {
+                return Err(format!(
+                    "unexpected concurrent race outcome: cancel={c:?}, dispatch={d:?}"
+                )
+                .into());
+            }
+        }
+
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_queued_provider_message_conflicts() -> Result<(), Box<dyn Error>> {
+        let mut fixture = fixture()?;
+        let message_id = Uuid::now_v7();
+        let target = fixture.target()?;
+
+        append(
+            &mut fixture.catalog,
+            fixture.workspace,
+            message_id,
+            "test cancel conflicts",
+            10,
+        )?;
+        fixture
+            .catalog
+            .enqueue_provider_message(EnqueueProviderMessageCommand {
+                node_route_witness: None,
+                message_id,
+                target: target.clone(),
+                queued_at: time(10)?,
+            })?;
+
+        // Conflict on mismatched target
+        let other_session = AgentProfileRuntimeSessionId::from_uuid(Uuid::now_v7())?;
+        let wrong_target = ProviderMessageTarget::new(
+            fixture.workspace,
+            fixture.profile_id,
+            fixture.participation_id,
+            other_session,
+            "conversation-1".to_owned(),
+        )?;
+        let target_conflict =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(message_id, 1, &wrong_target, time(20)?);
+        assert!(matches!(
+            target_conflict,
+            Err(OperationsError::Conflict("provider message target changed"))
+        ));
+
+        // Conflict on revision fence
+        let rev_conflict =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(message_id, 99, &target, time(20)?);
+        assert!(matches!(
+            rev_conflict,
+            Err(OperationsError::Conflict("provider message revision fence"))
+        ));
+
+        // Conflict on timestamp fence (observed_at < updated_at)
+        let time_conflict =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(message_id, 1, &target, time(5)?);
+        assert!(matches!(
+            time_conflict,
+            Err(OperationsError::Conflict(
+                "provider message timestamp fence"
+            ))
+        ));
+
+        // Dispatch the message -> state becomes EffectPending (2), last_dispatch_at > 0
+        let dispatched = fixture
+            .catalog
+            .provider_message_dispatch(message_id, time(15)?)?
+            .ok_or_else(|| std::io::Error::other("queued message did not dispatch"))?;
+        assert_eq!(
+            dispatched.outbox().state(),
+            ProviderMessageState::EffectPending
+        );
+        assert_eq!(dispatched.outbox().revision(), 2);
+
+        // Cancel on EffectPending must be rejected with conflict
+        let dispatched_conflict =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(message_id, 2, &target, time(25)?);
+        assert!(matches!(
+            dispatched_conflict,
+            Err(OperationsError::Conflict("provider cancel state"))
+        ));
+
         fixture.cleanup()?;
         Ok(())
     }

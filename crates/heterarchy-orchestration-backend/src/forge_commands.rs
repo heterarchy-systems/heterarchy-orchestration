@@ -91,12 +91,32 @@ impl ForgeCommandHttpClient {
         op: CommandOp,
         payload: Value,
     ) -> Result<Value, ForgeHttpClientError> {
+        self.command_with_request_id(Uuid::now_v7(), op, payload)
+            .await
+    }
+
+    /// Send one command whose protocol identity is the durable domain request.
+    ///
+    /// Only commands whose frozen ABI requires envelope/body identity equality
+    /// use this entry point. It does not retry or change the supplied identity.
+    ///
+    /// # Errors
+    /// Returns invalid request for a nil identity and the same bounded command
+    /// transport/service failures as [`Self::command`].
+    pub async fn command_with_request_id(
+        &self,
+        request_id: Uuid,
+        op: CommandOp,
+        payload: Value,
+    ) -> Result<Value, ForgeHttpClientError> {
+        if request_id.is_nil() {
+            return Err(ForgeHttpClientError::InvalidRequest);
+        }
         let _permit = self
             .slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| ForgeHttpClientError::Capacity)?;
-        let request_id = Uuid::now_v7();
         let envelope = json!({
             "forge_api": forge_backend::FORGE_API_VERSION,
             "request_id": request_id,

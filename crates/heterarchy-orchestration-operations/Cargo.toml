@@ -14,6 +14,7 @@ forge-domain = { path = "../../../heterarchy-forge/crates/forge-domain" }
 forge-persistence = { path = "../../../heterarchy-forge/crates/forge-persistence" }
 heterarchy-orchestration-sessions = { path = "../heterarchy-orchestration-sessions" }
 heterarchy-orchestration-policy = { path = "../heterarchy-orchestration-policy" }
+blake3.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

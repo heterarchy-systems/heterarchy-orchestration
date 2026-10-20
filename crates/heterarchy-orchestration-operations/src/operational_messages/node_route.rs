@@ -136,7 +136,11 @@ fn validate_sender(
     }
     match (message.author(), witness.sender_leadership_revision()) {
         (MessageAuthor::Operator, None) => Ok(()),
-        (MessageAuthor::Participant { participant_id, .. }, Some(revision)) => {
+        (
+            MessageAuthor::Participant { participant_id, .. }
+            | MessageAuthor::NativeParticipant { participant_id, .. },
+            Some(revision),
+        ) => {
             let authority = crate::leadership::current_leadership_authority_in_transaction(
                 transaction,
                 LeadershipScope::workspace(message.workspace_id()),
@@ -346,6 +350,12 @@ impl NodeMessageRouteWitness {
             (
                 RouteSender::Participant { session_id, .. },
                 MessageAuthor::Participant {
+                    session_id: stored, ..
+                },
+            )
+            | (
+                RouteSender::Participant { session_id, .. },
+                MessageAuthor::NativeParticipant {
                     session_id: stored, ..
                 },
             ) => session_id == stored.into_uuid(),

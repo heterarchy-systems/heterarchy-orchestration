@@ -35,7 +35,7 @@ use heterarchy_orchestration_operations::{
     AgentProvisionState, AgentRequestCommand, AgentRequestEffectScope, AgentRequestIndependence,
     AgentRequestIntent, AgentRequestRecord, AgentRequestRequester, AgentRequestResolution,
     AgentRequestResolutionKind, AgentRequestResolutionSelection, AgentRequestState,
-    CommitAgentRequestResolution, OperationsCatalog, OperationsError,
+    CommitAgentRequestResolution, OperationsCatalog, OperationsError, WorkspaceProjectReference,
 };
 use heterarchy_orchestration_policy::{
     AgentResolverActionKind, AgentResolverAvailability, AgentResolverCandidate,
@@ -238,6 +238,8 @@ pub struct ProvisionOperationSummary {
     pub revision: u64,
     /// True when this call changed durable state (creation or target binding).
     pub changed: bool,
+    /// Frozen provider Project route; legacy operations retain no provenance.
+    pub project: Option<WorkspaceProjectReference>,
 }
 
 impl OrchestrationRuntime {
@@ -981,6 +983,7 @@ impl ProvisionOperationSummary {
             created: plan.created,
             revision: operation.revision(),
             changed: plan.created || operation.revision() != plan.prepared_revision,
+            project: operation.project(),
         }
     }
 }
@@ -1155,6 +1158,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("provisioning-evidence-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&root)?;
         let runtime = OrchestrationRuntime::open(&root)?;
+        crate::test_support::ensure_workspace_project_binding(
+            &runtime,
+            Uuid::from_u128(0xA101),
+            1,
+        )?;
         let command = AgentRequestSubmit {
             workspace_id: Uuid::from_u128(0xA101),
             activity_id: Uuid::from_u128(0xA102),
@@ -1225,9 +1233,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("partial-provision-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&root)?;
         let runtime = OrchestrationRuntime::open(&root)?;
+        let workspace_id = Uuid::now_v7();
+        crate::test_support::ensure_workspace_project_binding(&runtime, workspace_id, 1)?;
         let request_id = Uuid::now_v7();
         runtime.submit_agent_request(AgentRequestSubmit {
-            workspace_id: Uuid::now_v7(),
+            workspace_id,
             activity_id: Uuid::now_v7(),
             requester_agent_id: Uuid::now_v7(),
             requester_session_id: Uuid::now_v7(),

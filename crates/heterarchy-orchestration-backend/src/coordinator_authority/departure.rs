@@ -28,14 +28,9 @@ impl CoordinatorAuthority {
         match &self.transport {
             SourceTransport::Http(client) => {
                 let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
                 ForgeMembershipHttpClient::new(client.commands().clone())
-                    .departure_by_identity(
-                        self.trusted_scope(&scope)?,
-                        &reference,
-                        request_id,
-                        session_id,
-                        principal,
-                    )
+                    .departure_by_identity(&trusted, &reference, request_id, session_id, principal)
                     .await
                     .map_err(map_source_error)
             }
@@ -117,8 +112,9 @@ impl CoordinatorAuthority {
         match &self.transport {
             SourceTransport::Http(client) => {
                 let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
                 ForgeMembershipHttpClient::new(client.commands().clone())
-                    .departure_reconciliation(self.trusted_scope(&scope)?, &reference, &request)
+                    .departure_reconciliation(&trusted, &reference, &request)
                     .await
                     .map_err(map_source_error)
             }
@@ -156,8 +152,9 @@ impl CoordinatorAuthority {
         match &self.transport {
             SourceTransport::Http(client) => {
                 let _permit = permit;
+                let trusted = self.trusted_scope(&scope)?;
                 ForgeMembershipHttpClient::new(client.commands().clone())
-                    .reconcile_departure(self.trusted_scope(&scope)?, &reference, &request)
+                    .reconcile_departure(&trusted, &reference, &request)
                     .await
                     .map_err(map_source_error)
             }

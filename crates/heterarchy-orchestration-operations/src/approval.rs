@@ -875,6 +875,19 @@ impl AdmissionIssuerConfig {
     }
 }
 
+pub(crate) fn admission_issuer_config_from(
+    connection: &Connection,
+) -> Result<Option<AdmissionIssuerConfig>, OperationsError> {
+    load_issuer(connection).map(|row| {
+        row.map(|issuer| AdmissionIssuerConfig {
+            issuer: issuer.issuer,
+            backend_id: issuer.backend_id,
+            admission_ttl_ms: issuer.admission_ttl_ms,
+            updated_at_ms: issuer.updated_at_ms,
+        })
+    })
+}
+
 /// Command submitting one execution approval request from a session-bound
 /// principal. The request id is the caller's stable replay identity.
 #[must_use]
@@ -1343,14 +1356,7 @@ impl OperationsCatalog {
     pub fn admission_issuer_config(
         &self,
     ) -> Result<Option<AdmissionIssuerConfig>, OperationsError> {
-        load_issuer(&self.connection).map(|row| {
-            row.map(|issuer| AdmissionIssuerConfig {
-                issuer: issuer.issuer,
-                backend_id: issuer.backend_id,
-                admission_ttl_ms: issuer.admission_ttl_ms,
-                updated_at_ms: issuer.updated_at_ms,
-            })
-        })
+        admission_issuer_config_from(&self.connection)
     }
 
     /// Read one workspace's approval policy, if one was ever set.

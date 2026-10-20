@@ -231,13 +231,14 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsErr
     Ok(())
 }
 
-/// Remove only the Phase-B shadow identity objects when a unit test needs to
-/// reconstruct an exact pre-v21 catalog shape. Production migrations never
-/// call this helper.
+/// Remove post-v20 additions when a unit test reconstructs an exact legacy
+/// catalog shape. The composed drops refuse durable isolation/handoff receipts.
+/// Production migrations never call this helper.
 #[cfg(test)]
 pub(crate) fn drop_schema_for_legacy_fixture(
     connection: &Connection,
 ) -> Result<(), OperationsError> {
+    crate::catalog::drop_v49_project_schema_for_legacy_fixture(connection)?;
     crate::work_credit_subject::drop_schema_for_legacy_fixture(connection)?;
     connection.execute_batch(
         "DROP TABLE IF EXISTS ops_election_subject_ballots; \

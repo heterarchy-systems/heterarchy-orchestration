@@ -20,6 +20,7 @@ mod effect_binding;
 mod effect_fact;
 mod election_subject;
 mod events;
+mod import_handoff;
 mod importer;
 mod inbox;
 mod leadership;
@@ -47,10 +48,18 @@ mod work_credit;
 mod work_credit_subject;
 mod workspace_chat_target;
 mod workspace_participation;
+mod workspace_project;
 
 pub use workspace_chat_target::{WorkspaceChatTarget, WorkspaceChatTargetPage};
+pub use workspace_project::{
+    ChatGptProjectId, MAX_WORKSPACE_AUTHORITY_SCOPES, WorkspaceProjectBinding,
+    WorkspaceProjectBindingReceipt, WorkspaceProjectBindingRevision,
+    WorkspaceProjectConfigureCommand, WorkspaceProjectConfigureOutcome, WorkspaceProjectEnrollment,
+    WorkspaceProjectReference, WorkspaceProjectScope,
+};
 
 mod binding_observation;
+mod binding_rejection;
 pub use activation::RegistrationActivationReceipt;
 pub use agent_profile_view::{
     AgentProfileSessionRuntimeObservation, AgentProfileWorkspaceCurrentIdentityView,
@@ -62,6 +71,8 @@ pub use agent_provision::{
     AgentProvisionDispatch, AgentProvisionDispatchAction, AgentProvisionDispatchOutcome,
     AgentProvisionEffectKind, AgentProvisionFailureCode, AgentProvisionOperation,
     AgentProvisionPrepareOutcome, AgentProvisionProviderFamily, AgentProvisionState,
+    AgentProvisionUncertaintyRetirement, AgentProvisionUncertaintyRetirementCommand,
+    AgentProvisionUncertaintyRetirementOutcome, AgentProvisionUncertaintyRetirementTarget,
 };
 pub use agent_request::{
     AgentRequestCommand, AgentRequestCurrentScopeProfiles, AgentRequestEffectScope,
@@ -82,14 +93,25 @@ pub use approval::{
     MAX_APPROVAL_POLICY_JSON_BYTES, MAX_REQUEST_TTL_MS, MIN_ADMISSION_TTL_MS, MIN_REQUEST_TTL_MS,
     SetApprovalPolicyCommand, SubmitApprovalCommand,
 };
-pub use binding_observation::{BindingActivationObservation, BindingReservationObservation};
+pub use binding_observation::{
+    BindingActivationObservation, BindingRejectionObservation, BindingReservationObservation,
+};
+pub use binding_rejection::{
+    BindingRejectionAttemptDisposition, BindingRejectionAttemptRequest,
+    BindingRejectionAttemptResolution, BindingRejectionSourceRequestPolicy,
+    LegacyBindingRejectionEnvelopePolicy, RegistrationBindingRejectionReceipt,
+    ResolveBindingRejectionAttempt, TrustedLegacyBindingRejectionDeployment,
+};
 pub use broker_cluster::{
     BrokerClusterConfig, BrokerClusterNodeProbe, BrokerClusterProbe, DEFAULT_BROKER_CLUSTER_TIMEOUT,
 };
 pub use broker_fence::{
     BrokerAuthorityFence, BrokerFenceConfig, DEFAULT_FENCE_TIMEOUT, LeadershipFenceError,
 };
-pub use broker_owner::{BrokerOwnerAuthority, BrokerOwnerAuthorityError, BrokerOwnerLease};
+pub use broker_owner::{
+    BrokerOwnerAuthority, BrokerOwnerAuthorityError, BrokerOwnerLease, BrokerOwnerObservation,
+    BrokerOwnerRecoveryApproval, BrokerOwnerRecoveryError,
+};
 pub use catalog::{ImportPhase, ImportProgress, OperationsCatalog};
 pub use coordination::{
     LogicalActivityJoinedEvent, LogicalActivityParticipant, LogicalActivitySnapshot,
@@ -110,12 +132,14 @@ pub use effect_fact::{
 };
 pub use election_subject::ElectionSubjectCutoverReceipt;
 pub use events::{InboxReceiptRecord, PresenceRecord};
+pub use forge_domain::AgentBindingRejectionReason;
 pub use forge_persistence::{
     AgentDepartureCommand, AgentDepartureKind, AgentDepartureReconciliationRequest,
     AgentOperationsExportCursor, AgentOperationsExportPage, AgentOperationsFreeze,
     AssignmentReviewedOutcome, AssignmentSubmittedSourceRef, DagNodeAssignmentSnapshot,
     DagNodeEvidenceScope,
 };
+pub use import_handoff::{CurrentImportHandoff, ImportHandoffSeal, ImportHandoffSealCommand};
 pub use importer::ImportVerificationTarget;
 pub use inbox::{LogicalInboxAck, LogicalInboxEntry, LogicalInboxQuery, LogicalInboxTarget};
 pub use leadership::ballots::LeadershipBallotSnapshot;
@@ -159,7 +183,9 @@ pub use operational_messages::{
     NodeMessageRouteTarget, NodeMessageRouteWitness, ProviderMessageDeliveryReceipt,
     ProviderMessageDispatch, ProviderMessageDispatchAction, ProviderMessageDispatchOutcome,
     ProviderMessageInFlightPage, ProviderMessageOutbox, ProviderMessageQueueOutcome,
-    ProviderMessageSource, ProviderMessageState, ProviderMessageTarget, ProviderTurnObservation,
+    ProviderMessageSource, ProviderMessageState, ProviderMessageTarget,
+    ProviderMessageUnknownIsolationCommand, ProviderMessageUnknownIsolationReason,
+    ProviderMessageUnknownIsolationReceipt, ProviderTurnObservation,
     RecordIncomingProviderMessageCommand, WorkspaceMessage, provider_message_text,
     validate_chat_text,
 };
@@ -181,10 +207,13 @@ pub use provider_deletion::{
 // Composition passes the original Forge receipt; no parallel witness type is
 // introduced and Runtime gains no Forge persistence/effect dependency.
 pub use forge_persistence::{
-    AgentBindingActivation, AgentBindingActivationRequest, AgentBindingReservation,
-    AgentBindingReservationRequest, AgentOperationsDelegation,
+    AgentBindingActivation, AgentBindingActivationRequest, AgentBindingRejectionOperation,
+    AgentBindingRejectionReceipt, AgentBindingReservation, AgentBindingReservationRequest,
+    AgentOperationsDelegation,
 };
-pub use registration::{RegistrationPhase, RegistrationProgress, RegistrationRequest};
+pub use registration::{
+    RegistrationPhase, RegistrationProgress, RegistrationRequest, native_session_participation_id,
+};
 pub use registration_profile::RegistrationProfileScope;
 pub use replacement_registration::{
     WorkspaceParticipationReplacementActivationReceipt,
@@ -246,6 +275,14 @@ pub enum OperationsError {
     },
     #[error("operations activation {request_id} commit is unconfirmed; read the same identity")]
     ActivationCommitUnconfirmed {
+        request_id: uuid::Uuid,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error(
+        "operations binding rejection {request_id} commit is unconfirmed; read the same identity"
+    )]
+    BindingRejectionCommitUnconfirmed {
         request_id: uuid::Uuid,
         #[source]
         source: rusqlite::Error,
@@ -333,6 +370,16 @@ pub enum OperationsError {
     )]
     AgentProvisionCommitUnconfirmed {
         operation_id: uuid::Uuid,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error(
+        "Agent provision uncertainty retirement {retirement_id} for operation {operation_id} commit is unconfirmed in catalog {destination_id}; query the same operation identity before retrying"
+    )]
+    AgentProvisionUncertaintyRetirementCommitUnconfirmed {
+        operation_id: uuid::Uuid,
+        retirement_id: uuid::Uuid,
+        destination_id: uuid::Uuid,
         #[source]
         source: rusqlite::Error,
     },

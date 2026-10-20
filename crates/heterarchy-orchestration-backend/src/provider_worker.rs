@@ -7,15 +7,21 @@
 use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
-use forge_domain::AuthenticatedPrincipal;
+use forge_domain::{AuthenticatedPrincipal, TimestampMillis, WorkspaceId};
 use heterarchy_orchestration_operations::{
     AgentProvisionDispatchAction, AgentProvisionFailureCode, AgentProvisionOperation,
     ProviderMessageDispatchAction, ProviderMessageOutbox, ProviderMessageState,
+    ProviderMessageTarget, ProviderMessageUnknownIsolationCommand,
+    ProviderMessageUnknownIsolationReason, ProviderMessageUnknownIsolationReceipt,
+    WorkspaceParticipationId, WorkspaceProjectReference,
 };
 use heterarchy_orchestration_runtime::provider_chat::{
     ProviderIncomingCommand, ProviderIncomingRole,
 };
 use heterarchy_orchestration_runtime::{OrchestrationRuntime, RuntimeError};
+use heterarchy_orchestration_sessions::{
+    AgentProfileId, AgentProfileProviderFamily, AgentProfileRuntimeSessionId,
+};
 use uuid::Uuid;
 
 use crate::BackendState;
@@ -25,8 +31,12 @@ use crate::wire::provider_worker::{
     ProviderDeliveryConfirmation, ProviderDispatchRequest, ProviderIncomingMessage,
     ProviderIncomingMessageResponse, ProviderIncomingReadbackResponse,
     ProviderMessageDispatchResponse, ProviderMessageFence, ProviderMessageInspection,
-    ProviderMessageInspectionResponse, ProviderMessageMutationResponse, ProviderMessageOutboxWire,
-    ProviderMessageSelectionObservation, ProviderMessageSelectionQuery, ProviderMessageTargetWire,
+    ProviderMessageInspectionResponse, ProviderMessageIsolationPrincipalKindWire,
+    ProviderMessageIsolationPrincipalWire, ProviderMessageMutationResponse,
+    ProviderMessageOutboxWire, ProviderMessageSelectionObservation, ProviderMessageSelectionQuery,
+    ProviderMessageTargetWire, ProviderMessageUnknownIsolationQuery,
+    ProviderMessageUnknownIsolationReasonWire, ProviderMessageUnknownIsolationReceiptWire,
+    ProviderMessageUnknownIsolationRequest, ProviderMessageUnknownIsolationResponse,
     ProviderOperationFence, ProviderProvisionConfirmation, ProviderProvisionDispatchResponse,
     ProviderProvisionDispatchWire, ProviderProvisionInspection, ProviderProvisionMutationResponse,
     ProviderProvisionQueryResponse, ProviderProvisionSelectionObservation,
@@ -88,8 +98,20 @@ pub(crate) fn routes() -> Router<BackendState> {
             post(unknown_message),
         )
         .route(
+            "/internal/v1/provider-worker/messages/unknown-isolation",
+            post(isolate_unknown_message),
+        )
+        .route(
+            "/internal/v1/provider-worker/messages/unknown-isolation/query",
+            post(query_unknown_message_isolation),
+        )
+        .route(
             "/internal/v1/provider-worker/messages/fail",
             post(fail_message),
+        )
+        .route(
+            "/internal/v1/provider-worker/messages/cancel",
+            post(cancel_message),
         )
         .route(
             "/internal/v1/provider-worker/messages/delivered",
@@ -168,6 +190,9 @@ async fn dispatch_provision(
                         effect_kind: effect_kind_name(fence),
                         provider_family: "chatgpt".to_owned(),
                         provider_conversation_id,
+                        project: fence.project().map(
+                            crate::wire::workspace_project::ProviderProjectReferenceWire::from,
+                        ),
                     },
                 }),
                 reconciled: None,
@@ -360,11 +385,12 @@ async fn confirm_provision(
     }
     let observed_at_ms = now_millis()?;
     mutate_provision(state, principal, body.operation_id, move |runtime| {
-        runtime.provider_worker_confirm_provision(
+        runtime.provider_worker_confirm_provision_with_project(
             principal,
             body.operation_id,
             body.expected_revision,
             &body.provider_conversation_id,
+            body.provider_project_id.as_deref(),
             observed_at_ms,
         )
     })
@@ -489,6 +515,72 @@ async fn unknown_message(
     .await
 }
 
+async fn isolate_unknown_message(
+    State(state): State<BackendState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<ProviderMessageUnknownIsolationRequest>,
+) -> Result<Json<ProviderMessageUnknownIsolationResponse>, LaneError> {
+    if body.request_id.is_nil() || body.message_id.is_nil() || body.expected_revision == 0 {
+        return Err(LaneError::InvalidIdentity);
+    }
+    let expected_target = provider_message_target_from_wire(body.expected_target)?;
+    let reason = match body.reason {
+        ProviderMessageUnknownIsolationReasonWire::OperatorAcknowledgedUnknown => {
+            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown
+        }
+    };
+    let acknowledged_at =
+        TimestampMillis::new(now_millis()?).map_err(|_| LaneError::InvalidIdentity)?;
+    let command = ProviderMessageUnknownIsolationCommand::new(
+        body.request_id,
+        body.message_id,
+        body.expected_revision,
+        expected_target,
+        reason,
+        principal,
+        acknowledged_at,
+    )
+    .map_err(RuntimeError::from)?;
+    let receipt = state
+        .run_operator_control_mutation(principal, move |runtime| {
+            runtime.provider_worker_isolate_unknown_message(principal, &command)
+        })
+        .await?;
+    Ok(Json(ProviderMessageUnknownIsolationResponse {
+        receipt: Some(ProviderMessageUnknownIsolationReceiptWire::from(&receipt)),
+        retry_authorized: false,
+    }))
+}
+
+async fn query_unknown_message_isolation(
+    State(state): State<BackendState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<ProviderMessageUnknownIsolationQuery>,
+) -> Result<Json<ProviderMessageUnknownIsolationResponse>, LaneError> {
+    if body.message_id.is_nil()
+        || body
+            .request_id
+            .is_some_and(|request_id| request_id.is_nil())
+    {
+        return Err(LaneError::InvalidIdentity);
+    }
+    let receipt = state
+        .run_catalog(move |runtime| {
+            runtime.provider_worker_unknown_message_isolation(
+                principal,
+                body.message_id,
+                body.request_id,
+            )
+        })
+        .await?;
+    Ok(Json(ProviderMessageUnknownIsolationResponse {
+        receipt: receipt
+            .as_ref()
+            .map(ProviderMessageUnknownIsolationReceiptWire::from),
+        retry_authorized: false,
+    }))
+}
+
 async fn fail_message(
     State(state): State<BackendState>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
@@ -509,6 +601,26 @@ async fn fail_message(
     .await
 }
 
+async fn cancel_message(
+    State(state): State<BackendState>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<ProviderMessageFence>,
+) -> Result<Json<ProviderMessageMutationResponse>, LaneError> {
+    if body.message_id.is_nil() || body.expected_revision == 0 {
+        return Err(LaneError::InvalidIdentity);
+    }
+    let now_ms = now_millis()?;
+    mutate_message(state, principal, body.message_id, move |runtime| {
+        runtime.provider_worker_cancel_queued_message(
+            principal,
+            body.message_id,
+            body.expected_revision,
+            now_ms,
+        )
+    })
+    .await
+}
+
 async fn delivered_message(
     State(state): State<BackendState>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
@@ -519,11 +631,12 @@ async fn delivered_message(
     }
     let now_ms = now_millis()?;
     mutate_message(state, principal, body.message_id, move |runtime| {
-        runtime.provider_worker_confirm_message_delivery(
+        runtime.provider_worker_confirm_message_delivery_with_project(
             principal,
             body.message_id,
             body.expected_revision,
             &body.provider_conversation_id,
+            body.provider_project_id.as_deref(),
             body.provider_turn_id,
             body.body,
             now_ms,
@@ -631,7 +744,7 @@ fn request_workspace_id(
         .agent_request(request_id)?
         .ok_or(RuntimeError::NotFound)?;
     Uuid::parse_str(&request.workspace_id).map_err(|_| {
-        RuntimeError::Persistence(
+        RuntimeError::persistence(
             heterarchy_orchestration_operations::OperationsError::Corrupt(
                 "provider worker request Workspace identity",
             ),
@@ -643,6 +756,64 @@ fn provision_action_wire(action: AgentProvisionDispatchAction) -> ProviderWorker
     match action {
         AgentProvisionDispatchAction::Execute => ProviderWorkerActionWire::Execute,
         AgentProvisionDispatchAction::Inspect => ProviderWorkerActionWire::Inspect,
+    }
+}
+
+fn provider_message_target_from_wire(
+    target: ProviderMessageTargetWire,
+) -> Result<ProviderMessageTarget, LaneError> {
+    let project = target
+        .project
+        .map(WorkspaceProjectReference::try_from)
+        .transpose()
+        .map_err(|_| LaneError::InvalidIdentity)?;
+    ProviderMessageTarget::new_with_project_route(
+        WorkspaceId::from_uuid(target.workspace_id),
+        AgentProfileId::from_uuid(target.profile_id).map_err(|_| LaneError::InvalidIdentity)?,
+        WorkspaceParticipationId::from_uuid(target.participation_id)
+            .map_err(|_| LaneError::InvalidIdentity)?,
+        match target.provider_family {
+            crate::wire::provider_worker::ProviderWorkerFamilyWire::ChatGpt => {
+                AgentProfileProviderFamily::ChatGpt
+            }
+        },
+        AgentProfileRuntimeSessionId::from_uuid(target.runtime_session_id)
+            .map_err(|_| LaneError::InvalidIdentity)?,
+        target.provider_conversation_id,
+        project,
+    )
+    .map_err(|_| LaneError::InvalidIdentity)
+}
+
+impl From<&ProviderMessageUnknownIsolationReceipt> for ProviderMessageUnknownIsolationReceiptWire {
+    fn from(receipt: &ProviderMessageUnknownIsolationReceipt) -> Self {
+        let (kind, id) = match receipt.principal() {
+            AuthenticatedPrincipal::TrustedStdio => (
+                ProviderMessageIsolationPrincipalKindWire::TrustedStdio,
+                None,
+            ),
+            AuthenticatedPrincipal::DirectToken(id) => (
+                ProviderMessageIsolationPrincipalKindWire::DirectToken,
+                Some(id.into_uuid()),
+            ),
+            AuthenticatedPrincipal::OAuthGrant(id) => (
+                ProviderMessageIsolationPrincipalKindWire::OAuthGrant,
+                Some(id.into_uuid()),
+            ),
+        };
+        Self {
+            request_id: receipt.request_id(),
+            message_id: receipt.message_id(),
+            expected_revision: receipt.expected_revision(),
+            expected_target: ProviderMessageTargetWire::from(receipt.expected_target()),
+            reason: match receipt.reason() {
+                ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown => {
+                    ProviderMessageUnknownIsolationReasonWire::OperatorAcknowledgedUnknown
+                }
+            },
+            principal: ProviderMessageIsolationPrincipalWire { kind, id },
+            acknowledged_at_ms: receipt.acknowledged_at().get(),
+        }
     }
 }
 

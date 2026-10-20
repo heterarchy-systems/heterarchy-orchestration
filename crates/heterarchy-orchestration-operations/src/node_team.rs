@@ -1037,6 +1037,11 @@ fn authorize_binding_actor_identity(
             Err(OperationsError::Conflict("operator leadership revision"))
         }
         (OperationalActor::Participant { .. }, Some(expected_revision)) => {
+            if !actor.is_profile_participant() {
+                return Err(OperationsError::Conflict(
+                    "node binding requires Profile participation",
+                ));
+            }
             let authority = leadership::current_leadership_authority_in_transaction(
                 tx,
                 crate::LeadershipScope::workspace(workspace_id),
@@ -1044,7 +1049,7 @@ fn authorize_binding_actor_identity(
             .ok_or(OperationsError::Conflict(
                 "node binding requires current Workspace leader",
             ))?;
-            if actor.participant_id != Some(authority.participant_id())
+            if actor.participant_id() != Some(authority.participant_id())
                 || expected_revision != authority.leadership_revision()
             {
                 return Err(OperationsError::Conflict(

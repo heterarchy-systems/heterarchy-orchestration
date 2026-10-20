@@ -2749,6 +2749,7 @@ mod tests {
             activity_id: activity,
             target_agent_id: agent,
             target_session_id: session,
+            expected_target_principal: forge_domain::AuthenticatedPrincipal::TrustedStdio,
             requester: crate::OperationalActor::LocalOperator,
             team_id: Some(team),
             node_scope,

@@ -187,7 +187,7 @@ fn receipt_wire(
         "awaiting_decision" => LeadershipReviewPhaseWire::AwaitingDecision,
         "resolved" => LeadershipReviewPhaseWire::Resolved,
         _ => {
-            return Err(RuntimeError::Persistence(
+            return Err(RuntimeError::persistence(
                 heterarchy_orchestration_operations::OperationsError::Corrupt(
                     "statement receipt phase",
                 ),

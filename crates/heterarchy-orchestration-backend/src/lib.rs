@@ -6,6 +6,7 @@
 pub mod app_support;
 pub mod approval;
 pub mod auth;
+pub mod binding_rejection_trust;
 mod catalog_execution;
 pub mod client;
 mod connections;
@@ -20,6 +21,7 @@ pub mod forge_read_api;
 pub mod forge_source;
 pub mod forge_source_config;
 mod handoff;
+mod node_assignment_admission;
 pub mod node_chat;
 pub mod node_team;
 mod operations_import;
@@ -44,6 +46,8 @@ pub mod teams;
 pub mod token_cli;
 pub mod wire;
 pub mod work_credit;
+mod workspace_chat;
+mod workspace_project;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -63,6 +67,7 @@ use heterarchy_orchestration_auth::{
 };
 use heterarchy_orchestration_operations::{
     ConfigureAdmissionIssuerCommand, MAX_ADMISSION_TTL_MS, MIN_ADMISSION_TTL_MS,
+    TrustedLegacyBindingRejectionDeployment,
 };
 use heterarchy_orchestration_runtime::{
     AgentProfileCreateCommand, AgentProfileCreateSummary, AgentRequestSummary,
@@ -114,6 +119,7 @@ pub struct BackendConfig {
     operator_policy: heterarchy_orchestration_runtime::access::OperatorPolicy,
     coordinator_authority: Option<coordinator_authority::CoordinatorAuthority>,
     admission_issuer: Option<AdmissionIssuerBootstrap>,
+    trusted_binding_rejection_legacy_deployments: Vec<TrustedLegacyBindingRejectionDeployment>,
 }
 
 /// Explicit host identity used to initialize the Forge admission issuer.
@@ -214,6 +220,7 @@ impl BackendConfig {
             operator_policy: heterarchy_orchestration_runtime::access::OperatorPolicy::default(),
             coordinator_authority: None,
             admission_issuer: None,
+            trusted_binding_rejection_legacy_deployments: Vec::new(),
         })
     }
 
@@ -249,6 +256,15 @@ impl BackendConfig {
     #[must_use]
     pub fn with_admission_issuer(mut self, issuer: AdmissionIssuerBootstrap) -> Self {
         self.admission_issuer = Some(issuer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_trusted_binding_rejection_legacy_deployments(
+        mut self,
+        deployments: Vec<TrustedLegacyBindingRejectionDeployment>,
+    ) -> Self {
+        self.trusted_binding_rejection_legacy_deployments = deployments;
         self
     }
 
@@ -715,6 +731,30 @@ impl BackendState {
             })
     }
 
+    async fn workspace_candidate_proof(
+        &self,
+        scope: wire::WorkspaceQueryScope,
+    ) -> Result<forge_control::ResolvedWorkspaceScope, ApiError> {
+        let authority = self
+            .coordinator_authority
+            .clone()
+            .ok_or(ApiError::WorkspaceScopeUnavailable)?;
+        let permit = self
+            .forge_query_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ApiError::Unavailable)?;
+        authority
+            .check_workspace_candidate(scope, permit)
+            .await
+            .map_err(|error| match error {
+                CoordinatorAuthorityError::Denied => ApiError::Runtime(RuntimeError::Forbidden),
+                CoordinatorAuthorityError::Stale => ApiError::Runtime(RuntimeError::Conflict),
+                CoordinatorAuthorityError::Unavailable => ApiError::WorkspaceScopeUnavailable,
+            })
+    }
+
     /// Authorize the same scoped operator and owned logical Session again at
     /// commit admission. Source and Broker waits retain no catalog guard.
     async fn run_scoped_operator_mutation<T, F>(
@@ -868,8 +908,16 @@ pub async fn serve(
     let data_root = config.data_root().to_path_buf();
     let admission_issuer = config.admission_issuer;
     let token_runtime = start_authorities(config.token_authority)?;
-    let runtime =
+    let mut runtime =
         OrchestrationRuntime::open(&data_root)?.with_operator_policy(config.operator_policy);
+    if !config
+        .trusted_binding_rejection_legacy_deployments
+        .is_empty()
+    {
+        runtime = runtime.with_trusted_binding_rejection_legacy_deployments(
+            config.trusted_binding_rejection_legacy_deployments,
+        );
+    }
     if let Some(issuer) = admission_issuer {
         let now_ms = startup_timestamp_millis()?;
         runtime
@@ -914,6 +962,15 @@ pub async fn serve_with_runtime(
     let destination_id = runtime.destination_id();
     let mut state = BackendState::new_shared(runtime, Arc::new(RealtimeHub::new()));
     state.coordinator_authority = coordinator_authority;
+    let enrollments = state
+        .catalog_job(OrchestrationRuntime::workspace_project_enrollments)
+        .await
+        .map_err(map_startup_catalog_error)?;
+    if let Some(authority) = &state.coordinator_authority {
+        authority
+            .hydrate_workspace_project_enrollments(&enrollments)
+            .map_err(|_| BackendError::WorkspaceProjectScopeProjection)?;
+    }
     let authorizer = auth::BearerAuthorizer::new(token_client);
     let router = router(state.clone(), authorizer.clone());
     let listener = TcpListener::bind(listen).await?;
@@ -981,11 +1038,14 @@ fn router(state: BackendState, authorizer: auth::BearerAuthorizer) -> Router {
         .merge(member_list::routes())
         .merge(departure::routes())
         .merge(coordination::routes())
+        .merge(node_assignment_admission::routes())
         .merge(node_team::routes())
         .merge(node_chat::routes())
         .merge(handoff::routes())
         .merge(sessions::routes())
         .merge(work_credit::routes())
+        .merge(workspace_chat::routes())
+        .merge(workspace_project::routes())
         .merge(forge_read_api::routes())
         .route_layer(axum::middleware::from_fn_with_state(
             ingress_limits::RequestAdmission::new(),
@@ -1106,7 +1166,7 @@ async fn agent_request(
                 .agent_request(request_id)?
                 .map(|request| {
                     let scope = Uuid::parse_str(&request.workspace_id).map_err(|_| {
-                        RuntimeError::Persistence(
+                        RuntimeError::persistence(
                             heterarchy_orchestration_operations::OperationsError::Corrupt(
                                 "request Workspace identity",
                             ),
@@ -1408,12 +1468,30 @@ pub enum BackendError {
     InvalidAdmissionIssuer,
     #[error("Orchestration startup clock is unavailable")]
     StartupClock,
+    #[error("Orchestration Workspace Project enrollment catalog could not be loaded")]
+    WorkspaceProjectScopeCatalog,
+    #[error("Orchestration Workspace Project enrollment projection is invalid")]
+    WorkspaceProjectScopeProjection,
     #[error("Orchestration runtime bootstrap failed")]
     Runtime(#[from] RuntimeError),
     #[error("Orchestration listener failed")]
     Io(#[from] std::io::Error),
     #[error("Orchestration server failed")]
     Serve(std::io::Error),
+}
+
+fn map_startup_catalog_error(error: ApiError) -> BackendError {
+    match error {
+        ApiError::Runtime(error) => BackendError::Runtime(error),
+        ApiError::WorkspaceScopeUnavailable | ApiError::Unavailable => {
+            BackendError::WorkspaceProjectScopeCatalog
+        }
+        ApiError::InvalidIdentity
+        | ApiError::NotFound
+        | ApiError::Capacity
+        | ApiError::CoordinatorUnavailable
+        | ApiError::SourceBindingUnconfirmed => BackendError::WorkspaceProjectScopeCatalog,
+    }
 }
 
 #[cfg(test)]

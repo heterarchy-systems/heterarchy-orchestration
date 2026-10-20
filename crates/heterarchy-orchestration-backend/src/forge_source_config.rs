@@ -13,12 +13,12 @@ use std::time::Duration;
 use forge_backend::ops::ScopeDto;
 use forge_control::{ResolvedWorkspaceScope, WorkspaceLocator};
 use forge_domain::{LocationId, LocationRevision, WorkspaceId, WorkspaceRevision};
+use heterarchy_orchestration_operations::MAX_WORKSPACE_AUTHORITY_SCOPES;
 use serde::Deserialize;
 use thiserror::Error;
 
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 const MAX_BEARER_BYTES: usize = 4 * 1024;
-const MAX_SCOPES: usize = 64;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Redacted failures while loading the trusted Forge source configuration.
@@ -150,7 +150,7 @@ pub fn load(path: &Path) -> Result<crate::CoordinatorAuthority, ForgeSourceConfi
 fn validated_scopes(
     source_scopes: Vec<ScopeDto>,
 ) -> Result<Vec<ResolvedWorkspaceScope>, ForgeSourceConfigError> {
-    if source_scopes.len() > MAX_SCOPES {
+    if source_scopes.len() > MAX_WORKSPACE_AUTHORITY_SCOPES {
         return Err(ForgeSourceConfigError::Scope);
     }
 
@@ -461,7 +461,7 @@ mod tests {
             fixture.document(&[scope(Uuid::from_u128(1), Uuid::from_u128(2), "../outside")])?;
         assert_load_error(&fixture, &invalid_path, ForgeSourceConfigError::Scope)?;
 
-        let upper = u64::try_from(MAX_SCOPES)?;
+        let upper = u64::try_from(MAX_WORKSPACE_AUTHORITY_SCOPES)?;
         let too_many: Vec<Value> = (0..=upper)
             .map(|index| {
                 scope(

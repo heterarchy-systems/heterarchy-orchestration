@@ -938,5 +938,5 @@ fn barrier_matches_intent(
 }
 
 fn inconsistent(label: &'static str) -> RuntimeError {
-    RuntimeError::Persistence(OperationsError::Corrupt(label))
+    RuntimeError::persistence(OperationsError::Corrupt(label))
 }

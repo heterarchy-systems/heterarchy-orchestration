@@ -16,5 +16,12 @@ thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+agent-broker-application = { path = "../../../heterarchy-broker/crates/agent-broker-application" }
+agent-broker-client = { path = "../../../heterarchy-broker/crates/agent-broker-client", features = ["async"] }
+agent-broker-domain = { path = "../../../heterarchy-broker/crates/agent-broker-domain" }
+agent-broker-protocol = { path = "../../../heterarchy-broker/crates/agent-broker-protocol" }
+rcgen = "0.14.8"
+
 [lints]
 workspace = true

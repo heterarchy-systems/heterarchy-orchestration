@@ -302,7 +302,7 @@ impl OperationsCatalog {
             if verify_digest != p.digest {
                 return Err(OperationsError::Corrupt("import chain"));
             }
-            verify_counts(&tx, &p)?;
+            verify_verified_import_counts(&tx, &p)?;
         }
         let changed=tx.execute("UPDATE ops_imports SET verified_pages=?1,verify_digest=?2,phase=?3 WHERE migration_id=?4 AND phase=1 AND verified_pages=?5",params![signed(verified)?,verify_digest.as_slice(),if complete{2}else{1},page.migration_id().as_bytes(),signed(p.verified_pages)?])?;
         if changed != 1 {
@@ -390,6 +390,14 @@ impl OperationsCatalog {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let p =
             load_progress(&tx, migration)?.ok_or(OperationsError::Conflict("import missing"))?;
+        let handoff_sealed: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ops_import_handoff_seals WHERE migration_id=?1)",
+            params![migration.as_bytes()],
+            |row| row.get(0),
+        )?;
+        if handoff_sealed {
+            return Err(OperationsError::Conflict("import handoff sealed"));
+        }
         if expected.is_some_and(|value| value != &p) {
             return Err(OperationsError::Conflict("import progress changed"));
         }
@@ -680,7 +688,10 @@ fn read_page(c: &Connection, migration: Uuid, ordinal: u64) -> Result<SavedPage,
     })
 }
 
-fn verify_counts(c: &Connection, p: &ImportProgress) -> Result<(), OperationsError> {
+pub(crate) fn verify_verified_import_counts(
+    c: &Connection,
+    p: &ImportProgress,
+) -> Result<(), OperationsError> {
     let (pages, records): (i64, i64) = c.query_row(
         "SELECT COUNT(*),COALESCE(SUM(record_count),0) FROM ops_import_pages WHERE migration_id=?1",
         params![p.migration.as_bytes()],

@@ -135,7 +135,7 @@ fn id(bytes: Vec<u8>) -> Result<Uuid, OperationsError> {
     Ok(Uuid::from_bytes(crate::wire::id(bytes)?))
 }
 
-fn load(
+pub(crate) fn load(
     connection: &Connection,
     request_id: Uuid,
 ) -> Result<Option<RegistrationProfileScope>, OperationsError> {

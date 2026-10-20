@@ -4,7 +4,9 @@ use axum::extract::{Extension, Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use forge_domain::AuthenticatedPrincipal;
-use heterarchy_orchestration_runtime::provisioning::operations::ProvisionOperationFullSummary;
+use heterarchy_orchestration_runtime::provisioning::operations::{
+    ProvisionOperationFullSummary, ProvisionOperationUncertaintyRetirement,
+};
 use uuid::Uuid;
 
 use crate::app_support::{LaneError, validate_workspace_reference};
@@ -12,8 +14,12 @@ use crate::catalog_execution::CatalogLane;
 use crate::wire::WorkspaceQueryScope;
 use crate::wire::provisioning_operations::{
     ProvisionOperationCancelRequest, ProvisionOperationCancelResponse,
-    ProvisionOperationQueryRequest, ProvisionOperationQueryResponse, ProvisionOperationWire,
+    ProvisionOperationQueryRequest, ProvisionOperationQueryResponse,
+    ProvisionOperationUncertaintyRetirementRequest,
+    ProvisionOperationUncertaintyRetirementResponse, ProvisionOperationUncertaintyRetirementWire,
+    ProvisionOperationWire,
 };
+use crate::wire::workspace_project::ProviderProjectReferenceWire;
 use crate::{BackendState, RealtimeEventKind, ScopedMutationAuthority};
 
 pub(super) fn routes() -> Router<BackendState> {
@@ -25,6 +31,10 @@ pub(super) fn routes() -> Router<BackendState> {
         .route(
             "/internal/v1/workspaces/{workspace_id}/provision-operations/cancel",
             post(cancel),
+        )
+        .route(
+            "/internal/v1/workspaces/{workspace_id}/provision-operations/retire-unobserved",
+            post(retire_unobserved),
         )
 }
 
@@ -102,6 +112,63 @@ async fn cancel(
     }))
 }
 
+async fn retire_unobserved(
+    State(state): State<BackendState>,
+    Path(workspace): Path<String>,
+    Extension(principal): Extension<AuthenticatedPrincipal>,
+    Json(body): Json<ProvisionOperationUncertaintyRetirementRequest>,
+) -> Result<Json<ProvisionOperationUncertaintyRetirementResponse>, LaneError> {
+    validate_scope(&workspace, &body.scope, Some(body.session_id))?;
+    if body.retirement_id.is_nil()
+        || body.operation_id.is_nil()
+        || body.expected_revision == 0
+        || body.recovery_version != 1
+    {
+        return Err(LaneError::InvalidIdentity);
+    }
+    let scope = body.scope.clone();
+    let workspace_id = scope.workspace_id;
+    let publisher = state.clone();
+    let outcome = state
+        .run_workspace_reference_mutation(
+            body.scope,
+            body.session_id,
+            principal,
+            ScopedMutationAuthority::Operator,
+            CatalogLane::Control,
+            move |runtime, now| {
+                let outcome = runtime.retire_unobserved_provision_operation(
+                    ProvisionOperationUncertaintyRetirement {
+                        principal,
+                        workspace_id,
+                        requester_session_id: body.session_id,
+                        retirement_id: body.retirement_id,
+                        operation_id: body.operation_id,
+                        expected_unknown_revision: body.expected_revision,
+                        recovery_version: body.recovery_version,
+                        retired_at_ms: now,
+                    },
+                )?;
+                if outcome.changed {
+                    publisher.publish_state_changed(
+                        RealtimeEventKind::ProvisioningStateChanged,
+                        outcome.operation.operation_id,
+                        outcome.operation.revision,
+                        Some(workspace_id),
+                    );
+                }
+                Ok(outcome)
+            },
+        )
+        .await?;
+    Ok(Json(ProvisionOperationUncertaintyRetirementResponse {
+        scope,
+        operation: operation_wire(&outcome.operation),
+        retirement: ProvisionOperationUncertaintyRetirementWire::from(&outcome.retirement),
+        changed: outcome.changed,
+    }))
+}
+
 fn validate_scope(
     path: &str,
     scope: &WorkspaceQueryScope,
@@ -137,5 +204,10 @@ pub(super) fn operation_wire(value: &ProvisionOperationFullSummary) -> Provision
         prepared_at_ms: value.prepared_at_ms,
         updated_at_ms: value.updated_at_ms,
         revision: value.revision,
+        uncertainty_retirement: value
+            .uncertainty_retirement
+            .as_ref()
+            .map(ProvisionOperationUncertaintyRetirementWire::from),
+        project: value.project.map(ProviderProjectReferenceWire::from),
     }
 }

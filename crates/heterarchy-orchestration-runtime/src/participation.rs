@@ -86,7 +86,7 @@ impl OrchestrationRuntime {
                 revision,
                 now,
             ))
-            .map_err(RuntimeError::Persistence)
+            .map_err(RuntimeError::persistence)
     }
     /// Read current nullable presence without synthesizing or touching a row.
     /// # Errors
@@ -99,7 +99,7 @@ impl OrchestrationRuntime {
         self.require_participation(target, principal)?;
         self.catalog()?
             .logical_presence(target.presence(), principal)
-            .map_err(RuntimeError::Persistence)
+            .map_err(RuntimeError::persistence)
     }
     /// List bounded existing receipts without acknowledging them.
     /// # Errors
@@ -113,7 +113,7 @@ impl OrchestrationRuntime {
         self.require_participation(target, principal)?;
         self.catalog()?
             .list_logical_inbox(LogicalInboxQuery::new(target.inbox(), principal, limit))
-            .map_err(RuntimeError::Persistence)
+            .map_err(RuntimeError::persistence)
     }
     /// Acknowledge one receipt at the exact CAS; a repeated ACK remains a conflict.
     /// # Errors
@@ -141,7 +141,7 @@ impl OrchestrationRuntime {
                 revision,
                 now,
             ))
-            .map_err(RuntimeError::Persistence)
+            .map_err(RuntimeError::persistence)
     }
     /// Read one exact event receipt after an uncertain ACK without retrying it.
     /// # Errors
@@ -158,6 +158,6 @@ impl OrchestrationRuntime {
         }
         self.catalog()?
             .logical_inbox_entry(target.inbox(), principal, event_id)
-            .map_err(RuntimeError::Persistence)
+            .map_err(RuntimeError::persistence)
     }
 }

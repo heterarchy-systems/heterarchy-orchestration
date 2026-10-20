@@ -229,19 +229,9 @@ async fn election_snapshot(
                 .map(|summary| (summary.workspace_id, summary)))
         })
         .await?;
-    Ok(Json(summary.map(|summary| ElectionSnapshotWire {
-        election_id: summary.election_id,
-        workspace_id: summary.workspace_id,
-        team_id: summary.team_id,
-        candidate_participant_id: summary.candidate_participant_id,
-        subject_kind: summary.subject_kind,
-        subject_id: summary.subject_id,
-        source_participant_count: summary.source_participant_count,
-        window_ms: summary.window_ms,
-        evaluated_at_ms: summary.evaluated_at_ms,
-        candidate_total_credits: summary.candidate_total_credits,
-        workspace_total_credits: summary.workspace_total_credits,
-    })))
+    Ok(Json(
+        summary.as_ref().map(ElectionSnapshotWire::from_summary),
+    ))
 }
 
 fn canonical_uuid(value: Option<&str>) -> Result<Uuid, LaneError> {
@@ -344,6 +334,46 @@ struct ElectionSnapshotWire {
     evaluated_at_ms: i64,
     candidate_total_credits: i64,
     workspace_total_credits: i64,
+    workspace_arithmetic_mean: i64,
+    mean_remainder_numerator: i64,
+    mean_subject_count: i64,
+    qualified: bool,
+    snapshot_digest: String,
+}
+
+impl ElectionSnapshotWire {
+    fn from_summary(
+        summary: &heterarchy_orchestration_runtime::work_credit::ElectionSnapshotSummary,
+    ) -> Self {
+        Self {
+            election_id: summary.election_id,
+            workspace_id: summary.workspace_id,
+            team_id: summary.team_id,
+            candidate_participant_id: summary.candidate_participant_id,
+            subject_kind: summary.subject_kind,
+            subject_id: summary.subject_id,
+            source_participant_count: summary.source_participant_count,
+            window_ms: summary.window_ms,
+            evaluated_at_ms: summary.evaluated_at_ms,
+            candidate_total_credits: summary.candidate_total_credits,
+            workspace_total_credits: summary.workspace_total_credits,
+            workspace_arithmetic_mean: summary.workspace_arithmetic_mean,
+            mean_remainder_numerator: summary.mean_remainder_numerator,
+            mean_subject_count: summary.mean_subject_count,
+            qualified: summary.qualified,
+            snapshot_digest: encode_snapshot_digest(&summary.snapshot_digest),
+        }
+    }
+}
+
+fn encode_snapshot_digest(digest: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 impl SnapshotWire {
@@ -441,5 +471,46 @@ fn subject_identity_wire(
         profile_id: subject.profile_id,
         legacy_participant_id: subject.legacy_participant_id,
         participation_revision: subject.participation_revision,
+    }
+}
+
+#[cfg(test)]
+mod election_snapshot_tests {
+    use super::ElectionSnapshotWire;
+    use heterarchy_orchestration_runtime::work_credit::ElectionSnapshotSummary;
+    use uuid::Uuid;
+
+    #[test]
+    fn election_wire_preserves_frozen_qualification_arithmetic_and_digest()
+    -> Result<(), serde_json::Error> {
+        for qualified in [false, true] {
+            let summary = ElectionSnapshotSummary {
+                election_id: Uuid::from_u128(1),
+                workspace_id: Uuid::from_u128(2),
+                team_id: None,
+                candidate_participant_id: Uuid::from_u128(3),
+                subject_kind: "workspace_participation",
+                subject_id: Uuid::from_u128(4),
+                source_participant_count: 2,
+                window_ms: 60_000,
+                evaluated_at_ms: 42,
+                candidate_total_credits: 8,
+                workspace_total_credits: 20,
+                workspace_arithmetic_mean: 6,
+                mean_remainder_numerator: 2,
+                mean_subject_count: 3,
+                qualified,
+                snapshot_digest: [0xab; 32],
+            };
+            let wire = serde_json::to_value(ElectionSnapshotWire::from_summary(&summary))?;
+            assert_eq!(wire["qualified"], qualified);
+            assert_eq!(wire["workspaceArithmeticMean"], 6);
+            assert_eq!(wire["meanRemainderNumerator"], 2);
+            assert_eq!(wire["meanSubjectCount"], 3);
+            assert_eq!(wire["snapshotDigest"], "ab".repeat(32));
+            assert!(wire["teamId"].is_null());
+            assert_eq!(wire["electionId"], Uuid::from_u128(1).to_string());
+        }
+        Ok(())
     }
 }

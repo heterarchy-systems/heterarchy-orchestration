@@ -242,7 +242,7 @@ impl OrchestrationRuntime {
         let request_id = require_identity(spec.request_id)?;
         let team_id = require_identity(spec.team_id)?;
         if !(2..=64).contains(&spec.initial_members.len()) {
-            return Err(RuntimeError::Persistence(OperationsError::Bounds(
+            return Err(RuntimeError::persistence(OperationsError::Bounds(
                 "team initial roster",
             )));
         }
@@ -280,7 +280,7 @@ impl OrchestrationRuntime {
         let mut catalog = self.catalog()?;
         catalog
             .create_team(command)
-            .map_err(RuntimeError::Persistence)
+            .map_err(RuntimeError::persistence)
     }
 
     /// Join the caller's logical participant to one exact Team revision.
@@ -314,7 +314,7 @@ impl OrchestrationRuntime {
         let mut catalog = self.catalog()?;
         catalog
             .join_team(command)
-            .map_err(RuntimeError::Persistence)
+            .map_err(RuntimeError::persistence)
     }
 
     /// Leave one Team while retaining the membership audit trail.
@@ -345,7 +345,7 @@ impl OrchestrationRuntime {
         let mut catalog = self.catalog()?;
         catalog
             .leave_team(command)
-            .map_err(RuntimeError::Persistence)
+            .map_err(RuntimeError::persistence)
     }
 
     /// Retire one Team through the trusted local operator boundary.
@@ -379,7 +379,7 @@ impl OrchestrationRuntime {
         let mut catalog = self.catalog()?;
         catalog
             .retire_team(command)
-            .map_err(RuntimeError::Persistence)
+            .map_err(RuntimeError::persistence)
     }
 
     /// Read one exact durable Team mutation receipt, including legacy
@@ -401,7 +401,7 @@ impl OrchestrationRuntime {
                 require_identity(team_id)?,
                 require_identity(request_id)?,
             )
-            .map_err(RuntimeError::Persistence)
+            .map_err(RuntimeError::persistence)
     }
 
     /// Read a bounded page of one Team's logical memberships.

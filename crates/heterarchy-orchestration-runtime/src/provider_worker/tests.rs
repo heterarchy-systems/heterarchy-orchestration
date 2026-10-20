@@ -15,6 +15,7 @@ use super::{OrchestrationRuntime, RuntimeError};
 use crate::provisioning::AgentRequestSubmit;
 
 const OPERATOR: AuthenticatedPrincipal = AuthenticatedPrincipal::TrustedStdio;
+const TEST_PROJECT_ID: &str = "g-p-6ad231f7ad7c8191bfc1d5ff782c171f";
 
 struct ProvisionFixture {
     root: PathBuf,
@@ -27,6 +28,11 @@ impl ProvisionFixture {
         let root = std::env::temp_dir().join(format!("provider-worker-flow-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&root)?;
         let runtime = OrchestrationRuntime::open(&root)?;
+        crate::test_support::ensure_workspace_project_binding(
+            &runtime,
+            Uuid::from_u128(0xA101),
+            1,
+        )?;
         let request_id = Uuid::from_u128(0xA105);
         runtime.submit_agent_request(AgentRequestSubmit {
             workspace_id: Uuid::from_u128(0xA101),
@@ -72,6 +78,24 @@ impl ProvisionFixture {
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
+}
+
+fn confirm_provision(
+    fixture: &ProvisionFixture,
+    expected_revision: u64,
+    conversation_id: &str,
+    observed_at_ms: i64,
+) -> Result<AgentProvisionOperation, RuntimeError> {
+    fixture
+        .runtime
+        .provider_worker_confirm_provision_with_project(
+            OPERATOR,
+            fixture.operation_id,
+            expected_revision,
+            conversation_id,
+            Some(TEST_PROJECT_ID),
+            observed_at_ms,
+        )
 }
 
 fn runtime_session_snapshot(
@@ -160,13 +184,7 @@ fn assert_stale_confirmations_preserve_session(
         .checked_sub(1)
         .ok_or("Execute revision underflow")?;
     assert!(matches!(
-        fixture.runtime.provider_worker_confirm_provision(
-            OPERATOR,
-            fixture.operation_id,
-            stale_revision,
-            "conversation-exact",
-            11,
-        ),
+        confirm_provision(fixture, stale_revision, "conversation-exact", 11),
         Err(RuntimeError::Conflict)
     ));
     assert_eq!(
@@ -179,13 +197,7 @@ fn assert_stale_confirmations_preserve_session(
     // than the committed EffectPending timestamp. It must be rejected before
     // the Sessions catalog is changed.
     assert!(matches!(
-        fixture.runtime.provider_worker_confirm_provision(
-            OPERATOR,
-            fixture.operation_id,
-            execute_revision,
-            "conversation-exact",
-            9,
-        ),
+        confirm_provision(fixture, execute_revision, "conversation-exact", 9),
         Err(RuntimeError::Conflict)
     ));
     assert_eq!(
@@ -222,9 +234,30 @@ fn assert_unknown_inspect_and_confirmation_replay(
     assert_eq!(unknown_fence.operation_id(), fixture.operation_id);
     assert_eq!(unknown_fence.operation_revision(), unknown.revision());
 
-    let confirmed = fixture.runtime.provider_worker_confirm_provision(
-        OPERATOR,
-        fixture.operation_id,
+    let before_bad_confirmation = runtime_session_snapshot(&fixture.runtime, fixture.operation_id)?;
+    for observed_project in [None, Some("g-p-7ad231f7ad7c8191bfc1d5ff782c171f")] {
+        assert!(matches!(
+            fixture
+                .runtime
+                .provider_worker_confirm_provision_with_project(
+                    OPERATOR,
+                    fixture.operation_id,
+                    unknown_fence.operation_revision(),
+                    "conversation-exact",
+                    observed_project,
+                    14,
+                ),
+            Err(RuntimeError::Conflict)
+        ));
+        assert_eq!(
+            runtime_session_snapshot(&fixture.runtime, fixture.operation_id)?,
+            before_bad_confirmation,
+            "missing or mismatched Project evidence must not ready the Runtime"
+        );
+    }
+
+    let confirmed = confirm_provision(
+        fixture,
         unknown_fence.operation_revision(),
         "conversation-exact",
         14,
@@ -240,18 +273,16 @@ fn assert_unknown_inspect_and_confirmation_replay(
     assert_eq!(ready.2.as_deref(), Some("conversation-exact"));
 
     assert!(matches!(
-        fixture.runtime.provider_worker_confirm_provision(
-            OPERATOR,
-            fixture.operation_id,
+        confirm_provision(
+            fixture,
             unknown_fence.operation_revision(),
             "conversation-changed",
             15,
         ),
         Err(RuntimeError::Conflict)
     ));
-    let replay = fixture.runtime.provider_worker_confirm_provision(
-        OPERATOR,
-        fixture.operation_id,
+    let replay = confirm_provision(
+        fixture,
         unknown_fence.operation_revision(),
         "conversation-exact",
         15,

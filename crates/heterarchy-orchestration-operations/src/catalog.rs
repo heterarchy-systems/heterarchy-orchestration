@@ -2,10 +2,11 @@
 use crate::operational_messages;
 use crate::{
     OperationsError, activation, adoption, agent_provision, agent_request,
-    agent_request_resolution, approval, cursor, departure, effect_binding, effect_fact,
-    election_subject, events, inbox, leadership, members, membership, node_team, presence,
-    profile_deletion, provider_deletion, registration, replacement_registration,
+    agent_request_resolution, approval, binding_rejection, cursor, departure, effect_binding,
+    effect_fact, election_subject, events, inbox, leadership, members, membership, node_team,
+    presence, profile_deletion, provider_deletion, registration, replacement_registration,
     session_replacement, teams, wire, work_credit, work_credit_subject, workspace_participation,
+    workspace_project,
 };
 use forge_domain::WorkspaceId;
 use forge_persistence::{
@@ -17,7 +18,7 @@ use rusqlite::{
 use std::path::Path;
 use uuid::Uuid;
 const APPLICATION_ID: i64 = 0x484F_4F50;
-pub(crate) const VERSION: i64 = 43;
+pub(crate) const VERSION: i64 = 52;
 const IDENTITY_SQL: &str = "CREATE TABLE ops_catalog_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), destination_id BLOB NOT NULL UNIQUE CHECK(length(destination_id)=16))";
 const IMPORTS_SQL: &str = "CREATE TABLE ops_imports (migration_id BLOB PRIMARY KEY NOT NULL CHECK(length(migration_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), destination_id BLOB NOT NULL CHECK(length(destination_id)=16), source_revision INTEGER NOT NULL CHECK(source_revision>=1), phase INTEGER NOT NULL CHECK(phase IN(0,1,2,3)), next_cursor BLOB CHECK(next_cursor IS NULL OR length(next_cursor) BETWEEN 1 AND 512), page_count INTEGER NOT NULL CHECK(page_count>=0), record_count INTEGER NOT NULL CHECK(record_count>=0), import_digest BLOB NOT NULL CHECK(length(import_digest)=32), verified_pages INTEGER NOT NULL CHECK(verified_pages BETWEEN 0 AND page_count), verify_digest BLOB NOT NULL CHECK(length(verify_digest)=32), FOREIGN KEY(destination_id) REFERENCES ops_catalog_identity(destination_id), CHECK(phase NOT IN(1,2) OR page_count>=5), CHECK((phase=0 AND next_cursor IS NOT NULL) OR (phase IN(1,2) AND next_cursor IS NULL) OR phase=3), CHECK(phase!=2 OR (verified_pages=page_count AND import_digest=verify_digest)))";
 const IMPORT_INDEX: &str = "CREATE UNIQUE INDEX ops_imports_workspace_owner_idx ON ops_imports(workspace_id) WHERE phase!=3";
@@ -326,6 +327,15 @@ fn validate_catalog_schema_version(
         40 => validate_schema_v40(connection),
         41 => validate_schema_v41(connection),
         42 => validate_schema_v42(connection),
+        43 => validate_schema_v43(connection),
+        44 => validate_schema_v44(connection),
+        45 => validate_schema_v45(connection),
+        46 => validate_schema_v46(connection),
+        47 => validate_schema_v47(connection),
+        48 => validate_schema_v48(connection),
+        49 => validate_schema_v49(connection),
+        50 => validate_schema_v50(connection),
+        51 => validate_schema_v51(connection),
         VERSION => validate_schema(connection),
         _ => Err(OperationsError::Conflict("foreign catalog")),
     }
@@ -374,6 +384,7 @@ fn initialize_catalog(
             registration::create_schema(&tx)?;
             membership::create_schema(&tx)?;
             activation::create_schema(&tx)?;
+            binding_rejection::create_schema(&tx)?;
             presence::create_schema(&tx)?;
             inbox::create_schema(&tx)?;
             effect_binding::create_schema(&tx)?;
@@ -393,9 +404,16 @@ fn initialize_catalog(
             agent_request_resolution::create_schema(&tx)?;
             agent_provision::create_schema(&tx)?;
             agent_provision::create_failure_schema(&tx)?;
+            agent_provision::create_uncertainty_retirement_schema(&tx)?;
+            agent_provision::create_project_route_schema(&tx)?;
+            workspace_project::create_schema(&tx)?;
+            workspace_project::create_enrollment_schema(&tx)?;
             agent_request::create_fulfillment_schema(&tx)?;
             teams::create_schema(&tx)?;
             operational_messages::create_schema(&tx)?;
+            operational_messages::create_project_route_schema(&tx)?;
+            operational_messages::create_unknown_isolation_schema(&tx)?;
+            crate::import_handoff::create_schema(&tx)?;
             crate::team_assignment::create_schema(&tx)?;
             node_team::create_schema(&tx)?;
             leadership::governance::create_schema(&tx)?;
@@ -501,7 +519,7 @@ fn create_legacy_schema_upgrade(tx: &Transaction<'_>, version: i64) -> Result<()
             effect_fact::create_assignment_submit_source_refs_schema(tx)?;
         }
         17 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32 | 33 | 34 | 35
-        | 36 | 37 | 38 | 39 | 40 | 41 | 42 => {}
+        | 36 | 37 | 38 | 39 | 40 | 41 | 42 | 43 | 44 | 45 | 46 | 47 | 48 | 49 | 50 | 51 => {}
         18 => {
             leadership::rebuild_receipts_v19(tx)?;
         }
@@ -580,6 +598,7 @@ fn create_schema_upgrade(tx: &Transaction<'_>, version: i64) -> Result<(), Opera
     if (31..=35).contains(&version) {
         operational_messages::migrate_v35_to_v36(tx)?;
     }
+    upgrade_workspace_message_author_schema(tx, version)?;
     if (32..=35).contains(&version) {
         crate::team_assignment::migrate_v35_to_v36(tx)?;
     }
@@ -604,8 +623,66 @@ fn create_schema_upgrade(tx: &Transaction<'_>, version: i64) -> Result<(), Opera
     if version <= 41 {
         leadership::work_roster::create_schema(tx)?;
     }
-    crate::approval_versions::create_schema(tx)?;
+    if version <= 42 {
+        crate::approval_versions::create_schema(tx)?;
+    }
+    upgrade_catalog_features(tx, version)?;
     tx.pragma_update(None, "user_version", VERSION)?;
+    Ok(())
+}
+
+fn upgrade_catalog_features(tx: &Transaction<'_>, version: i64) -> Result<(), OperationsError> {
+    upgrade_binding_rejection_schema(tx, version)?;
+    upgrade_uncertainty_retirement_schema(tx, version)?;
+    if (36..=47).contains(&version) {
+        crate::team_assignment::migrate_v47_to_v48(tx)?;
+    }
+    if version <= 48 {
+        workspace_project::create_schema(tx)?;
+        agent_provision::create_project_route_schema(tx)?;
+        operational_messages::create_project_route_schema(tx)?;
+    }
+    if version <= 49 {
+        workspace_project::create_enrollment_schema(tx)?;
+    }
+    if version <= 50 {
+        operational_messages::create_unknown_isolation_schema(tx)?;
+    }
+    if version <= 51 {
+        crate::import_handoff::create_schema(tx)?;
+    }
+    Ok(())
+}
+
+fn upgrade_workspace_message_author_schema(
+    tx: &Transaction<'_>,
+    version: i64,
+) -> Result<(), OperationsError> {
+    if (31..=46).contains(&version) {
+        operational_messages::migrate_v46_to_v47(tx)?;
+    }
+    Ok(())
+}
+
+fn upgrade_uncertainty_retirement_schema(
+    tx: &Transaction<'_>,
+    version: i64,
+) -> Result<(), OperationsError> {
+    if version <= 45 {
+        agent_provision::create_uncertainty_retirement_schema(tx)?;
+    }
+    Ok(())
+}
+
+fn upgrade_binding_rejection_schema(
+    tx: &Transaction<'_>,
+    version: i64,
+) -> Result<(), OperationsError> {
+    if version <= 43 {
+        binding_rejection::create_schema(tx)?;
+    } else if version == 44 {
+        binding_rejection::create_resolution_schema(tx)?;
+    }
     Ok(())
 }
 
@@ -819,8 +896,8 @@ fn validate_schema_v35(c: &Connection) -> Result<(), OperationsError> {
 fn schema_v36_objects() -> Vec<(&'static str, &'static str, String)> {
     let mut objects = schema_v35_objects();
     for replacements in [
-        operational_messages::schema_objects(),
-        crate::team_assignment::schema_objects(),
+        operational_messages::schema_objects_v46(),
+        crate::team_assignment::schema_objects_v47(),
         node_team::schema_objects(),
     ] {
         for (kind, name, sql) in replacements {
@@ -898,10 +975,128 @@ fn validate_schema_v42(c: &Connection) -> Result<(), OperationsError> {
     validate_exact_schema_objects(c, &schema_v42_objects())
 }
 
-fn validate_schema(c: &Connection) -> Result<(), OperationsError> {
+fn schema_v43_objects() -> Vec<(&'static str, &'static str, String)> {
     let mut objects = schema_v42_objects();
     extend_owned(&mut objects, crate::approval_versions::schema_objects());
-    validate_exact_schema_objects(c, &objects)
+    objects
+}
+
+fn validate_schema_v43(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v43_objects())
+}
+
+fn validate_schema(c: &Connection) -> Result<(), OperationsError> {
+    validate_schema_v52(c)
+}
+
+fn schema_v52_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v51_objects();
+    extend_owned(&mut objects, crate::import_handoff::schema_objects());
+    objects
+}
+
+fn validate_schema_v52(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v52_objects())
+}
+
+fn schema_v47_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v46_objects();
+    for (kind, name, sql) in operational_messages::schema_objects() {
+        objects.retain(|(old_kind, old_name, _)| *old_kind != kind || *old_name != name);
+        objects.push((kind, name, sql.to_owned()));
+    }
+    objects
+}
+
+fn validate_schema_v47(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v47_objects())
+}
+
+fn schema_v48_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v47_objects();
+    for (kind, name, sql) in crate::team_assignment::schema_objects() {
+        objects.retain(|(old_kind, old_name, _)| *old_kind != kind || *old_name != name);
+        objects.push((kind, name, sql.to_owned()));
+    }
+    objects
+}
+
+fn validate_schema_v48(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v48_objects())
+}
+
+fn schema_v49_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v48_objects();
+    extend_owned(&mut objects, workspace_project::schema_objects());
+    extend_owned(
+        &mut objects,
+        agent_provision::project_route_schema_objects(),
+    );
+    extend_owned(
+        &mut objects,
+        operational_messages::project_route_schema_objects(),
+    );
+    objects
+}
+
+fn validate_schema_v49(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v49_objects())
+}
+
+fn schema_v50_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v49_objects();
+    extend_owned(&mut objects, workspace_project::enrollment_schema_objects());
+    objects
+}
+
+fn validate_schema_v50(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v50_objects())
+}
+
+fn schema_v51_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v50_objects();
+    extend_owned(
+        &mut objects,
+        operational_messages::unknown_isolation_schema_objects(),
+    );
+    objects
+}
+
+fn validate_schema_v51(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v51_objects())
+}
+
+fn schema_v46_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v45_objects();
+    extend_owned(
+        &mut objects,
+        agent_provision::uncertainty_retirement_schema_objects(),
+    );
+    objects
+}
+
+fn validate_schema_v46(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v46_objects())
+}
+
+fn schema_v45_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v44_objects();
+    extend_owned(&mut objects, vec![binding_rejection::schema_objects()[2]]);
+    objects
+}
+
+fn validate_schema_v45(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v45_objects())
+}
+
+fn schema_v44_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v43_objects();
+    extend_owned(&mut objects, binding_rejection::schema_objects_v44());
+    objects
+}
+
+fn validate_schema_v44(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v44_objects())
 }
 
 fn validate_schema_v31(c: &Connection) -> Result<(), OperationsError> {
@@ -1770,6 +1965,9 @@ pub(crate) fn assert_fixture_table_schema(
 pub(crate) fn restore_v34_shapes_for_legacy_fixture(
     connection: &Connection,
 ) -> Result<(), OperationsError> {
+    drop_v49_project_schema_for_legacy_fixture(connection)?;
+    connection.execute_batch("DROP TABLE IF EXISTS ops_agent_provision_uncertainty_retirements")?;
+    crate::binding_rejection::drop_schema_for_legacy_fixture(connection)?;
     connection.execute_batch("DROP TABLE IF EXISTS ops_approval_request_versions")?;
     leadership::work_roster::drop_schema_for_legacy_fixture(connection)?;
     connection.execute_batch("DROP TABLE IF EXISTS ops_registration_profile_scopes; DROP TABLE IF EXISTS ops_leadership_work_exchanges")?;
@@ -1782,6 +1980,57 @@ pub(crate) fn restore_v34_shapes_for_legacy_fixture(
     restore_fixture_table_shapes(connection, node_team::schema_objects_v35())?;
     connection.execute_batch("DROP TABLE IF EXISTS ops_election_team_leader_sources")?;
     restore_fixture_table_shapes(connection, election_subject::schema_objects_v34())
+}
+
+/// Remove post-v48 Project, UNKNOWN-isolation, and handoff-seal schemas from a
+/// newer test fixture before restamping it as a historical catalog. Production
+/// migrations never call this helper; durable receipts prevent fixture downgrade.
+#[cfg(test)]
+pub(crate) fn drop_v49_project_schema_for_legacy_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    crate::import_handoff::drop_schema_for_legacy_fixture(connection)?;
+    drop_v51_unknown_isolation_schema_for_legacy_fixture(connection)?;
+    workspace_project::drop_enrollment_schema_for_legacy_fixture(connection)?;
+    connection.execute_batch(
+        "DROP TABLE IF EXISTS ops_provider_message_project_receipts;
+         DROP TABLE IF EXISTS ops_provider_message_project_routes;
+         DROP TABLE IF EXISTS ops_agent_provision_project_routes;
+         DROP TABLE IF EXISTS ops_workspace_chatgpt_project_receipts;
+         DROP TABLE IF EXISTS ops_workspace_chatgpt_project_bindings;",
+    )?;
+    Ok(())
+}
+
+/// Remove only the empty v51 isolation journal from a historical test fixture.
+/// A receipt is durable evidence and must never be discarded by fixture setup.
+#[cfg(test)]
+pub(crate) fn drop_v51_unknown_isolation_schema_for_legacy_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    let has_table: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ops_provider_message_unknown_isolations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_table {
+        let receipt_count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM ops_provider_message_unknown_isolations",
+            [],
+            |row| row.get(0),
+        )?;
+        if receipt_count != 0 {
+            return Err(OperationsError::Conflict(
+                "legacy fixture contains UNKNOWN isolation receipts",
+            ));
+        }
+    }
+    connection.execute_batch(
+        "DROP TRIGGER IF EXISTS ops_provider_message_unknown_isolations_no_update;
+         DROP TRIGGER IF EXISTS ops_provider_message_unknown_isolations_no_delete;
+         DROP TABLE IF EXISTS ops_provider_message_unknown_isolations;",
+    )?;
+    Ok(())
 }
 
 /// Restore exact pre-DAG-base/pre-generation message and outbox shapes for fixtures.
@@ -1900,9 +2149,569 @@ fn restore_fixture_table_shapes(
     Ok(())
 }
 
+/// Restore the v46 message table before a legacy migration test lowers the
+/// catalog version from a current v48 fixture. Production migrations never
+/// downgrade a catalog.
+#[cfg(test)]
+pub(crate) fn restore_v46_message_schema_for_legacy_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    drop_v49_project_schema_for_legacy_fixture(connection)?;
+    let message_sql = operational_messages::schema_objects_v46()
+        .into_iter()
+        .find(|(_, name, _)| *name == "ops_workspace_messages")
+        .map(|(_, _, sql)| sql)
+        .ok_or(OperationsError::Corrupt("v46 message fixture schema"))?;
+    let explicit_objects = {
+        let mut statement = connection.prepare(
+            "SELECT sql FROM sqlite_schema WHERE tbl_name='ops_workspace_messages' AND type IN('index','trigger') AND sql IS NOT NULL ORDER BY type,name",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    connection.pragma_update(None, "foreign_keys", false)?;
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        connection.execute_batch(&message_sql.replace(
+            "CREATE TABLE ops_workspace_messages ",
+            "CREATE TABLE ops_workspace_messages_v46 ",
+        ))?;
+        connection.execute(
+            "INSERT INTO ops_workspace_messages_v46(message_id,workspace_id,channel_kind,channel_participation_id,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms,activity_id,goal_id,dag_revision,node_id,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_profile_id,provider_source_participation_id,provider_source_label,goal_created_at_ms,dag_base_goal_revision) SELECT message_id,workspace_id,channel_kind,channel_participation_id,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms,activity_id,goal_id,dag_revision,node_id,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_profile_id,provider_source_participation_id,provider_source_label,goal_created_at_ms,dag_base_goal_revision FROM ops_workspace_messages",
+            [],
+        )?;
+        connection.execute_batch(
+            "DROP TABLE ops_workspace_messages; ALTER TABLE ops_workspace_messages_v46 RENAME TO ops_workspace_messages;",
+        )?;
+        for sql in explicit_objects {
+            connection.execute_batch(&sql)?;
+        }
+        connection.execute_batch("COMMIT")?;
+        Ok::<_, OperationsError>(())
+    })();
+    if result.is_err() {
+        let _ = connection.execute_batch("ROLLBACK");
+    }
+    connection.pragma_update(None, "foreign_keys", true)?;
+    result?;
+    let foreign_key_violation: Option<String> = connection
+        .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+        .optional()?;
+    if foreign_key_violation.is_some() {
+        return Err(OperationsError::Corrupt("v46 fixture foreign key"));
+    }
+    Ok(())
+}
+
+/// Restore the v47 affinity table before a historical migration test lowers
+/// the catalog version from a current v48 fixture. All persisted columns and
+/// evidence bytes are copied verbatim. Production migrations never downgrade
+/// a catalog.
+#[cfg(test)]
+pub(crate) fn restore_v47_assignment_schema_for_legacy_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    drop_v49_project_schema_for_legacy_fixture(connection)?;
+    let table_sql = crate::team_assignment::schema_objects_v47()
+        .into_iter()
+        .find(|(_, name, _)| *name == "ops_assignment_team_affinities")
+        .map(|(_, _, sql)| sql)
+        .ok_or(OperationsError::Corrupt("v47 assignment fixture schema"))?;
+    let explicit_objects = {
+        let mut statement = connection.prepare(
+            "SELECT sql FROM sqlite_schema WHERE tbl_name='ops_assignment_team_affinities' AND type IN('index','trigger') AND sql IS NOT NULL ORDER BY type,name",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    connection.pragma_update(None, "foreign_keys", false)?;
+    connection.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| {
+        connection.execute_batch(&table_sql.replace(
+            "CREATE TABLE ops_assignment_team_affinities ",
+            "CREATE TABLE ops_assignment_team_affinities_v47 ",
+        ))?;
+        let columns = {
+            let mut query =
+                connection.prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?;
+            query
+                .query_map(["ops_assignment_team_affinities_v47"], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let columns = columns
+            .iter()
+            .map(|column| format!("\"{column}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        connection.execute(
+            &format!(
+                "INSERT INTO ops_assignment_team_affinities_v47({columns}) SELECT {columns} FROM ops_assignment_team_affinities"
+            ),
+            [],
+        )?;
+        connection.execute_batch(
+            "DROP TABLE ops_assignment_team_affinities;
+             ALTER TABLE ops_assignment_team_affinities_v47 RENAME TO ops_assignment_team_affinities;",
+        )?;
+        for sql in explicit_objects {
+            connection.execute_batch(&sql)?;
+        }
+        connection.execute_batch("COMMIT")?;
+        Ok::<_, OperationsError>(())
+    })();
+    if result.is_err() {
+        let _ = connection.execute_batch("ROLLBACK");
+    }
+    connection.pragma_update(None, "foreign_keys", true)?;
+    result?;
+    let foreign_key_violation: Option<String> = connection
+        .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
+        .optional()?;
+    if foreign_key_violation.is_some() {
+        return Err(OperationsError::Corrupt("v47 fixture foreign key"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type CatalogTableSnapshot = Vec<Vec<rusqlite::types::Value>>;
+    type ForeignKeySnapshotRow = (i64, String, String, String, String);
+    type ForeignKeySnapshot = Vec<ForeignKeySnapshotRow>;
+    type V46NativeAuthorShape = (
+        i64,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    );
+
+    #[derive(Clone, Copy)]
+    enum V46MessageCorruption {
+        InvalidLegacyAuthorShape,
+        UnsupportedFutureNativeAuthor,
+    }
+
+    fn create_v46_message_migration_fixture(
+        path: &Path,
+        destination: Uuid,
+        corruption: Option<V46MessageCorruption>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let old = Connection::open(path)?;
+        for (_, _, sql) in schema_v46_objects() {
+            old.execute_batch(&sql)?;
+        }
+        old.pragma_update(None, "foreign_keys", true)?;
+
+        let workspace = Uuid::from_u128(0xA471);
+        let profile = Uuid::from_u128(0xA472);
+        let participation = Uuid::from_u128(0xA473);
+        let session = Uuid::from_u128(0xA474);
+        let participant = Uuid::from_u128(0xA475);
+        let operator_message = Uuid::from_u128(0xA480);
+        let participant_message = Uuid::from_u128(0xA481);
+        let system_message = Uuid::from_u128(0xA482);
+        let provider_message = Uuid::from_u128(0xA483);
+        let outbox_message = Uuid::from_u128(0xA484);
+        let election = Uuid::from_u128(0xA490);
+        let request = Uuid::from_u128(0xA491);
+        let migration = Uuid::from_u128(0xA496);
+
+        old.execute(
+            "INSERT INTO ops_catalog_identity(singleton,destination_id) VALUES(1,?1)",
+            params![destination.as_bytes()],
+        )?;
+        old.pragma_update(None, "application_id", APPLICATION_ID)?;
+        old.pragma_update(None, "user_version", 46_i64)?;
+        old.execute(
+            "INSERT INTO ops_imports(migration_id,workspace_id,destination_id,source_revision,phase,next_cursor,page_count,record_count,import_digest,verified_pages,verify_digest) VALUES(?1,?2,?3,1,2,NULL,5,5,?4,5,?4)",
+            params![migration.as_bytes(), workspace.as_bytes(), destination.as_bytes(), [0xA4_u8; 32].as_slice()],
+        )?;
+        old.execute(
+            "INSERT INTO ops_workspace_participations(workspace_id,agent_profile_id,participation_id,created_at_ms,revision) VALUES(?1,?2,?3,10,1)",
+            params![workspace.as_bytes(), profile.as_bytes(), participation.as_bytes()],
+        )?;
+        old.execute(
+            "INSERT INTO ops_workspace_messages(message_id,workspace_id,channel_kind,author_kind,author_display_name,origin_kind,body,sequence,submitted_at_ms) VALUES(?1,?2,0,0,'Local operator',0,'Preserved operator message',1,10)",
+            params![operator_message.as_bytes(), workspace.as_bytes()],
+        )?;
+        old.execute(
+            "INSERT INTO ops_workspace_messages(message_id,workspace_id,channel_kind,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms) VALUES(?1,?2,0,1,?3,?4,?5,?6,'Profile participant',0,'Preserved participant message',2,20)",
+            params![participant_message.as_bytes(), workspace.as_bytes(), participation.as_bytes(), profile.as_bytes(), participant.as_bytes(), session.as_bytes()],
+        )?;
+        old.execute(
+            "INSERT INTO ops_workspace_messages(message_id,workspace_id,channel_kind,author_kind,author_display_name,origin_kind,body,sequence,submitted_at_ms) VALUES(?1,?2,0,3,'System',0,'Preserved system message',3,30)",
+            params![system_message.as_bytes(), workspace.as_bytes()],
+        )?;
+        old.execute(
+            "INSERT INTO ops_workspace_messages(message_id,workspace_id,channel_kind,author_kind,author_display_name,origin_kind,body,sequence,submitted_at_ms,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_label) VALUES(?1,?2,0,2,'Provider',1,'Preserved provider message',4,40,'migration-conversation','migration-turn',1,'Provider')",
+            params![provider_message.as_bytes(), workspace.as_bytes()],
+        )?;
+        if corruption.is_some() {
+            old.pragma_update(None, "ignore_check_constraints", true)?;
+        }
+        let (author_kind, author_participant_id, author_session_id) = match corruption {
+            Some(V46MessageCorruption::InvalidLegacyAuthorShape) => {
+                (0, Some(participant.as_bytes()), None)
+            }
+            Some(V46MessageCorruption::UnsupportedFutureNativeAuthor) => {
+                (4, Some(participant.as_bytes()), Some(session.as_bytes()))
+            }
+            None => (0, None, None),
+        };
+        old.execute(
+            "INSERT INTO ops_workspace_messages(message_id,workspace_id,channel_kind,author_kind,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms) VALUES(?1,?2,0,?3,?4,?5,'Broken fixture',0,'Will force migration rollback',5,50)",
+            params![outbox_message.as_bytes(), workspace.as_bytes(), author_kind, author_participant_id, author_session_id],
+        )?;
+        if corruption.is_some() {
+            old.pragma_update(None, "ignore_check_constraints", false)?;
+        }
+        old.execute(
+            "INSERT INTO ops_provider_message_routes(provider_family,runtime_session_id,provider_conversation_id,workspace_id,recipient_profile_id,recipient_participation_id,created_at_ms) VALUES(1,?1,'outbox-conversation',?2,?3,?4,50)",
+            params![session.as_bytes(), workspace.as_bytes(), profile.as_bytes(), participation.as_bytes()],
+        )?;
+        let witness = br#"{"version":1,"operation_id":"00000000-0000-4000-8000-00000000a492","participation_revision":1,"runtime_revision":1,"sender_leadership_revision":null,"sender":{"kind":"operator"},"target":{"kind":"agent","assignment_id":"00000000-0000-4000-8000-00000000a493","assignment_revision":1,"agent_id":"00000000-0000-4000-8000-00000000a494","session_id":"00000000-0000-4000-8000-00000000a495"}}"#;
+        old.execute(
+            "INSERT INTO ops_provider_message_outbox(message_id,workspace_id,recipient_profile_id,recipient_participation_id,provider_family,runtime_session_id,provider_conversation_id,state,queued_at_ms,last_dispatch_at_ms,updated_at_ms,revision,provider_turn_id,provider_body,node_route_witness) VALUES(?1,?2,?3,?4,1,?5,'outbox-conversation',1,50,0,50,1,NULL,NULL,?6)",
+            params![outbox_message.as_bytes(), workspace.as_bytes(), profile.as_bytes(), participation.as_bytes(), session.as_bytes(), witness.as_slice()],
+        )?;
+        old.execute(
+            "INSERT INTO ops_leadership_elections(election_id,workspace_id,scope_kind,kind,state,candidate_participant_id,ballot_deadline_ms,created_at_ms,closed_at_ms) VALUES(?1,?2,0,'RECALL','CANCELLED',?3,100,10,20)",
+            params![election.as_bytes(), workspace.as_bytes(), participant.as_bytes()],
+        )?;
+        old.execute(
+            "INSERT INTO ops_leadership_reviews(request_id,election_id,workspace_id,scope_kind,expected_leadership_revision,proposer_kind,proposer_display_name,reason,defense_deadline_ms,discussion_deadline_ms,ballot_deadline_ms,created_at_ms) VALUES(?1,?2,?3,0,1,0,'Local operator','Migration preservation fixture',100,200,300,10)",
+            params![request.as_bytes(), election.as_bytes(), workspace.as_bytes()],
+        )?;
+        old.execute(
+            "INSERT INTO ops_governance_invitations(request_id,election_id,workspace_id,phase,recipient_participation_id,message_id,deadline_ms,queued_at_ms) VALUES(?1,?2,?3,'DEFENSE',?4,?5,100,50)",
+            params![request.as_bytes(), election.as_bytes(), workspace.as_bytes(), participation.as_bytes(), operator_message.as_bytes()],
+        )?;
+        old.pragma_update(None, "foreign_keys", true)?;
+        old.pragma_update(None, "application_id", APPLICATION_ID)?;
+        validate_schema_v46(&old)?;
+        Ok(())
+    }
+
+    fn snapshot_table(
+        connection: &Connection,
+        table: &str,
+        order_by: &str,
+    ) -> Result<CatalogTableSnapshot, Box<dyn std::error::Error>> {
+        let mut statement =
+            connection.prepare(&format!("SELECT * FROM {table} ORDER BY {order_by}"))?;
+        let column_count = statement.column_count();
+        Ok(statement
+            .query_map([], |row| {
+                (0..column_count)
+                    .map(|index| row.get(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    #[test]
+    fn v46_native_author_migration_preserves_legacy_messages_and_child_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("operations-v46-messages-{}", Uuid::now_v7()));
+        std::fs::create_dir(&root)?;
+        let path = root.join("operations.sqlite3");
+        let destination = Uuid::from_u128(0xA470);
+        create_v46_message_migration_fixture(&path, destination, None)?;
+
+        let old = Connection::open(&path)?;
+        let messages = snapshot_table(&old, "ops_workspace_messages", "message_id")?;
+        let outbox = snapshot_table(&old, "ops_provider_message_outbox", "message_id")?;
+        let invitations = snapshot_table(&old, "ops_governance_invitations", "message_id")?;
+        let witness: Vec<u8> = old.query_row(
+            "SELECT node_route_witness FROM ops_provider_message_outbox WHERE message_id=?1",
+            params![Uuid::from_u128(0xA484).as_bytes()],
+            |row| row.get(0),
+        )?;
+        let outbox_foreign_keys = snapshot_foreign_keys(&old, "ops_provider_message_outbox")?;
+        let invitation_foreign_keys = snapshot_foreign_keys(&old, "ops_governance_invitations")?;
+        drop(old);
+
+        let upgraded = OperationsCatalog::open(&path, destination)?;
+        assert_v46_migration_preserved(
+            &upgraded,
+            &messages,
+            &outbox,
+            &invitations,
+            &witness,
+            &outbox_foreign_keys,
+            &invitation_foreign_keys,
+        )?;
+        drop(upgraded);
+        let reopened = OperationsCatalog::open(&path, destination)?;
+        validate_schema(&reopened.connection)?;
+        drop(reopened);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_v46_native_author_migration_rolls_back_and_reopens_after_repair()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("operations-v46-rollback-{}", Uuid::now_v7()));
+        std::fs::create_dir(&root)?;
+        let path = root.join("operations.sqlite3");
+        let destination = Uuid::from_u128(0xA470);
+        create_v46_message_migration_fixture(
+            &path,
+            destination,
+            Some(V46MessageCorruption::InvalidLegacyAuthorShape),
+        )?;
+
+        assert!(OperationsCatalog::open(&path, destination).is_err());
+        let raw = Connection::open(&path)?;
+        assert_eq!(
+            raw.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))?,
+            46
+        );
+        validate_schema_v46(&raw)?;
+        assert_eq!(
+            raw.query_row(
+                "SELECT author_participant_id FROM ops_workspace_messages WHERE message_id=?1",
+                params![Uuid::from_u128(0xA484).as_bytes()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?,
+            Uuid::from_u128(0xA475).as_bytes()
+        );
+        raw.execute(
+            "UPDATE ops_workspace_messages SET author_participant_id=NULL WHERE message_id=?1",
+            params![Uuid::from_u128(0xA484).as_bytes()],
+        )?;
+        drop(raw);
+
+        let repaired = OperationsCatalog::open(&path, destination)?;
+        assert_eq!(
+            repaired
+                .connection
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))?,
+            VERSION
+        );
+        validate_schema(&repaired.connection)?;
+        assert!(
+            repaired
+                .workspace_message(Uuid::from_u128(0xA484))?
+                .is_some()
+        );
+        drop(repaired);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn v46_migration_rejects_native_author_kind_without_changing_the_catalog()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "operations-v46-native-kind-rollback-{}",
+            Uuid::now_v7()
+        ));
+        std::fs::create_dir(&root)?;
+        let path = root.join("operations.sqlite3");
+        let destination = Uuid::from_u128(0xA470);
+        create_v46_message_migration_fixture(
+            &path,
+            destination,
+            Some(V46MessageCorruption::UnsupportedFutureNativeAuthor),
+        )?;
+
+        let raw = Connection::open(&path)?;
+        let native_shape: V46NativeAuthorShape = raw.query_row(
+                "SELECT author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id FROM ops_workspace_messages WHERE message_id=?1",
+                params![Uuid::from_u128(0xA484).as_bytes()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )?;
+        assert_eq!(native_shape.0, 4);
+        assert_eq!(native_shape.1, None);
+        assert_eq!(native_shape.2, None);
+        assert_eq!(
+            native_shape.3,
+            Some(Uuid::from_u128(0xA475).as_bytes().to_vec())
+        );
+        assert_eq!(
+            native_shape.4,
+            Some(Uuid::from_u128(0xA474).as_bytes().to_vec())
+        );
+        let messages = snapshot_table(&raw, "ops_workspace_messages", "message_id")?;
+        let outbox = snapshot_table(&raw, "ops_provider_message_outbox", "message_id")?;
+        let routes = snapshot_table(&raw, "ops_provider_message_routes", "provider_family")?;
+        let invitations = snapshot_table(&raw, "ops_governance_invitations", "message_id")?;
+        let outbox_foreign_keys = snapshot_foreign_keys(&raw, "ops_provider_message_outbox")?;
+        let invitation_foreign_keys = snapshot_foreign_keys(&raw, "ops_governance_invitations")?;
+        drop(raw);
+
+        let Some(error) = OperationsCatalog::open(&path, destination).err() else {
+            std::fs::remove_dir_all(&root)?;
+            return Err("v46 migration accepted a future Native author kind".into());
+        };
+        assert!(matches!(error, OperationsError::Corrupt(_)));
+
+        let raw = Connection::open(&path)?;
+        assert_eq!(
+            raw.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))?,
+            46
+        );
+        validate_schema_v46(&raw)?;
+        assert_eq!(
+            snapshot_table(&raw, "ops_workspace_messages", "message_id")?,
+            messages
+        );
+        assert_eq!(
+            snapshot_table(&raw, "ops_provider_message_outbox", "message_id")?,
+            outbox
+        );
+        assert_eq!(
+            snapshot_table(&raw, "ops_provider_message_routes", "provider_family")?,
+            routes
+        );
+        assert_eq!(
+            snapshot_table(&raw, "ops_governance_invitations", "message_id")?,
+            invitations
+        );
+        assert_eq!(
+            snapshot_foreign_keys(&raw, "ops_provider_message_outbox")?,
+            outbox_foreign_keys
+        );
+        assert_eq!(
+            snapshot_foreign_keys(&raw, "ops_governance_invitations")?,
+            invitation_foreign_keys
+        );
+        let mut foreign_key_check = raw.prepare("PRAGMA foreign_key_check")?;
+        assert!(foreign_key_check.query([])?.next()?.is_none());
+        drop(foreign_key_check);
+        drop(raw);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn snapshot_foreign_keys(
+        connection: &Connection,
+        table: &str,
+    ) -> Result<ForeignKeySnapshot, Box<dyn std::error::Error>> {
+        let mut statement = connection.prepare(&format!("PRAGMA foreign_key_list('{table}')"))?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn assert_v46_migration_preserved(
+        upgraded: &OperationsCatalog,
+        messages: &CatalogTableSnapshot,
+        outbox: &CatalogTableSnapshot,
+        invitations: &CatalogTableSnapshot,
+        witness: &[u8],
+        outbox_foreign_keys: &ForeignKeySnapshot,
+        invitation_foreign_keys: &ForeignKeySnapshot,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(messages.len(), 5);
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(invitations.len(), 1);
+        assert_eq!(
+            upgraded
+                .connection
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))?,
+            VERSION
+        );
+        assert_eq!(
+            &snapshot_table(&upgraded.connection, "ops_workspace_messages", "message_id")?,
+            messages
+        );
+        assert_eq!(
+            &snapshot_table(
+                &upgraded.connection,
+                "ops_provider_message_outbox",
+                "message_id"
+            )?,
+            outbox
+        );
+        assert_eq!(
+            &snapshot_table(
+                &upgraded.connection,
+                "ops_governance_invitations",
+                "message_id"
+            )?,
+            invitations
+        );
+        assert_eq!(
+            upgraded.connection.query_row(
+                "SELECT node_route_witness FROM ops_provider_message_outbox WHERE message_id=?1",
+                params![Uuid::from_u128(0xA484).as_bytes()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )?,
+            witness
+        );
+        assert_eq!(
+            &snapshot_foreign_keys(&upgraded.connection, "ops_provider_message_outbox")?,
+            outbox_foreign_keys
+        );
+        assert_eq!(
+            &snapshot_foreign_keys(&upgraded.connection, "ops_governance_invitations")?,
+            invitation_foreign_keys
+        );
+        assert_eq!(
+            upgraded
+                .connection
+                .query_row("PRAGMA foreign_key_check", [], |row| row.get::<_, i64>(0))
+                .optional()?,
+            None
+        );
+        validate_schema(&upgraded.connection)?;
+
+        for (message_id, author) in [
+            (
+                Uuid::from_u128(0xA480),
+                operational_messages::MessageAuthor::Operator,
+            ),
+            (
+                Uuid::from_u128(0xA481),
+                operational_messages::MessageAuthor::Participant {
+                    participation_id: crate::WorkspaceParticipationId::from_uuid(Uuid::from_u128(
+                        0xA473,
+                    ))?,
+                    profile_id: Uuid::from_u128(0xA472),
+                    participant_id: Uuid::from_u128(0xA475),
+                    session_id: forge_domain::AgentSessionId::from_uuid(Uuid::from_u128(0xA474)),
+                },
+            ),
+            (
+                Uuid::from_u128(0xA482),
+                operational_messages::MessageAuthor::System,
+            ),
+        ] {
+            assert_eq!(
+                upgraded
+                    .workspace_message(message_id)?
+                    .ok_or("legacy message missing")?
+                    .author(),
+                &author
+            );
+        }
+        assert!(matches!(
+            upgraded
+                .workspace_message(Uuid::from_u128(0xA483))?
+                .ok_or("provider message missing")?
+                .author(),
+            operational_messages::MessageAuthor::Provider { .. }
+        ));
+        Ok(())
+    }
 
     #[test]
     fn v38_schema_remains_exact_and_migrates_additively_to_v42()
@@ -3270,6 +4079,322 @@ mod tests {
             file_before,
             "read-only current catalog access changed database bytes"
         );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn v43_upgrade_preserves_catalog_identity_and_adds_empty_binding_rejections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!(
+            "operations-v43-binding-rejections-{}",
+            Uuid::now_v7()
+        ));
+        std::fs::create_dir(&root)?;
+        let path = root.join("operations.sqlite3");
+        let destination = Uuid::now_v7();
+        let old = Connection::open(&path)?;
+        for (_, _, sql) in schema_v43_objects() {
+            old.execute_batch(&sql)?;
+        }
+        old.execute(
+            "INSERT INTO ops_catalog_identity(singleton,destination_id) VALUES(1,?1)",
+            params![destination.as_bytes()],
+        )?;
+        old.pragma_update(None, "application_id", APPLICATION_ID)?;
+        old.pragma_update(None, "user_version", 43)?;
+        validate_schema_v43(&old)?;
+        drop(old);
+
+        let upgraded = OperationsCatalog::open(&path, destination)?;
+        let stored_destination: Vec<u8> = upgraded.connection.query_row(
+            "SELECT substr(destination_id,1,17) FROM ops_catalog_identity WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(wire::id(stored_destination)?, destination.into_bytes());
+        let rejection_count: i64 = upgraded.connection.query_row(
+            "SELECT COUNT(*) FROM ops_binding_rejections",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rejection_count, 0);
+        let attempt_count: i64 = upgraded.connection.query_row(
+            "SELECT COUNT(*) FROM ops_binding_rejection_attempts",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(attempt_count, 0);
+        let resolution_count: i64 = upgraded.connection.query_row(
+            "SELECT COUNT(*) FROM ops_binding_rejection_attempt_resolutions",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(resolution_count, 0);
+        assert_eq!(
+            upgraded
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
+            VERSION
+        );
+        validate_schema(&upgraded.connection)?;
+        drop(upgraded);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod assignment_affinity_schema_evolution_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::{error::Error, path::Path};
+
+    #[derive(Clone, Copy)]
+    enum RequesterShape {
+        Operator,
+        Profile,
+        Mixed,
+    }
+
+    fn insert_affinity(
+        connection: &Connection,
+        workspace: Uuid,
+        assignment: Uuid,
+        requester_shape: RequesterShape,
+        sealed: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let requester_activity = Uuid::from_u128(0xB101);
+        let requester_agent = Uuid::from_u128(0xB102);
+        let requester_session = Uuid::from_u128(0xB103);
+        let requester_participation = Uuid::from_u128(0xB104);
+        let requester_profile = Uuid::from_u128(0xB105);
+        let requester_participant = Uuid::from_u128(0xB106);
+        let profile_fields = !matches!(requester_shape, RequesterShape::Operator);
+        let valid_profile = matches!(requester_shape, RequesterShape::Profile);
+        let identity_activity = profile_fields.then_some(requester_activity.as_bytes().as_slice());
+        let identity_agent = profile_fields.then_some(requester_agent.as_bytes().as_slice());
+        let identity_session = profile_fields.then_some(requester_session.as_bytes().as_slice());
+        let identity_participation =
+            valid_profile.then_some(requester_participation.as_bytes().as_slice());
+        let identity_profile = profile_fields.then_some(requester_profile.as_bytes().as_slice());
+        let identity_participant =
+            profile_fields.then_some(requester_participant.as_bytes().as_slice());
+        let requester_key = match requester_shape {
+            RequesterShape::Operator => "operator".to_owned(),
+            RequesterShape::Profile => format!("participant:{requester_participation}"),
+            RequesterShape::Mixed => format!("participant:{requester_profile}"),
+        };
+        let team = Uuid::from_u128(0xB110);
+        let target_agent = Uuid::from_u128(0xB111);
+        let target_session = Uuid::from_u128(0xB112);
+        let target_participation = Uuid::from_u128(0xB113);
+        let target_participant = Uuid::from_u128(0xB114);
+        let goal = Uuid::from_u128(0xB115);
+        let node = Uuid::from_u128(0xB116);
+        let seal_agent = Uuid::from_u128(0xB117);
+        let seal_session = Uuid::from_u128(0xB118);
+        let current_activity = Uuid::from_u128(0xB119);
+        let disposition = if sealed { "QUIESCED" } else { "PENDING" };
+        let seal_authority = sealed.then_some("COORDINATOR");
+        let seal_observation = sealed.then_some("FOREIGN_ACTIVITY");
+        let seal_agent_bytes = sealed.then_some(seal_agent.as_bytes().as_slice());
+        let seal_session_bytes = sealed.then_some(seal_session.as_bytes().as_slice());
+        let seal_current_activity_bytes = sealed.then_some(current_activity.as_bytes().as_slice());
+        let seal_revision = sealed.then_some(7_i64);
+        let seal_time = sealed.then_some(120_i64);
+        let seal_applied_time = sealed.then_some(121_i64);
+        let seal_current_state = sealed.then_some("RUNNING");
+
+        connection.execute(
+            "INSERT INTO ops_assignment_team_affinities(
+                workspace_id,assignment_id,activity_id,target_agent_id,target_session_id,
+                target_participation_id,target_participant_id,team_id,team_membership_revision,
+                requester_activity_id,requester_agent_id,requester_session_id,
+                requester_participation_id,requester_profile_id,requester_participant_id,
+                requester_key,requester_display_name,assignment_payload_fingerprint,
+                observed_at_ms,node_goal_id,goal_created_at_ms,node_dag_revision,
+                node_dag_base_goal_revision,node_id,node_binding_revision,disposition,
+                original_offer_payload,seal_sealed_at_ms,seal_applied_at_ms,
+                seal_authority_kind,seal_authority_agent_id,seal_authority_session_id,
+                seal_authority_revision,seal_observation_kind,seal_current_activity_id,
+                seal_current_state,seal_current_revision
+            ) VALUES(
+                ?1,?2,?3,?4,?5,?6,?7,?8,4,?9,?10,?11,?12,?13,?14,?15,?16,?17,
+                110,?18,20,1,1,?19,3,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31
+            )",
+            rusqlite::params![
+                workspace.as_bytes(),
+                assignment.as_bytes(),
+                requester_activity.as_bytes(),
+                target_agent.as_bytes(),
+                target_session.as_bytes(),
+                target_participation.as_bytes(),
+                target_participant.as_bytes(),
+                team.as_bytes(),
+                identity_activity,
+                identity_agent,
+                identity_session,
+                identity_participation,
+                identity_profile,
+                identity_participant,
+                requester_key,
+                if valid_profile {
+                    "Profile requester"
+                } else {
+                    "Local operator"
+                },
+                [0xB1_u8; 32].as_slice(),
+                goal.as_bytes(),
+                node.as_bytes(),
+                disposition,
+                [0xB2_u8, 0, 0xB3].as_slice(),
+                seal_time,
+                seal_applied_time,
+                seal_authority,
+                seal_agent_bytes,
+                seal_session_bytes,
+                seal_revision,
+                seal_observation,
+                seal_current_activity_bytes,
+                seal_current_state,
+                seal_revision,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn snapshot(connection: &Connection) -> rusqlite::Result<Vec<Vec<rusqlite::types::Value>>> {
+        let mut statement = connection.prepare(
+            "SELECT * FROM ops_assignment_team_affinities ORDER BY workspace_id,assignment_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                (0..row.as_ref().column_count())
+                    .map(|index| row.get(index))
+                    .collect()
+            })?
+            .collect()
+    }
+
+    fn create_v47(path: &Path, destination: Uuid) -> Result<Connection, Box<dyn Error>> {
+        let connection = Connection::open(path)?;
+        let objects = schema_v47_objects();
+        for (kind, _, sql) in &objects {
+            if *kind == "table" {
+                connection.execute_batch(sql)?;
+            }
+        }
+        for (kind, _, sql) in &objects {
+            if *kind != "table" {
+                connection.execute_batch(sql)?;
+            }
+        }
+        connection.execute(
+            "INSERT INTO ops_catalog_identity(singleton,destination_id) VALUES(1,?1)",
+            rusqlite::params![destination.as_bytes()],
+        )?;
+        connection.pragma_update(None, "application_id", APPLICATION_ID)?;
+        connection.pragma_update(None, "user_version", 47_i64)?;
+        validate_schema_v47(&connection)?;
+        Ok(connection)
+    }
+
+    fn assert_no_foreign_key_violations(connection: &Connection) -> rusqlite::Result<()> {
+        let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        assert!(rows.collect::<Result<Vec<_>, _>>()?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn v47_affinity_upgrade_preserves_all_columns_and_seal_provenance() -> Result<(), Box<dyn Error>>
+    {
+        let root = std::env::temp_dir().join(format!("assignment-affinity-v47-{}", Uuid::now_v7()));
+        std::fs::create_dir(&root)?;
+        let path = root.join("operations.sqlite3");
+        let destination = Uuid::from_u128(0xB001);
+        let workspace = Uuid::from_u128(0xB002);
+        let old = create_v47(&path, destination)?;
+        insert_affinity(
+            &old,
+            workspace,
+            Uuid::from_u128(0xB003),
+            RequesterShape::Operator,
+            false,
+        )?;
+        insert_affinity(
+            &old,
+            workspace,
+            Uuid::from_u128(0xB004),
+            RequesterShape::Profile,
+            true,
+        )?;
+        let before = snapshot(&old)?;
+        drop(old);
+
+        let upgraded = OperationsCatalog::open(&path, destination)?;
+        assert_eq!(
+            upgraded
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
+            VERSION
+        );
+        assert_eq!(snapshot(&upgraded.connection)?, before);
+        assert_no_foreign_key_violations(&upgraded.connection)?;
+        validate_schema(&upgraded.connection)?;
+        drop(upgraded);
+
+        let reopened = OperationsCatalog::open(&path, destination)?;
+        assert_eq!(snapshot(&reopened.connection)?, before);
+        assert_no_foreign_key_violations(&reopened.connection)?;
+        validate_schema(&reopened.connection)?;
+        drop(reopened);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn v47_mixed_requester_identity_rejects_upgrade_without_partial_rewrite()
+    -> Result<(), Box<dyn Error>> {
+        let root =
+            std::env::temp_dir().join(format!("assignment-affinity-mixed-v47-{}", Uuid::now_v7()));
+        std::fs::create_dir(&root)?;
+        let path = root.join("operations.sqlite3");
+        let destination = Uuid::from_u128(0xB011);
+        let workspace = Uuid::from_u128(0xB012);
+        let old = create_v47(&path, destination)?;
+        insert_affinity(
+            &old,
+            workspace,
+            Uuid::from_u128(0xB013),
+            RequesterShape::Operator,
+            false,
+        )?;
+        old.pragma_update(None, "ignore_check_constraints", true)?;
+        insert_affinity(
+            &old,
+            workspace,
+            Uuid::from_u128(0xB014),
+            RequesterShape::Mixed,
+            false,
+        )?;
+        old.pragma_update(None, "ignore_check_constraints", false)?;
+        validate_schema_v47(&old)?;
+        let before = snapshot(&old)?;
+        drop(old);
+
+        assert!(OperationsCatalog::open(&path, destination).is_err());
+
+        let unchanged = Connection::open(&path)?;
+        assert_eq!(
+            unchanged.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
+            47
+        );
+        assert_eq!(snapshot(&unchanged)?, before);
+        assert_no_foreign_key_violations(&unchanged)?;
+        validate_schema_v47(&unchanged)?;
+        drop(unchanged);
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

@@ -110,6 +110,76 @@ async fn command_uses_typed_op_endpoint_and_redacts_the_bearer() -> Result<(), B
 }
 
 #[tokio::test]
+async fn durable_command_preserves_envelope_and_payload_request_identity()
+-> Result<(), Box<dyn Error>> {
+    let durable_request_id = Uuid::from_u128(0xB701);
+    for (op, payload) in [
+        (
+            CommandOp::AgentBindingRejectionGet,
+            json!({"request_id": durable_request_id}),
+        ),
+        (
+            CommandOp::AgentBindingReject,
+            json!({
+                "reservation": {"request_id": durable_request_id},
+                "activation": {"request_id": durable_request_id},
+            }),
+        ),
+    ] {
+        let (authority, server) = one_exchange(|request| {
+            success_response(&request["request_id"], forge_backend::FORGE_API_VERSION)
+        })
+        .await?;
+        let client =
+            ForgeCommandHttpClient::new(authority, SERVICE_SECRET, Duration::from_secs(1))?;
+        let result = client
+            .command_with_request_id(durable_request_id, op, payload)
+            .await?;
+        assert_eq!(result, json!({"resolved": true}));
+        let request = server.await??;
+        let body = request_value(&request)?;
+        assert_eq!(body["request_id"], durable_request_id.to_string());
+        match op {
+            CommandOp::AgentBindingRejectionGet => {
+                assert_eq!(
+                    body["payload"]["request_id"],
+                    durable_request_id.to_string()
+                );
+            }
+            CommandOp::AgentBindingReject => {
+                assert_eq!(
+                    body["payload"]["reservation"]["request_id"],
+                    durable_request_id.to_string()
+                );
+                assert_eq!(
+                    body["payload"]["activation"]["request_id"],
+                    durable_request_id.to_string()
+                );
+            }
+            _ => return Err("unexpected durable command fixture".into()),
+        }
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let client = ForgeCommandHttpClient::new(
+        listener.local_addr()?,
+        SERVICE_SECRET,
+        Duration::from_secs(1),
+    )?;
+    drop(listener);
+    assert_eq!(
+        client
+            .command_with_request_id(
+                Uuid::nil(),
+                CommandOp::AgentBindingRejectionGet,
+                json!({"request_id": Uuid::nil()}),
+            )
+            .await,
+        Err(ForgeHttpClientError::InvalidRequest)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn command_rejects_wrong_request_nonce_and_protocol_version() -> Result<(), Box<dyn Error>> {
     let wrong_nonce = json!(Uuid::now_v7());
     let (authority, nonce_server) =
