@@ -7,7 +7,9 @@
 
 mod departure;
 pub(crate) use departure::HandoffTargetSelector;
+mod home_transfer;
 mod membership;
+pub(crate) use home_transfer::ConfiguredHomeTransferSource;
 
 use forge_backend::{ForgeHttpClientError, ForgeHttpServiceCode};
 use forge_control::{
@@ -54,6 +56,7 @@ pub struct CoordinatorAuthority {
     scopes: Vec<ResolvedWorkspaceScope>,
     enrolled_scopes: Arc<RwLock<WorkspaceProjectScopeProjection>>,
     effect_facts: Option<forge_backend::ForgeHttpClient>,
+    home_transfer_source: Option<ConfiguredHomeTransferSource>,
 }
 
 #[derive(Debug, Default)]
@@ -202,6 +205,7 @@ impl CoordinatorAuthority {
             scopes,
             enrolled_scopes: Arc::new(RwLock::new(WorkspaceProjectScopeProjection::default())),
             effect_facts: None,
+            home_transfer_source: None,
         })
     }
 
@@ -220,6 +224,7 @@ impl CoordinatorAuthority {
             scopes,
             enrolled_scopes: Arc::new(RwLock::new(WorkspaceProjectScopeProjection::default())),
             effect_facts: None,
+            home_transfer_source: None,
         })
     }
 
@@ -236,6 +241,25 @@ impl CoordinatorAuthority {
     pub fn with_effect_facts(mut self, client: forge_backend::ForgeHttpClient) -> Self {
         self.effect_facts = Some(client);
         self
+    }
+
+    /// Select the exact configured source lane for Mission evidence operations.
+    /// This is a host reference, not a fresh observation or mutation authority;
+    /// callers retain their normal admission and actor checks around source I/O.
+    pub(crate) fn mission_evidence_source(
+        &self,
+        request: &crate::wire::WorkspaceQueryScope,
+    ) -> Result<(ResolvedWorkspaceScope, forge_backend::ForgeHttpClient), CoordinatorAuthorityError>
+    {
+        if !matches!(&self.transport, SourceTransport::Http(_)) {
+            return Err(CoordinatorAuthorityError::Unavailable);
+        }
+        let trusted = self.trusted_scope(request)?;
+        let client = self
+            .effect_facts
+            .as_ref()
+            .ok_or(CoordinatorAuthorityError::Unavailable)?;
+        Ok((trusted, client.clone()))
     }
 
     /// The configured HTTP source client for bounded read-only source

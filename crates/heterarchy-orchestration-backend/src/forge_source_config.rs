@@ -76,6 +76,8 @@ struct SourceConfig {
     scopes: Vec<ScopeDto>,
     #[serde(default)]
     effect_facts: Option<EffectFactConfig>,
+    #[serde(default)]
+    home_transfer: Option<HomeTransferConfig>,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +85,15 @@ struct SourceConfig {
 struct EffectFactConfig {
     backend_id: uuid::Uuid,
     destination_id: uuid::Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HomeTransferConfig {
+    backend_id: uuid::Uuid,
+    destination_id: uuid::Uuid,
+    issuer_id: uuid::Uuid,
+    grant_validity_ms: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -130,7 +141,7 @@ pub fn load(path: &Path) -> Result<crate::CoordinatorAuthority, ForgeSourceConfi
         crate::forge_commands::ForgeCommandHttpClient::new(config.address, bearer, HTTP_TIMEOUT)
             .map_err(|_| ForgeSourceConfigError::HttpClient)?;
     let source = crate::forge_source::ForgeSourceHttpClient::new(commands);
-    let authority = crate::CoordinatorAuthority::from_http(source, scopes)
+    let mut authority = crate::CoordinatorAuthority::from_http(source, scopes)
         .map_err(|_| ForgeSourceConfigError::CoordinatorAuthority)?;
     if let Some(identity) = config.effect_facts {
         let client = forge_backend::ForgeHttpClient::new(
@@ -141,10 +152,27 @@ pub fn load(path: &Path) -> Result<crate::CoordinatorAuthority, ForgeSourceConfi
             HTTP_TIMEOUT,
         )
         .map_err(|_| ForgeSourceConfigError::HttpClient)?;
-        Ok(authority.with_effect_facts(client))
-    } else {
-        Ok(authority)
+        authority = authority.with_effect_facts(client);
     }
+    if let Some(identity) = config.home_transfer {
+        let service = forge_control::HomeTransferSourceService {
+            issuer: forge_domain::OrchestrationIssuerId::from_uuid(identity.issuer_id),
+            backend_id: forge_domain::ForgeBackendId::from_uuid(identity.backend_id),
+            destination_id: identity.destination_id,
+        };
+        let client = forge_backend::ForgeHttpClient::new(
+            config.address,
+            bearer,
+            service.backend_id,
+            service.destination_id,
+            HTTP_TIMEOUT,
+        )
+        .map_err(|_| ForgeSourceConfigError::HttpClient)?;
+        authority = authority
+            .with_home_transfer_source(client, service, identity.grant_validity_ms)
+            .map_err(|_| ForgeSourceConfigError::CoordinatorAuthority)?;
+    }
+    Ok(authority)
 }
 
 fn validated_scopes(
@@ -323,6 +351,66 @@ mod tests {
         document["effect_facts"]["backend_id"] = json!(Uuid::from_u128(3));
         document["effect_facts"]["destination_id"] = json!(Uuid::nil());
         assert_load_error(&fixture, &document, ForgeSourceConfigError::HttpClient)?;
+        Ok(())
+    }
+
+    #[test]
+    fn home_transfer_requires_its_own_service_pin_and_explicit_grant_duration() -> TestResult {
+        let fixture = Fixture::new(SECRET.as_bytes())?;
+        let mut document = fixture.document(&valid_scopes())?;
+        document["effect_facts"] =
+            json!({"backend_id": Uuid::from_u128(3), "destination_id": Uuid::from_u128(4)});
+        fixture.write_document(&document)?;
+        let query = crate::wire::WorkspaceQueryScope {
+            workspace_id: Uuid::from_u128(1),
+            location_id: Uuid::from_u128(2),
+            location_revision: 1,
+            workspace_revision: 1,
+            locator: WorkspaceLocator::new(
+                LocationId::from_uuid(Uuid::from_u128(2)),
+                LocationRevision::INITIAL,
+                Path::new("."),
+            )?
+            .encode(),
+        };
+        let authority = load(&fixture.config_path)?;
+        assert!(matches!(
+            authority.home_transfer_source(&query),
+            Err(crate::CoordinatorAuthorityError::Unavailable)
+        ));
+        document["home_transfer"] = json!({"backend_id":Uuid::from_u128(3), "destination_id":Uuid::from_u128(4), "issuer_id":Uuid::from_u128(5), "grant_validity_ms":1000});
+        fixture.write_document(&document)?;
+        let authority = load(&fixture.config_path)?;
+        let (scope, source) = authority.home_transfer_source(&query)?;
+        assert_eq!(scope.workspace_id().into_uuid(), query.workspace_id);
+        assert_eq!(source.service().issuer.into_uuid(), Uuid::from_u128(5));
+        assert_eq!(source.client().destination_id(), Uuid::from_u128(4));
+        assert!(!format!("{authority:?}").contains(SECRET));
+        let mut stale = query.clone();
+        stale.workspace_revision = 2;
+        assert!(matches!(
+            authority.home_transfer_source(&stale),
+            Err(crate::CoordinatorAuthorityError::Stale)
+        ));
+
+        document["home_transfer"]["grant_validity_ms"] = json!(0);
+        assert_load_error(
+            &fixture,
+            &document,
+            ForgeSourceConfigError::CoordinatorAuthority,
+        )?;
+        document["home_transfer"]["grant_validity_ms"] = json!(1000);
+        document["home_transfer"]["issuer_id"] = json!(Uuid::nil());
+        assert_load_error(
+            &fixture,
+            &document,
+            ForgeSourceConfigError::CoordinatorAuthority,
+        )?;
+        document["home_transfer"]
+            .as_object_mut()
+            .ok_or("Home source fixture object")?
+            .remove("grant_validity_ms");
+        assert_load_error(&fixture, &document, ForgeSourceConfigError::ConfigDocument)?;
         Ok(())
     }
 

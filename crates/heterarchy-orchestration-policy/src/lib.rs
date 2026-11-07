@@ -8,6 +8,8 @@
 
 pub mod agent_request;
 pub mod dependency;
+pub mod organization_governance;
+pub mod performance;
 pub mod provisioning;
 pub mod queue;
 pub mod runtime_activation;

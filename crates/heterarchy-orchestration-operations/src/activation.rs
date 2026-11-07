@@ -259,6 +259,23 @@ impl OperationsCatalog {
             }
             return Ok(receipt);
         }
+        if let Some(scope) = crate::registration_profile::load(&transaction, request_id)? {
+            crate::team_permanent_transfer::preparation::ensure_profile_open(
+                &transaction,
+                scope.workspace_id(),
+                scope.profile_id().into_uuid(),
+            )?;
+        } else {
+            crate::team_permanent_transfer::preparation::ensure_unscoped_open(
+                &transaction,
+                progress.workspace_id(),
+            )?;
+        }
+        crate::team_permanent_transfer::preparation::ensure_session_open(
+            &transaction,
+            progress.workspace_id(),
+            progress.request().binding().session_id(),
+        )?;
         if !activation_member_is_current(&transaction, &membership)? {
             return Err(OperationsError::Conflict(
                 "activation current member Session",
@@ -306,21 +323,7 @@ impl OperationsCatalog {
         request_id: Uuid,
     ) -> Result<Option<RegistrationActivationReceipt>, OperationsError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let result = (|| {
-            let Some(progress) = registration::committed_progress_at(&transaction, request_id)?
-            else {
-                return Ok(None);
-            };
-            let Some(membership) =
-                membership::commit_at(&transaction, self.destination, request_id)?
-            else {
-                return Ok(None);
-            };
-            let Some(raw) = load_activation(&transaction, request_id)? else {
-                return Ok(None);
-            };
-            read_activation_row(&progress, &membership, self.destination, &raw).map(Some)
-        })();
+        let result = activation_at(&transaction, self.destination, request_id);
         match result {
             Ok(value) => {
                 crate::catalog::commit_read(transaction, self.destination)?;
@@ -329,6 +332,25 @@ impl OperationsCatalog {
             Err(error) => Err(error),
         }
     }
+}
+
+/// Read a validated immutable witness inside the caller's existing transaction.
+/// This audit lookup survives departure/rebind and does not restore authority.
+pub(crate) fn activation_at(
+    connection: &Connection,
+    destination: Uuid,
+    request_id: Uuid,
+) -> Result<Option<RegistrationActivationReceipt>, OperationsError> {
+    let Some(progress) = registration::committed_progress_at(connection, request_id)? else {
+        return Ok(None);
+    };
+    let Some(membership) = membership::commit_at(connection, destination, request_id)? else {
+        return Ok(None);
+    };
+    let Some(raw) = load_activation(connection, request_id)? else {
+        return Ok(None);
+    };
+    read_activation_row(&progress, &membership, destination, &raw).map(Some)
 }
 
 fn activation_member_is_current(

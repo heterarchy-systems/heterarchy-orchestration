@@ -1597,7 +1597,7 @@ async fn fake_forge_backend_routes_preserve_admit_chat_and_restart_contracts()
         current_dag_revision: forge_domain::DagRevisionNumber::new(1)?,
         assignment_present: false,
     };
-    fixture.runtime.create_team(
+    let created_team = fixture.runtime.create_team(
         TeamCreateSpec {
             request_id: Uuid::from_u128(0x735),
             workspace_id: scope.workspace_id,
@@ -1619,10 +1619,25 @@ async fn fake_forge_backend_routes_preserve_admit_chat_and_restart_contracts()
                     role: "worker".to_owned(),
                 },
             ],
+            max_members: Some(2),
             observed_at_ms: 30,
         },
         fixture.principal,
     )?;
+    assert_eq!(created_team.initial_members().len(), 2);
+    let capacity = created_team
+        .team_capacity()
+        .ok_or("explicit Team cap receipt")?;
+    assert_eq!(capacity.max_members().get(), 2);
+    assert_eq!(capacity.leadership_revision(), 1);
+    assert_eq!(
+        capacity.actor().activity_id().into_uuid(),
+        fixture.sender_activity
+    );
+    assert_eq!(
+        capacity.actor().session_id().into_uuid(),
+        fixture.sender_session
+    );
     let native_team_binding = fixture.runtime.set_node_team_operator(
         fixture.principal,
         NodeTeamSet {

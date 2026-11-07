@@ -104,3 +104,82 @@ pub struct TeamMutationWire {
     pub created: bool,
     pub replayed: bool,
 }
+
+/// Exact v2 mutation source and immutable receipt. The v1 Team query never
+/// serializes this projection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeamMutationV2Wire {
+    pub team: TeamWire,
+    pub membership: Option<TeamMemberWire>,
+    pub initial_members: Vec<TeamMemberWire>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub capacity: Option<TeamCapacityReceiptV2Wire>,
+    /// Lowercase hexadecimal SHA-256 digest using the shared v1 roster contract.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub initial_roster_digest_v1: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub expansion_slot: Option<super::team_commands::TeamExpansionSlotV2Request>,
+    /// Required for every successful v2 Join, including direct mutation
+    /// replies. Missing source evidence leaves the mutation outcome unknown.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub expansion_join_source: Option<TeamExpansionJoinSourceV2Wire>,
+    /// Mirrors whether this operation inserted its row: a Team on CREATE or
+    /// a membership on JOIN. For JOIN, this matches membership revision 1.
+    pub created: bool,
+    pub replayed: bool,
+}
+
+/// Immutable capacity generation from a v2 Team create receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeamCapacityReceiptV2Wire {
+    pub team_id: Uuid,
+    pub workspace_id: Uuid,
+    pub max_members: u8,
+    pub revision: u64,
+    pub recorded_at_ms: i64,
+    pub actor: super::team_expansion::TeamExpansionActorReceiptWire,
+    pub leadership_revision: i64,
+}
+
+/// Original actor and exact decision slot consumed by one v2 Join.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeamExpansionJoinSourceV2Wire {
+    pub activity_id: Uuid,
+    pub agent_id: Uuid,
+    pub session_id: Uuid,
+    pub decision_id: Uuid,
+    pub ordinal: u8,
+    pub role: String,
+}
+
+pub(crate) const fn v2_join_created_flag_matches_membership_revision(
+    created: bool,
+    membership_revision: u64,
+) -> bool {
+    membership_revision > 0 && created == (membership_revision == 1)
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::v2_join_created_flag_matches_membership_revision;
+
+    #[test]
+    fn v2_join_created_tracks_first_row_vs_rejoin_revision() {
+        assert!(v2_join_created_flag_matches_membership_revision(true, 1));
+        assert!(v2_join_created_flag_matches_membership_revision(false, 2));
+        assert!(!v2_join_created_flag_matches_membership_revision(false, 1));
+        assert!(!v2_join_created_flag_matches_membership_revision(true, 2));
+        assert!(!v2_join_created_flag_matches_membership_revision(false, 0));
+    }
+}

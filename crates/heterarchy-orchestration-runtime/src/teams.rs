@@ -15,9 +15,10 @@ use forge_domain::{
     ActivityId, AgentSessionId, AuthenticatedPrincipal, TimestampMillis, WorkspaceId,
 };
 use heterarchy_orchestration_operations::{
-    OperationalActor, OperationsError, TeamCreateCommand, TeamJoinCommand, TeamLeaveCommand,
-    TeamMutationRecord, TeamQuerySnapshot, TeamReadSet, TeamRecord, TeamRetireCommand,
-    TeamRosterMemberInput,
+    OperationalActor, OperationsError, TeamCreateCommand, TeamExpansionSlotRef, TeamJoinCommand,
+    TeamLeaveCommand, TeamMemberCapacity, TeamMutationRecord, TeamQuerySnapshot, TeamReadSet,
+    TeamRecord, TeamRetireCommand, TeamRosterMemberInput,
+    team_expansion::TeamMutationOwnerReadback,
 };
 use uuid::Uuid;
 
@@ -26,7 +27,7 @@ use crate::{OrchestrationRuntime, RuntimeError, TeamSummary};
 
 /// Server-derived participant actor for one caller session. The `agent_id`
 /// is never accepted from a request body.
-fn participant_actor(
+pub(crate) fn participant_actor(
     workspace: WorkspaceId,
     activity_id: Uuid,
     session_id: Uuid,
@@ -121,6 +122,9 @@ pub struct TeamCreateSpec {
     pub purpose: String,
     /// Initial roster, assigned atomically at formation.
     pub initial_members: Vec<TeamRosterMemberSpec>,
+    /// Explicit capacity for a new Team. `None` is preserved only so
+    /// Operations can replay an exact legacy capless create receipt.
+    pub max_members: Option<u8>,
     /// Caller-supplied wall-clock milliseconds.
     pub observed_at_ms: i64,
 }
@@ -153,6 +157,8 @@ pub struct TeamJoinSpec {
     pub session_id: Uuid,
     /// Declared role inside the team.
     pub role: String,
+    /// Exact Orchestrator-selected expansion slot for a new membership.
+    pub expansion_slot: Option<TeamExpansionSlotRef>,
     /// Caller-supplied wall-clock milliseconds.
     pub observed_at_ms: i64,
 }
@@ -278,9 +284,18 @@ impl OrchestrationRuntime {
             observed_at: timestamp(spec.observed_at_ms)?,
         };
         let mut catalog = self.catalog()?;
-        catalog
-            .create_team(command)
-            .map_err(RuntimeError::persistence)
+        match spec.max_members {
+            Some(capacity) => {
+                let capacity =
+                    TeamMemberCapacity::new(capacity).map_err(RuntimeError::persistence)?;
+                catalog
+                    .create_team_with_capacity(command, capacity)
+                    .map_err(RuntimeError::persistence)
+            }
+            None => catalog
+                .create_team(command)
+                .map_err(RuntimeError::persistence),
+        }
     }
 
     /// Join the caller's logical participant to one exact Team revision.
@@ -309,6 +324,7 @@ impl OrchestrationRuntime {
             expected_team_revision: spec.expected_team_revision,
             actor,
             role: spec.role,
+            expansion_slot: spec.expansion_slot,
             observed_at: timestamp(spec.observed_at_ms)?,
         };
         let mut catalog = self.catalog()?;
@@ -401,6 +417,33 @@ impl OrchestrationRuntime {
                 require_identity(team_id)?,
                 require_identity(request_id)?,
             )
+            .map_err(RuntimeError::persistence)
+    }
+
+    /// Read a v2 Team source receipt for its original stable Profile or current
+    /// Workspace Orchestrator. Agent identity is derived from the reader's
+    /// current Activity and Session before Operations checks ownership.
+    ///
+    /// # Errors
+    /// Rejects invalid identities or a reader that does not own the Workspace
+    /// Session; unrelated and absent receipts both return None.
+    pub fn team_mutation_owner_readback(
+        &self,
+        workspace_id: Uuid,
+        team_id: Uuid,
+        request_id: Uuid,
+        reader_activity_id: Uuid,
+        reader_session_id: Uuid,
+        principal: AuthenticatedPrincipal,
+    ) -> Result<Option<TeamMutationOwnerReadback>, RuntimeError> {
+        let workspace = WorkspaceId::from_uuid(require_identity(workspace_id)?);
+        let team_id = require_identity(team_id)?;
+        let request_id = require_identity(request_id)?;
+        let (actor, participation) =
+            participant_actor(workspace, reader_activity_id, reader_session_id)?;
+        self.require_participation(participation, principal)?;
+        self.catalog()?
+            .team_mutation_owner_readback(workspace, team_id, request_id, actor)
             .map_err(RuntimeError::persistence)
     }
 

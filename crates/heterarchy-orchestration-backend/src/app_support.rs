@@ -193,6 +193,22 @@ fn runtime_classification(error: &RuntimeError) -> (StatusCode, &'static str, &'
             StatusCode::CONFLICT, LaneError::COMMITTED_BUT_UNCONFIRMED,
             "Read the same Profile mutation receipt before retrying.", false,
         ),
+        RuntimeError::ProfileCatalog(
+            heterarchy_orchestration_sessions::AgentProfileError::HomeAcceptanceProfileCommitUnconfirmed { .. }
+            | heterarchy_orchestration_sessions::AgentProfileError::HomeAcceptanceProfileReadbackRequired { .. },
+        ) => (
+            StatusCode::CONFLICT, LaneError::COMMITTED_BUT_UNCONFIRMED,
+            "Read the same Home acceptance Profile pin before continuing.", false,
+        ),
+        RuntimeError::SessionCatalog(
+            heterarchy_orchestration_sessions::AgentSessionCatalogError::HomeAcceptance(source),
+        ) if matches!(source.as_ref(),
+            heterarchy_orchestration_sessions::HomeAcceptanceSessionError::CommitUnconfirmed { .. }
+            | heterarchy_orchestration_sessions::HomeAcceptanceSessionError::ReadbackRequired { .. }
+        ) => (
+            StatusCode::CONFLICT, LaneError::COMMITTED_BUT_UNCONFIRMED,
+            "Read the same Home acceptance Session hold before continuing.", false,
+        ),
         RuntimeError::SourceAuthorityUnavailable => (StatusCode::SERVICE_UNAVAILABLE,"WORKSPACE_SCOPE_UNAVAILABLE","The exact source scope authority is unavailable.",true),
         RuntimeError::Forbidden => (
             StatusCode::FORBIDDEN,
@@ -386,6 +402,68 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.code, "UNSUPPORTED_BINDING_REJECTION_TARGET");
         assert!(!body.retryable);
+    }
+
+    #[test]
+    fn home_profile_pin_conflict_is_not_a_store_outage() {
+        let error = RuntimeError::from(
+            heterarchy_orchestration_sessions::AgentProfileError::HomeAcceptanceProfilePinned,
+        );
+        let (status, body) = runtime_error_response(&error);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.code, "ORCHESTRATION_CONFLICT");
+        assert!(!body.retryable);
+    }
+
+    #[test]
+    fn home_owner_uncertain_mutations_require_exact_readback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use heterarchy_orchestration_sessions::{
+            AgentProfileError, AgentSessionCatalogError, HomeAcceptanceSessionError,
+        };
+        let OperationsError::Sqlite(profile_source) = corrupt_catalog_error()? else {
+            return Err("expected SQLite failure fixture".into());
+        };
+        let OperationsError::Sqlite(session_source) = corrupt_catalog_error()? else {
+            return Err("expected SQLite failure fixture".into());
+        };
+        let acceptance_id = Uuid::from_u128(8);
+        let errors = [
+            RuntimeError::ProfileCatalog(
+                AgentProfileError::HomeAcceptanceProfileCommitUnconfirmed {
+                    acceptance_id,
+                    source: profile_source,
+                },
+            ),
+            RuntimeError::ProfileCatalog(
+                AgentProfileError::HomeAcceptanceProfileReadbackRequired {
+                    acceptance_id,
+                    source: Box::new(AgentProfileError::Corrupt("synthetic readback failure")),
+                },
+            ),
+            RuntimeError::SessionCatalog(AgentSessionCatalogError::HomeAcceptance(Box::new(
+                HomeAcceptanceSessionError::CommitUnconfirmed {
+                    acceptance_id,
+                    source: Box::new(session_source),
+                },
+            ))),
+            RuntimeError::SessionCatalog(AgentSessionCatalogError::HomeAcceptance(Box::new(
+                HomeAcceptanceSessionError::ReadbackRequired {
+                    acceptance_id,
+                    source: Box::new(AgentSessionCatalogError::Schema(
+                        "synthetic readback failure",
+                    )),
+                },
+            ))),
+        ];
+        for error in errors {
+            let (status, body) = runtime_error_response(&error);
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body.code, "COMMITTED_BUT_UNCONFIRMED");
+            assert!(!body.retryable);
+            assert!(!body.message.contains("synthetic readback failure"));
+        }
+        Ok(())
     }
 
     fn corrupt_catalog_error() -> Result<OperationsError, Box<dyn std::error::Error>> {

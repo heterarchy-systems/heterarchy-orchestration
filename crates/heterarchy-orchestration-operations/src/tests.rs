@@ -468,7 +468,30 @@ fn binding_rejection_attempt_is_readback_only_and_preserves_membership_history()
         attempt.request_digest(),
         receipt_digest,
     )?;
+    // The transfer census must retain UNKNOWN source attempts; once the exact
+    // rejection is recorded it may exclude the request without erasing history.
+    let target_profile = Uuid::from_u128(0xEB80);
+    let target_participation = Uuid::from_u128(0xEB81);
+    assert!(matches!(
+        crate::team_permanent_transfer::preparation::registration_census_for_test(
+            &catalog.connection,
+            source.workspace,
+            target_profile,
+            target_participation,
+        ),
+        Err(OperationsError::Conflict(
+            "permanent transfer Workspace target registration pending"
+        ))
+    ));
     let receipt = catalog.record_registration_binding_rejection_observation(&observation)?;
+    let census_high_water =
+        crate::team_permanent_transfer::preparation::registration_census_for_test(
+            &catalog.connection,
+            source.workspace,
+            target_profile,
+            target_participation,
+        )?;
+    assert_eq!(census_high_water, receipt.rejected_at().get());
     assert_eq!(receipt.membership_digest(), commit.commit_digest());
     assert_eq!(receipt.binding(), &binding);
     assert_eq!(
@@ -608,7 +631,7 @@ fn timestamp(value: i64) -> Result<TimestampMillis, Box<dyn Error>> {
 /// SQL. The Forge attach writers are retired, so test sources are seeded
 /// directly against the legacy tables on a short-lived connection.
 #[allow(clippy::too_many_lines)]
-fn insert_legacy_attached_agent(
+pub(crate) fn insert_legacy_attached_agent(
     layout: &WorkspaceStateLayout,
     workspace: WorkspaceId,
     activity: ActivityId,

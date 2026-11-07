@@ -420,6 +420,16 @@ impl OperationsCatalog {
             registration::verified_import(&transaction, progress.migration_id(), self.destination)?;
         validate_reservation(&progress, &import, reservation, self.destination)?;
         if progress.phase() == registration::RegistrationPhase::Pending {
+            crate::team_permanent_transfer::preparation::ensure_profile_open(
+                &transaction,
+                progress.workspace_id(),
+                progress.profile_id().into_uuid(),
+            )?;
+            crate::team_permanent_transfer::preparation::ensure_session_open(
+                &transaction,
+                progress.workspace_id(),
+                progress.request().binding().session_id(),
+            )?;
             transaction.execute(
                 "UPDATE ops_workspace_participation_replacement_registrations SET phase=1,freeze_revision=?1,reserved_at_ms=?2 WHERE request_id=?3 AND phase=0",
                 params![
@@ -490,6 +500,16 @@ impl OperationsCatalog {
             joined_event_id,
         )?;
         if progress.phase() == registration::RegistrationPhase::Reserved {
+            crate::team_permanent_transfer::preparation::ensure_profile_open(
+                &transaction,
+                progress.workspace_id(),
+                progress.profile_id().into_uuid(),
+            )?;
+            crate::team_permanent_transfer::preparation::ensure_session_open(
+                &transaction,
+                progress.workspace_id(),
+                progress.request().binding().session_id(),
+            )?;
             transaction.execute(
                 "UPDATE ops_workspace_participation_replacement_registrations SET phase=2,commit_digest=?1,committed_at_ms=?2,joined_event_id=?3 WHERE request_id=?4 AND phase=1",
                 params![
@@ -558,6 +578,16 @@ impl OperationsCatalog {
         validate_activation(&progress, &import, activation, self.destination)?;
         ensure_rebind_persisted(&transaction, &progress)?;
         if progress.phase() == registration::RegistrationPhase::MembershipCommitted {
+            crate::team_permanent_transfer::preparation::ensure_profile_open(
+                &transaction,
+                progress.workspace_id(),
+                progress.profile_id().into_uuid(),
+            )?;
+            crate::team_permanent_transfer::preparation::ensure_session_open(
+                &transaction,
+                progress.workspace_id(),
+                progress.request().binding().session_id(),
+            )?;
             let binding = progress.request().binding();
             let _current = effect_binding::record_registration(
                 &transaction,

@@ -973,7 +973,12 @@ pub(crate) fn ensure_profile_admission_open(
             "Profile membership is frozen for leadership work cut",
         ));
     }
-    Ok(())
+    crate::team_permanent_transfer::preparation::ensure_profile_open(
+        tx,
+        workspace,
+        profile.into_uuid(),
+    )?;
+    crate::home_acceptance::ensure_profile_mutation_open(tx, workspace, profile.into_uuid())
 }
 pub(crate) fn ensure_session_admission_open(
     tx: &Connection,
@@ -986,7 +991,8 @@ pub(crate) fn ensure_session_admission_open(
             "Session membership is frozen for leadership work cut",
         ));
     }
-    Ok(())
+    crate::team_permanent_transfer::preparation::ensure_session_open(tx, workspace, session)?;
+    crate::home_acceptance::ensure_session_rebind_open(tx, workspace, session)
 }
 pub(crate) fn ensure_unscoped_admission_open(
     tx: &Connection,
@@ -1002,7 +1008,7 @@ pub(crate) fn ensure_unscoped_admission_open(
             "unscoped admission during leadership work cut",
         ));
     }
-    Ok(())
+    crate::team_permanent_transfer::preparation::ensure_unscoped_open(tx, workspace)
 }
 
 /// Check fresh identity admission as one policy: known Profiles remain scoped,

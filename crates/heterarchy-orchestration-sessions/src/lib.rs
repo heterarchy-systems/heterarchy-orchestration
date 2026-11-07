@@ -25,7 +25,11 @@ mod identity_mapping;
 mod profile_catalog;
 pub use catalog::{
     AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION, AgentSessionCatalog,
-    AgentSessionCatalogError,
+    AgentSessionCatalogError, HomeAcceptanceOperationsAdmission,
+    HomeAcceptanceOperationsResolution, HomeAcceptanceSessionAcquireOutcome,
+    HomeAcceptanceSessionError, HomeAcceptanceSessionHoldReference, HomeAcceptanceSessionIntent,
+    HomeAcceptanceSessionPendingPage, HomeAcceptanceSessionRecord, HomeAcceptanceSessionResolution,
+    HomeAcceptanceSessionState,
 };
 pub use identity_mapping::{AgentIdentityMappingError, link_existing_logical_session};
 pub use profile_catalog::MAX_AGENT_PROFILE_RUNTIME_SESSIONS;
@@ -52,6 +56,12 @@ pub use profile_catalog::{
     AgentProfileResolutionClaimKind, AgentProfileResolutionClaimTarget,
     AgentProfileResolverAvailability, AgentProfileResolverCandidate,
     AgentProfileResolverCandidates, MAX_AGENT_PROFILE_RESOLVER_CANDIDATES,
+};
+pub use profile_catalog::{
+    HomeAcceptanceProfileAcquireOutcome, HomeAcceptanceProfileError, HomeAcceptanceProfileIntent,
+    HomeAcceptanceProfileOperationsAdmission, HomeAcceptanceProfileOperationsResolution,
+    HomeAcceptanceProfilePendingPage, HomeAcceptanceProfilePinRecord,
+    HomeAcceptanceProfilePinReference, HomeAcceptanceProfileState,
 };
 
 /// An explicitly selected durable catalog; no cached session decisions.
@@ -147,7 +157,47 @@ fn map_catalog_error(error: &AgentSessionCatalogError) -> ControlError {
         | AgentSessionCatalogError::ForeignPrincipal(_) => AgentSessionAuthorityFailure::NotFound,
         AgentSessionCatalogError::SessionIdConflict(_)
         | AgentSessionCatalogError::RevisionConflict(_)
+        | AgentSessionCatalogError::HomeAcceptancePending(_)
         | AgentSessionCatalogError::Transition(_) => AgentSessionAuthorityFailure::Conflict,
+        AgentSessionCatalogError::HomeAcceptance(source)
+            if matches!(
+                source.as_ref(),
+                HomeAcceptanceSessionError::Conflict
+                    | HomeAcceptanceSessionError::InvalidIntent(_)
+                    | HomeAcceptanceSessionError::InvalidResolution(_)
+                    | HomeAcceptanceSessionError::PageSize
+            ) =>
+        {
+            AgentSessionAuthorityFailure::Conflict
+        }
+        AgentSessionCatalogError::HomeAcceptance(source)
+            if matches!(
+                source.as_ref(),
+                HomeAcceptanceSessionError::Session(source)
+                    if matches!(
+                        source.as_ref(),
+                        AgentSessionCatalogError::SessionMissing(_)
+                            | AgentSessionCatalogError::ForeignPrincipal(_)
+                    )
+            ) =>
+        {
+            AgentSessionAuthorityFailure::NotFound
+        }
+        AgentSessionCatalogError::HomeAcceptance(source)
+            if matches!(
+                source.as_ref(),
+                HomeAcceptanceSessionError::Session(source)
+                    if matches!(
+                        source.as_ref(),
+                        AgentSessionCatalogError::SessionIdConflict(_)
+                            | AgentSessionCatalogError::RevisionConflict(_)
+                            | AgentSessionCatalogError::HomeAcceptancePending(_)
+                            | AgentSessionCatalogError::Transition(_)
+                    )
+            ) =>
+        {
+            AgentSessionAuthorityFailure::Conflict
+        }
         _ => AgentSessionAuthorityFailure::Unavailable,
     }
     .into_control_error()

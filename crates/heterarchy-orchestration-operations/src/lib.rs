@@ -20,14 +20,33 @@ mod effect_binding;
 mod effect_fact;
 mod election_subject;
 mod events;
+pub mod home_acceptance;
 mod import_handoff;
 mod importer;
 mod inbox;
 mod leadership;
 mod members;
 mod membership;
+mod mission_evaluation;
+pub mod mission_evidence;
 mod node_team;
 mod operational_actor;
+pub mod reviewer_participation;
+pub mod reviewer_qualification_rule;
+pub mod team_expansion;
+pub use team_expansion::{
+    LegacySlotRecoveryCommand, LegacySlotRecoveryIntent, LegacySlotRecoveryReceipt,
+    TeamCapacityReceipt, TeamCapacitySetCommand, TeamCapacitySnapshot,
+    TeamCreateWithCapacityCommand, TeamExpansionActor, TeamExpansionApprovalSlotPlan,
+    TeamExpansionApprovalSlotPlanV3, TeamExpansionDecision, TeamExpansionDecisionCommand,
+    TeamExpansionDecisionReceipt, TeamExpansionDecisionState, TeamExpansionDecisionV2Command,
+    TeamExpansionDecisionV3Command, TeamExpansionDecisionV3Projection, TeamExpansionJoinSource,
+    TeamExpansionRequestCommand, TeamExpansionRequestReceipt, TeamExpansionSlotAssignmentCommand,
+    TeamExpansionSlotAssignmentReceipt, TeamExpansionSlotRef, TeamExpansionWorkspaceTarget,
+    TeamExpansionWorkspaceTargetV3, TeamMemberCapacity, TeamMutationOwnerReadback,
+    TeamMutationSourceEvidence,
+};
+pub mod temporary_dispatch;
 pub use node_team::{
     LegacyNodeTeamBindingRetirementAuthority, LegacyNodeTeamBindingRetirementReceipt,
     MAX_NODE_TEAM_BINDINGS_PER_READ, NodeTeamBinding, NodeTeamBindingPage, NodeTeamBindingScope,
@@ -42,6 +61,8 @@ mod registration_profile;
 mod replacement_registration;
 mod session_replacement;
 mod team_assignment;
+mod team_create_source;
+mod team_permanent_transfer;
 mod teams;
 mod wire;
 mod work_credit;
@@ -49,6 +70,41 @@ mod work_credit_subject;
 mod workspace_chat_target;
 mod workspace_participation;
 mod workspace_project;
+
+pub use team_permanent_transfer::{
+    ActorSnapshot, TeamPermanentTransferBindingOrigin, TeamPermanentTransferConsentCommand,
+    TeamPermanentTransferConsentKind, TeamPermanentTransferConsentReceipt,
+    TeamPermanentTransferDestinationSlot, TeamPermanentTransferGeneration,
+    TeamPermanentTransferGenerationSnapshot, TeamPermanentTransferGenerationState,
+    TeamPermanentTransferIntentCommand, TeamPermanentTransferIntentReceipt,
+    TeamPermanentTransferPreparationBinding, TeamPermanentTransferPreparationCommand,
+    TeamPermanentTransferPreparationReceipt, TeamPermanentTransferRenewalCommand,
+    TeamPermanentTransferRevisions, TeamPermanentTransferScope, TeamPermanentTransferSnapshot,
+    TeamPermanentTransferSourceDispatchCommand, TeamPermanentTransferSourceDispatchOutcome,
+    TeamPermanentTransferSourceDispatchPermit, TeamPermanentTransferSourceDispatchReadback,
+    TeamPermanentTransferSourceDispatchReceipt, TeamPermanentTransferSourceDispatchReplay,
+    TeamPermanentTransferSourceEnvelopeDigest, TeamPermanentTransferSourceReceiptCommand,
+    TeamPermanentTransferSourceReceiptOutcome, TeamPermanentTransferSourceReceiptRecord,
+    TeamPermanentTransferSourceWireIdentity, derive_team_permanent_transfer_source_request,
+};
+pub use temporary_dispatch::{
+    TemporaryDispatchActorProvenance, TemporaryDispatchAdmissionRequest,
+    TemporaryDispatchAdmissionResult, TemporaryDispatchRequestRecord,
+    TemporaryDispatchRequestedScope,
+};
+
+pub use mission_evaluation::{
+    MissionCreateCommand, MissionCreateOutcome, MissionEvaluationAuthority,
+    MissionEvaluationPlanId, MissionEvaluationPlanObligation, MissionEvaluationPlanObligationInput,
+    MissionEvaluationPlanPublishCommand, MissionEvaluationPlanPublishOutcome,
+    MissionEvaluationPlanStartCommand, MissionEvaluationPlanStartOutcome,
+    MissionEvaluationPlanStartRecord, MissionEvaluationPlanVersion, MissionEvaluationPlanVersionId,
+    MissionEvaluationRecordedMutation, MissionEvaluationRequestRecord, MissionId,
+    MissionObligationId, MissionObligationRecord, MissionObligationRecordCommand,
+    MissionObligationRecordOutcome, MissionRecord, MissionT2AccountableOwner,
+    MissionT2CheckpointId, MissionT2DeferCommand, MissionT2DeferContent, MissionT2DeferOutcome,
+    MissionT2DeferredCheckpoint, MissionWorkUnitId, PositiveWeight,
+};
 
 pub use workspace_chat_target::{WorkspaceChatTarget, WorkspaceChatTargetPage};
 pub use workspace_project::{
@@ -252,6 +308,14 @@ pub enum OperationsError {
     )]
     CatalogCommitUnconfirmed {
         destination_id: uuid::Uuid,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error(
+        "operations Home acceptance {acceptance_id} commit is unconfirmed; read back the same identity"
+    )]
+    HomeAcceptanceCommitUnconfirmed {
+        acceptance_id: uuid::Uuid,
         #[source]
         source: rusqlite::Error,
     },

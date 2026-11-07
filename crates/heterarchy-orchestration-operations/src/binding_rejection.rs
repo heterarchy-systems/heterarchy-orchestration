@@ -998,23 +998,7 @@ impl OperationsCatalog {
         request_id: Uuid,
     ) -> Result<Option<RegistrationBindingRejectionReceipt>, OperationsError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let result = (|| {
-            let Some(raw) = load_rejection(&transaction, request_id)? else {
-                return Ok(None);
-            };
-            if crate::activation::has_activation(&transaction, request_id)? {
-                return Err(OperationsError::Corrupt(
-                    "binding activation and rejection coexist",
-                ));
-            }
-            let attempt = load_attempt(&transaction, request_id)?.ok_or(
-                OperationsError::Corrupt("binding rejection attempt missing"),
-            )?;
-            let receipt = rejection_identity(&transaction, self.destination, request_id)?;
-            let receipt = assemble_receipt(receipt, raw)?;
-            validate_stored_attempt(&transaction, &attempt, &receipt)?;
-            Ok(Some(receipt))
-        })();
+        let result = registration_binding_rejection_at(&transaction, self.destination, request_id);
         match result {
             Ok(value) => {
                 crate::catalog::commit_read(transaction, self.destination)?;
@@ -1023,6 +1007,31 @@ impl OperationsCatalog {
             Err(error) => Err(error),
         }
     }
+}
+
+/// Read the complete terminal source proof in the caller's consistent snapshot.
+pub(crate) fn registration_binding_rejection_at(
+    connection: &Connection,
+    destination: Uuid,
+    request_id: Uuid,
+) -> Result<Option<RegistrationBindingRejectionReceipt>, OperationsError> {
+    let Some(raw) = load_rejection(connection, request_id)? else {
+        return Ok(None);
+    };
+    if crate::activation::has_activation(connection, request_id)? {
+        return Err(OperationsError::Corrupt(
+            "binding activation and rejection coexist",
+        ));
+    }
+    let attempt = load_attempt(connection, request_id)?.ok_or(OperationsError::Corrupt(
+        "binding rejection attempt missing",
+    ))?;
+    let receipt = assemble_receipt(
+        rejection_identity(connection, destination, request_id)?,
+        raw,
+    )?;
+    validate_stored_attempt(connection, &attempt, &receipt)?;
+    Ok(Some(receipt))
 }
 
 fn same_attempt_identity(

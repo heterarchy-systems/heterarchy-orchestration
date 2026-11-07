@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 
 use forge_domain::{ActivityId, AgentInstanceId, AgentSessionId, TimestampMillis, WorkspaceId};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Value,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -25,6 +27,7 @@ pub const MAX_TEAM_MEMBERS_PER_READ: usize = 256;
 const MAX_TEAM_NAME_BYTES: usize = 128;
 const MAX_TEAM_PURPOSE_BYTES: usize = 2_048;
 const MAX_TEAM_ROLE_BYTES: usize = 256;
+const MAX_TEAM_PROFILES_PER_WORKSPACE: usize = 4;
 pub const MIN_FORMING_TEAM_MEMBERS: usize = 2;
 pub const MAX_INITIAL_TEAM_MEMBERS: usize = 64;
 
@@ -333,6 +336,10 @@ pub struct TeamMutationRecord {
     team: TeamRecord,
     membership: Option<TeamMemberRecord>,
     initial_members: Vec<TeamMemberRecord>,
+    initial_roster_digest: Option<crate::team_expansion::TeamCreateRosterDigest>,
+    expansion_slot: Option<crate::team_expansion::TeamExpansionSlotRef>,
+    expansion_join_source: Option<crate::team_expansion::TeamExpansionJoinSource>,
+    team_capacity: Option<crate::team_expansion::TeamCapacitySnapshot>,
     created: bool,
     replayed: bool,
 }
@@ -351,6 +358,35 @@ impl TeamMutationRecord {
     #[must_use]
     pub fn initial_members(&self) -> &[TeamMemberRecord] {
         &self.initial_members
+    }
+
+    /// Digest of the original source roster, if immutable roster rows exist.
+    /// Legacy creates without source evidence remain `None`.
+    #[must_use]
+    pub const fn initial_roster_digest(
+        &self,
+    ) -> Option<crate::team_expansion::TeamCreateRosterDigest> {
+        self.initial_roster_digest
+    }
+
+    #[must_use]
+    pub const fn expansion_slot(&self) -> Option<crate::team_expansion::TeamExpansionSlotRef> {
+        self.expansion_slot
+    }
+
+    /// Original source actor and slot for a v2 slot-backed Join, when stored.
+    #[must_use]
+    pub(crate) const fn expansion_join_source(
+        &self,
+    ) -> Option<&crate::team_expansion::TeamExpansionJoinSource> {
+        self.expansion_join_source.as_ref()
+    }
+
+    /// Capacity generation from the original Team creation request, if that
+    /// request explicitly configured one. Legacy Teams remain `None`.
+    #[must_use]
+    pub const fn team_capacity(&self) -> Option<&crate::team_expansion::TeamCapacitySnapshot> {
+        self.team_capacity.as_ref()
     }
 
     #[must_use]
@@ -407,6 +443,7 @@ pub struct TeamJoinCommand {
     pub expected_team_revision: u64,
     pub actor: OperationalActor,
     pub role: String,
+    pub expansion_slot: Option<crate::team_expansion::TeamExpansionSlotRef>,
     pub observed_at: TimestampMillis,
 }
 
@@ -432,7 +469,23 @@ pub struct TeamRetireCommand {
 
 pub(crate) fn create_team(
     connection: &mut Connection,
+    command: TeamCreateCommand,
+) -> Result<TeamMutationRecord, OperationsError> {
+    create_team_inner(connection, command, None)
+}
+
+pub(crate) fn create_team_with_capacity(
+    connection: &mut Connection,
+    command: TeamCreateCommand,
+    capacity: crate::team_expansion::TeamMemberCapacity,
+) -> Result<TeamMutationRecord, OperationsError> {
+    create_team_inner(connection, command, Some(capacity))
+}
+
+fn create_team_inner(
+    connection: &mut Connection,
     mut command: TeamCreateCommand,
+    capacity: Option<crate::team_expansion::TeamMemberCapacity>,
 ) -> Result<TeamMutationRecord, OperationsError> {
     command.initial_members = canonicalize_roster(std::mem::take(&mut command.initial_members))?;
     validate_request_id(command.request_id)?;
@@ -450,14 +503,37 @@ pub(crate) fn create_team(
     ensure_verified_workspace(&transaction, command.workspace_id)?;
     if let Some(existing) = load_request(&transaction, command.request_id)? {
         let fingerprint = RequestFingerprint::create(existing.fingerprint.actor.clone(), &command);
-        return replay_or_conflict(
+        let record = replay_or_conflict(
             transaction,
             command.workspace_id,
             command.request_id,
             &existing,
             &fingerprint,
-        );
+        )?;
+        if record
+            .team_capacity()
+            .map(crate::team_expansion::TeamCapacitySnapshot::max_members)
+            != capacity
+        {
+            return Err(OperationsError::Conflict("team create capacity replay"));
+        }
+        if capacity.is_some() {
+            let source_digest = record
+                .initial_roster_digest()
+                .ok_or(OperationsError::Corrupt(
+                    "Team create roster digest missing",
+                ))?;
+            if source_digest != team_create_roster_digest_for_request(&command.initial_members)? {
+                return Err(OperationsError::Conflict(
+                    "team create roster digest replay",
+                ));
+            }
+        }
+        return Ok(record);
     }
+    let capacity = capacity.ok_or(OperationsError::Conflict(
+        "new Team creation requires explicit Orchestrator capacity",
+    ))?;
     if team_exists_any(&transaction, command.team_id)? {
         return Err(OperationsError::Conflict("team identity"));
     }
@@ -476,6 +552,20 @@ pub(crate) fn create_team(
         command.initial_members.clone(),
         observed_at,
     )?;
+    if roster.len() > usize::from(capacity.get()) {
+        return Err(OperationsError::Bounds("team initial roster"));
+    }
+    for member in &roster {
+        ensure_single_home_team_membership(
+            &transaction,
+            command.workspace_id,
+            command.team_id,
+            member.member.participation_id,
+            member.member.profile_id(),
+            None,
+        )?;
+    }
+    ensure_workspace_team_capacity(&transaction, command.workspace_id)?;
     let fingerprint = RequestFingerprint::create(TeamCreator::from_actor(&actor), &command);
     let record = insert_formed_team(
         &transaction,
@@ -484,9 +574,118 @@ pub(crate) fn create_team(
         &roster,
         &fingerprint,
         observed_at,
+        capacity,
     )?;
     commit_team(transaction, command.workspace_id, command.request_id)?;
     Ok(record)
+}
+
+fn ensure_workspace_team_capacity(
+    transaction: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+) -> Result<(), OperationsError> {
+    let count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM ops_teams WHERE workspace_id=?1",
+        params![workspace_id.into_uuid().as_bytes()],
+        |row| row.get(0),
+    )?;
+    ensure_below_capacity(
+        count,
+        MAX_TEAM_PROFILES_PER_WORKSPACE,
+        "workspace team capacity",
+    )
+}
+
+pub(crate) fn ensure_team_member_capacity(
+    transaction: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+    team_id: Uuid,
+) -> Result<(), OperationsError> {
+    match crate::team_expansion::ensure_team_capacity_for_addition(
+        transaction,
+        workspace_id,
+        team_id,
+        None,
+        None,
+        None,
+    ) {
+        Err(OperationsError::Bounds("team member capacity")) => {
+            Err(OperationsError::Bounds("team membership capacity"))
+        }
+        result => result,
+    }
+}
+
+fn ensure_single_home_team_membership(
+    transaction: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+    target_team_id: Uuid,
+    participation_id: WorkspaceParticipationId,
+    profile_id: Option<Uuid>,
+    permitted_slot: Option<crate::team_expansion::TeamExpansionSlotRef>,
+) -> Result<(), OperationsError> {
+    let profile_id = profile_id.map(|id| id.as_bytes().to_vec());
+    let has_other_home: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM ops_team_members AS member
+             LEFT JOIN ops_workspace_participations AS participation
+               ON participation.workspace_id=member.workspace_id
+              AND participation.participation_id=member.participation_id
+             WHERE member.workspace_id=?1
+               AND member.team_id<>?2
+               AND member.state='JOINED'
+               AND (member.participation_id=?3
+                    OR (?4 IS NOT NULL AND participation.agent_profile_id=?4))
+         )",
+        params![
+            workspace_id.into_uuid().as_bytes(),
+            target_team_id.as_bytes(),
+            participation_id.into_uuid().as_bytes(),
+            profile_id,
+        ],
+        |row| row.get(0),
+    )?;
+    if has_other_home {
+        Err(OperationsError::Conflict(
+            "participant already has a home Team",
+        ))
+    } else {
+        let profile_bytes = profile_id.clone();
+        let permitted_approval = permitted_slot.map(|slot| slot.approval_id().as_bytes().to_vec());
+        let permitted_ordinal = permitted_slot.map(|slot| i64::from(slot.ordinal()));
+        let has_other_expansion_hold: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ops_team_expansion_slot_assignments AS assignment LEFT JOIN ops_team_expansion_slot_uses AS used ON used.decision_id=assignment.decision_id AND used.ordinal=assignment.ordinal WHERE assignment.workspace_id=?1 AND (assignment.target_participation_id=?2 OR (?3 IS NOT NULL AND assignment.target_profile_id=?3)) AND used.decision_id IS NULL AND (?4 IS NULL OR assignment.decision_id<>?4 OR assignment.ordinal<>?5))",
+            params![
+                workspace_id.into_uuid().as_bytes(),
+                participation_id.into_uuid().as_bytes(),
+                profile_bytes,
+                permitted_approval,
+                permitted_ordinal,
+            ],
+            |row| row.get(0),
+        )?;
+        if has_other_expansion_hold {
+            Err(OperationsError::Conflict(
+                "participant already has an outstanding Team expansion slot",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn ensure_below_capacity(
+    current_count: i64,
+    maximum: usize,
+    label: &'static str,
+) -> Result<(), OperationsError> {
+    let current_count = usize::try_from(current_count)
+        .map_err(|_| OperationsError::Corrupt("team capacity count"))?;
+    if current_count >= maximum {
+        Err(OperationsError::Bounds(label))
+    } else {
+        Ok(())
+    }
 }
 
 fn insert_formed_team(
@@ -496,6 +695,7 @@ fn insert_formed_team(
     roster: &[ResolvedTeamRosterMember],
     fingerprint: &RequestFingerprint,
     observed_at: i64,
+    max_members: crate::team_expansion::TeamMemberCapacity,
 ) -> Result<TeamMutationRecord, OperationsError> {
     let creator = TeamCreator::from_actor(actor);
     transaction.execute(
@@ -531,10 +731,22 @@ fn insert_formed_team(
     let team = load_team_row(transaction, command.workspace_id, command.team_id)?
         .ok_or(OperationsError::Corrupt("team insert readback"))?
         .record();
-    let record = TeamMutationRecord {
+    let capacity = crate::team_expansion::record_team_created_capacity(
+        transaction,
+        command,
+        max_members,
+        actor,
+        TimestampMillis::new(observed_at)
+            .map_err(|_| OperationsError::Corrupt("Team capacity created timestamp"))?,
+    )?;
+    let mut record = TeamMutationRecord {
         team,
         membership: None,
         initial_members,
+        initial_roster_digest: None,
+        expansion_slot: None,
+        expansion_join_source: None,
+        team_capacity: Some(capacity),
         created: true,
         replayed: false,
     };
@@ -562,7 +774,42 @@ fn insert_formed_team(
             observed_at,
         )?;
     }
+    record.initial_roster_digest = Some(read_team_create_roster_digest(
+        transaction,
+        command,
+        &record.initial_members,
+    )?);
+    crate::team_create_source::record_verified(
+        transaction,
+        command.request_id,
+        command.workspace_id,
+        command.team_id,
+        command.observed_at,
+    )?;
     Ok(record)
+}
+
+fn read_team_create_roster_digest(
+    connection: &Connection,
+    command: &TeamCreateCommand,
+    expected_members: &[TeamMemberRecord],
+) -> Result<crate::team_expansion::TeamCreateRosterDigest, OperationsError> {
+    let (stored_roster, stored_members) = load_team_create_roster(
+        connection,
+        command.request_id,
+        command.workspace_id,
+        command.team_id,
+    )?;
+    if stored_roster != command.initial_members || stored_members != expected_members {
+        return Err(OperationsError::Corrupt("Team create roster readback"));
+    }
+    let digest = team_create_roster_digest_for_request(&stored_roster)?;
+    if digest != team_create_roster_digest_for_request(&command.initial_members)? {
+        return Err(OperationsError::Corrupt(
+            "Team create roster digest readback",
+        ));
+    }
+    Ok(digest)
 }
 
 #[derive(Debug, Clone)]
@@ -585,7 +832,7 @@ fn canonicalize_roster(
         {
             return Err(OperationsError::Conflict("team initial roster identity"));
         }
-        validate_text(&member.role, MAX_TEAM_ROLE_BYTES, "team role", true)?;
+        validate_team_role(&member.role)?;
     }
     members.sort_by(|left, right| {
         (
@@ -609,6 +856,22 @@ fn canonicalize_roster(
         return Err(OperationsError::Conflict("duplicate team roster actor"));
     }
     Ok(members)
+}
+
+fn team_create_roster_digest_for_request(
+    members: &[TeamRosterMemberInput],
+) -> Result<crate::team_expansion::TeamCreateRosterDigest, OperationsError> {
+    let inputs = members
+        .iter()
+        .map(|member| {
+            crate::team_expansion::TeamRosterDigestInput::new(
+                member.activity_id,
+                member.session_id,
+                &member.role,
+            )
+        })
+        .collect::<Vec<_>>();
+    crate::team_expansion::team_create_roster_digest(&inputs)
 }
 
 fn validate_team_creator_fence_input(
@@ -787,14 +1050,7 @@ pub(crate) fn retire_team(
             "team retire requires local operator",
         ));
     }
-    let fingerprint = RequestFingerprint::simple(
-        TeamOperation::Retire,
-        command.workspace_id,
-        command.team_id,
-        &actor,
-        Some(command.expected_team_revision),
-        None,
-    );
+    let fingerprint = RequestFingerprint::retire(&command, &actor);
     if let Some(existing) = load_request(&transaction, command.request_id)? {
         return replay_or_conflict(
             transaction,
@@ -804,6 +1060,16 @@ pub(crate) fn retire_team(
             &fingerprint,
         );
     }
+    crate::team_permanent_transfer::preparation::ensure_team_open(
+        &transaction,
+        command.workspace_id,
+        command.team_id,
+    )?;
+    crate::home_acceptance::ensure_team_mutation_open(
+        &transaction,
+        command.workspace_id,
+        command.team_id,
+    )?;
     let row = load_team_row(&transaction, command.workspace_id, command.team_id)?
         .ok_or(OperationsError::Conflict("team workspace scope"))?;
     if row.revision != command.expected_team_revision {
@@ -835,6 +1101,10 @@ pub(crate) fn retire_team(
         team,
         membership: None,
         initial_members: Vec::new(),
+        initial_roster_digest: None,
+        expansion_slot: None,
+        expansion_join_source: None,
+        team_capacity: None,
         created: false,
         replayed: false,
     };
@@ -1082,6 +1352,13 @@ impl MembershipMutation {
             Self::Leave(_) => None,
         }
     }
+
+    fn expansion_slot(&self) -> Option<crate::team_expansion::TeamExpansionSlotRef> {
+        match self {
+            Self::Join(command) => command.expansion_slot,
+            Self::Leave(_) => None,
+        }
+    }
 }
 
 fn mutate_membership(
@@ -1100,14 +1377,7 @@ fn mutate_membership(
     let participation_id = actor.participation_id().ok_or(OperationsError::Conflict(
         "team membership requires participant",
     ))?;
-    let fingerprint = RequestFingerprint::simple(
-        command.operation(),
-        command.workspace_id(),
-        command.team_id(),
-        &actor,
-        Some(command.expected_revision()),
-        command.role(),
-    );
+    let fingerprint = RequestFingerprint::membership(command, &actor);
     if let Some(existing) = load_request(&transaction, command.request_id())? {
         return replay_or_conflict(
             transaction,
@@ -1116,6 +1386,23 @@ fn mutate_membership(
             &existing,
             &fingerprint,
         );
+    }
+    if let Some(profile_id) = actor.profile_id() {
+        crate::home_acceptance::ensure_profile_mutation_open(
+            &transaction,
+            command.workspace_id(),
+            profile_id,
+        )?;
+        crate::team_permanent_transfer::preparation::ensure_profile_open(
+            &transaction,
+            command.workspace_id(),
+            profile_id,
+        )?;
+    } else {
+        crate::team_permanent_transfer::preparation::ensure_unscoped_open(
+            &transaction,
+            command.workspace_id(),
+        )?;
     }
     let row = load_team_row(&transaction, command.workspace_id(), command.team_id())?
         .ok_or(OperationsError::Conflict("team workspace scope"))?;
@@ -1132,14 +1419,43 @@ fn mutate_membership(
         command.team_id(),
         participation_id,
     )?;
-    let (membership, created) = apply_membership_change(
+    ensure_membership_admission(
+        &transaction,
+        command,
+        existing.as_ref(),
+        &actor,
+        participation_id,
+    )?;
+    let membership = apply_membership_change(
         &transaction,
         command,
         participation_id,
         existing,
         observed_at,
     )?;
-    let next_team_revision = increment_revision(row.revision)?;
+    persist_membership_mutation(
+        transaction,
+        command,
+        &actor,
+        &fingerprint,
+        participation_id,
+        membership,
+        row.revision,
+    )
+}
+
+fn persist_membership_mutation(
+    transaction: Transaction<'_>,
+    command: &MembershipMutation,
+    actor: &ResolvedOperationalActor,
+    fingerprint: &RequestFingerprint,
+    participation_id: WorkspaceParticipationId,
+    membership: (TeamMemberRecord, bool),
+    current_team_revision: u64,
+) -> Result<TeamMutationRecord, OperationsError> {
+    let observed_at = command.observed_at().get();
+    let (membership, created) = membership;
+    let next_team_revision = increment_revision(current_team_revision)?;
     let changed = transaction.execute(
 		"UPDATE ops_teams SET revision=?1,updated_at_ms=?2 WHERE workspace_id=?3 AND team_id=?4 AND revision=?5 AND state='ACTIVE'",
 		params![i64::try_from(next_team_revision).map_err(|_| OperationsError::Bounds("team revision"))?, observed_at, command.workspace_id().into_uuid().as_bytes(), command.team_id().as_bytes(), i64::try_from(command.expected_revision()).map_err(|_| OperationsError::Bounds("team revision"))?],
@@ -1154,13 +1470,17 @@ fn mutate_membership(
         team,
         membership: Some(membership),
         initial_members: Vec::new(),
+        initial_roster_digest: None,
+        expansion_slot: command.expansion_slot(),
+        expansion_join_source: fingerprint.expansion_join_source()?,
+        team_capacity: None,
         created,
         replayed: false,
     };
     insert_request(
         &transaction,
         command.request_id(),
-        &fingerprint,
+        fingerprint,
         &record,
         observed_at,
     )?;
@@ -1172,9 +1492,34 @@ fn mutate_membership(
         &transaction,
         command.request_id(),
         membership,
-        &actor,
+        actor,
         observed_at,
     )?;
+    if let Some(slot) = command.expansion_slot() {
+        if command.operation() != TeamOperation::Join
+            || membership.state() != TeamMembershipState::Joined
+        {
+            return Err(OperationsError::Corrupt(
+                "Team expansion slot attached to non-Join mutation",
+            ));
+        }
+        let profile_id = membership.profile_id().ok_or(OperationsError::Conflict(
+            "Team expansion slot requires Profile membership",
+        ))?;
+        crate::team_expansion::record_team_expansion_slot_use(
+            &transaction,
+            crate::team_expansion::TeamExpansionSlotUseIntent {
+                join_request_id: command.request_id(),
+                workspace_id: command.workspace_id(),
+                team_id: command.team_id(),
+                slot,
+                participation_id: membership.participation_id(),
+                profile_id,
+                membership_revision: membership.revision(),
+                recorded_at: command.observed_at(),
+            },
+        )?;
+    }
     if membership.state() == TeamMembershipState::Left {
         crate::leadership::reconcile_team_departure(
             &transaction,
@@ -1186,6 +1531,39 @@ fn mutate_membership(
     }
     commit_team(transaction, command.workspace_id(), command.request_id())?;
     Ok(record)
+}
+
+fn ensure_membership_admission(
+    transaction: &Transaction<'_>,
+    command: &MembershipMutation,
+    existing: Option<&TeamMemberRecord>,
+    actor: &ResolvedOperationalActor,
+    participation_id: WorkspaceParticipationId,
+) -> Result<(), OperationsError> {
+    let adds_joined_member = command.operation() == TeamOperation::Join
+        && existing.is_none_or(|member| member.state == TeamMembershipState::Left);
+    if adds_joined_member {
+        ensure_single_home_team_membership(
+            transaction,
+            command.workspace_id(),
+            command.team_id(),
+            participation_id,
+            actor.profile_id(),
+            command.expansion_slot(),
+        )?;
+        let slot = command.expansion_slot().ok_or(OperationsError::Conflict(
+            "new Team join requires approved expansion slot",
+        ))?;
+        crate::team_expansion::ensure_team_capacity_for_addition(
+            transaction,
+            command.workspace_id(),
+            command.team_id(),
+            Some(slot),
+            Some(participation_id),
+            actor.profile_id(),
+        )?;
+    }
+    Ok(())
 }
 
 fn apply_membership_change(
@@ -1305,6 +1683,7 @@ struct RequestFingerprint {
     request_actor: Option<OperationalActor>,
     expected_sender_leadership_revision: Option<i64>,
     role: Option<String>,
+    expansion_slot: Option<crate::team_expansion::TeamExpansionSlotRef>,
     initial_roster: Vec<TeamRosterMemberInput>,
 }
 
@@ -1321,34 +1700,82 @@ impl RequestFingerprint {
             request_actor: Some(command.actor),
             expected_sender_leadership_revision: command.expected_sender_leadership_revision,
             role: None,
+            expansion_slot: None,
             initial_roster: command.initial_members.clone(),
         }
     }
 
-    fn simple(
-        operation: TeamOperation,
-        workspace_id: WorkspaceId,
-        team_id: Uuid,
-        actor: &ResolvedOperationalActor,
-        expected_revision: Option<u64>,
-        role: Option<&str>,
-    ) -> Self {
+    fn membership(command: &MembershipMutation, actor: &ResolvedOperationalActor) -> Self {
+        let expansion_slot = command.expansion_slot();
         Self {
-            operation,
-            workspace_id,
-            team_id,
+            operation: command.operation(),
+            workspace_id: command.workspace_id(),
+            team_id: command.team_id(),
             actor: TeamCreator::from_actor(actor),
             name: None,
             purpose: None,
-            expected_revision,
-            request_actor: None,
+            expected_revision: Some(command.expected_revision()),
+            request_actor: expansion_slot.map(|_| command.actor()),
             expected_sender_leadership_revision: None,
-            role: role.map(str::to_owned),
+            role: command.role().map(str::to_owned),
+            expansion_slot,
             initial_roster: Vec::new(),
         }
     }
 
+    fn retire(command: &TeamRetireCommand, actor: &ResolvedOperationalActor) -> Self {
+        Self {
+            operation: TeamOperation::Retire,
+            workspace_id: command.workspace_id,
+            team_id: command.team_id,
+            actor: TeamCreator::from_actor(actor),
+            name: None,
+            purpose: None,
+            expected_revision: Some(command.expected_team_revision),
+            request_actor: None,
+            expected_sender_leadership_revision: None,
+            role: None,
+            expansion_slot: None,
+            initial_roster: Vec::new(),
+        }
+    }
+
+    fn expansion_join_source(
+        &self,
+    ) -> Result<Option<crate::team_expansion::TeamExpansionJoinSource>, OperationsError> {
+        let (TeamOperation::Join, Some(slot)) = (self.operation, self.expansion_slot) else {
+            return Ok(None);
+        };
+        match self.request_actor {
+            Some(actor @ OperationalActor::Participant { .. }) => {
+                let role = self.role.clone().ok_or(OperationsError::Corrupt(
+                    "slot-backed Team join role source",
+                ))?;
+                Ok(Some(crate::team_expansion::TeamExpansionJoinSource::new(
+                    actor, slot, role,
+                )))
+            }
+            Some(OperationalActor::LocalOperator) => Err(OperationsError::Corrupt(
+                "slot-backed Team join source actor",
+            )),
+            None => Ok(None),
+        }
+    }
+
     fn semantically_matches(&self, other: &Self) -> bool {
+        self.request_actor == other.request_actor && self.semantically_matches_without_source(other)
+    }
+
+    fn semantically_matches_legacy_slot_replay(&self, other: &Self) -> bool {
+        self.operation == TeamOperation::Join
+            && other.operation == TeamOperation::Join
+            && self.expansion_slot.is_some()
+            && self.request_actor.is_none()
+            && other.request_actor.is_some()
+            && self.semantically_matches_without_source(other)
+    }
+
+    fn semantically_matches_without_source(&self, other: &Self) -> bool {
         self.operation == other.operation
             && self.workspace_id == other.workspace_id
             && self.team_id == other.team_id
@@ -1360,9 +1787,9 @@ impl RequestFingerprint {
             && self.name == other.name
             && self.purpose == other.purpose
             && self.expected_revision == other.expected_revision
-            && self.request_actor == other.request_actor
             && self.expected_sender_leadership_revision == other.expected_sender_leadership_revision
             && self.role == other.role
+            && self.expansion_slot == other.expansion_slot
             && self.initial_roster == other.initial_roster
     }
 }
@@ -1413,6 +1840,7 @@ impl TeamRow {
 
 #[derive(Debug, Clone)]
 struct RawRequest {
+    request_id: Uuid,
     fingerprint: RequestFingerprint,
     result_team_state: TeamState,
     result_team_revision: u64,
@@ -1420,6 +1848,7 @@ struct RawRequest {
     result_membership: Option<TeamMemberRecord>,
     initial_members: Vec<TeamMemberRecord>,
     created: bool,
+    observed_at: TimestampMillis,
 }
 
 fn load_team_row(
@@ -1627,6 +2056,10 @@ fn validate_text(
     }
 }
 
+pub(crate) fn validate_team_role(role: &str) -> Result<(), OperationsError> {
+    validate_text(role, MAX_TEAM_ROLE_BYTES, "team role", true)
+}
+
 pub(crate) fn ensure_verified_workspace(
     connection: &Connection,
     workspace_id: WorkspaceId,
@@ -1677,6 +2110,28 @@ fn load_request(
     let Some(mut raw) = raw else {
         return Ok(None);
     };
+    raw.request_id = request_id;
+    match raw.fingerprint.operation {
+        TeamOperation::Join => {
+            raw.fingerprint.expansion_slot =
+                crate::team_expansion::slot_ref_for_join_request(connection, request_id)?;
+            crate::team_expansion::validate_legacy_join_slot_history(
+                connection,
+                request_id,
+                raw.fingerprint.workspace_id,
+                raw.fingerprint.team_id,
+                raw.observed_at,
+                raw.fingerprint.expansion_slot,
+            )?;
+        }
+        _ => {
+            if crate::team_expansion::slot_ref_for_join_request(connection, request_id)?.is_some() {
+                return Err(OperationsError::Corrupt(
+                    "Team expansion slot used by non-Join request",
+                ));
+            }
+        }
+    }
     let (roster, initial_members) = load_team_create_roster(
         connection,
         request_id,
@@ -1724,6 +2179,7 @@ fn decode_team_request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawReque
     )
     .map_err(to_sql_error)?;
     Ok(RawRequest {
+        request_id: Uuid::nil(),
         fingerprint: RequestFingerprint {
             operation: TeamOperation::decode(&row.get::<_, String>(0)?).map_err(to_sql_error)?,
             workspace_id,
@@ -1739,6 +2195,7 @@ fn decode_team_request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawReque
             request_actor,
             expected_sender_leadership_revision: row.get(25)?,
             role: row.get(26)?,
+            expansion_slot: None,
             initial_roster: Vec::new(),
         },
         result_team_state: TeamState::decode(&row.get::<_, String>(12)?).map_err(to_sql_error)?,
@@ -1747,6 +2204,7 @@ fn decode_team_request_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawReque
         result_membership,
         initial_members: Vec::new(),
         created: row.get::<_, i64>(20)? != 0,
+        observed_at: decode_timestamp(row.get(21)?).map_err(to_sql_error)?,
     })
 }
 
@@ -1861,7 +2319,7 @@ fn load_team_create_roster(
         {
             return Err(OperationsError::Corrupt("team roster order"));
         }
-        validate_text(&role, MAX_TEAM_ROLE_BYTES, "team role", true)?;
+        validate_team_role(&role)?;
         let activity_id = ActivityId::from_uuid(Uuid::from_bytes(wire::id(activity)?));
         let agent_id = AgentInstanceId::from_uuid(Uuid::from_bytes(wire::id(agent)?));
         let session_id = AgentSessionId::from_uuid(Uuid::from_bytes(wire::id(session)?));
@@ -1999,7 +2457,11 @@ fn replay_or_conflict(
     existing: &RawRequest,
     fingerprint: &RequestFingerprint,
 ) -> Result<TeamMutationRecord, OperationsError> {
-    if !existing.fingerprint.semantically_matches(fingerprint) {
+    if !existing.fingerprint.semantically_matches(fingerprint)
+        && !existing
+            .fingerprint
+            .semantically_matches_legacy_slot_replay(fingerprint)
+    {
         return Err(OperationsError::Conflict("team request replay"));
     }
     let record = stored_mutation_record(&transaction, existing)?;
@@ -2022,10 +2484,82 @@ fn stored_mutation_record(
         existing.result_team_revision,
         existing.result_team_updated_at,
     )?;
+    let team_capacity = if existing.fingerprint.operation == TeamOperation::Create {
+        crate::team_expansion::capacity_receipt_snapshot_for_create(
+            connection,
+            existing.fingerprint.workspace_id,
+            existing.fingerprint.team_id,
+            existing.request_id,
+        )?
+    } else {
+        None
+    };
+    let initial_roster_digest = if existing.fingerprint.operation == TeamOperation::Create
+        && !existing.fingerprint.initial_roster.is_empty()
+    {
+        Some(team_create_roster_digest_for_request(
+            &existing.fingerprint.initial_roster,
+        )?)
+    } else {
+        None
+    };
+    if team_capacity.is_some() && initial_roster_digest.is_none() {
+        return Err(OperationsError::Corrupt(
+            "Team create roster digest evidence",
+        ));
+    }
+    if existing.fingerprint.operation == TeamOperation::Create {
+        if team_capacity.is_some() {
+            crate::team_create_source::validate(
+                connection,
+                existing.request_id,
+                existing.fingerprint.workspace_id,
+                existing.fingerprint.team_id,
+            )?;
+        } else {
+            crate::team_create_source::validate_legacy_or_absent(
+                connection,
+                existing.request_id,
+                existing.fingerprint.workspace_id,
+                existing.fingerprint.team_id,
+            )?;
+        }
+    }
+    if let Some(capacity) = &team_capacity {
+        let creator = &existing.fingerprint.actor;
+        let capacity_actor = capacity.actor();
+        let actor_source_matches = matches!(
+            existing.fingerprint.request_actor,
+            Some(OperationalActor::Participant {
+                activity_id,
+                agent_id,
+                session_id,
+            }) if activity_id == capacity_actor.activity_id()
+                && agent_id == capacity_actor.agent_id()
+                && session_id == capacity_actor.session_id()
+        );
+        if !actor_source_matches
+            || creator.participation_id() != Some(capacity_actor.participation_id())
+            || creator.profile_id() != Some(capacity_actor.profile_id())
+            || creator.participant_id() != Some(capacity_actor.participant_id())
+            || creator.session_id() != Some(capacity_actor.session_id())
+            || creator.display_name() != capacity_actor.display_name()
+            || existing.fingerprint.expected_sender_leadership_revision
+                != Some(capacity.leadership_revision())
+        {
+            return Err(OperationsError::Corrupt(
+                "Team create capacity actor evidence",
+            ));
+        }
+    }
     Ok(TeamMutationRecord {
         team,
         membership: existing.result_membership.clone(),
         initial_members: existing.initial_members.clone(),
+        initial_roster_digest,
+        expansion_slot: existing.fingerprint.expansion_slot,
+        expansion_join_source: existing.fingerprint.expansion_join_source()?,
+        team_capacity,
         created: existing.created,
         replayed: true,
     })
@@ -2044,6 +2578,104 @@ pub(crate) fn read_team_mutation(
     let result = read_team_mutation_in_transaction(&tx, workspace_id, team_id, request_id)?;
     commit_team_read(tx)?;
     Ok(result)
+}
+
+fn read_team_mutation_owner_readback_for_actor(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    team_id: Uuid,
+    request_id: Uuid,
+    actor_input: OperationalActor,
+) -> Result<Option<crate::team_expansion::TeamMutationOwnerReadback>, OperationsError> {
+    validate_team_id(team_id)?;
+    validate_request_id(request_id)?;
+    let transaction = connection.unchecked_transaction()?;
+    ensure_verified_workspace(&transaction, workspace_id)?;
+    let reader = resolve_actor(&transaction, workspace_id, actor_input)?;
+    let is_current_orchestrator = crate::leadership::current_leadership_authority_in_transaction(
+        &transaction,
+        crate::LeadershipScope::workspace(workspace_id),
+    )?
+    .is_some_and(|authority| reader.participant_id() == Some(authority.participant_id()));
+    let authorized = is_current_orchestrator
+        || team_mutation_actor_matches_reader(
+            &transaction,
+            workspace_id,
+            team_id,
+            request_id,
+            &reader,
+        )?;
+    if !authorized {
+        commit_team_read(transaction)?;
+        return Ok(None);
+    }
+    let mutation =
+        read_team_mutation_in_transaction(&transaction, workspace_id, team_id, request_id)?;
+    let readback = mutation
+        .map(|mutation| -> Result<
+            crate::team_expansion::TeamMutationOwnerReadback,
+            OperationsError,
+        > {
+            let source = if let Some(source) = mutation.expansion_join_source() {
+                Some(
+                    crate::team_expansion::TeamMutationSourceEvidence::SlotBackedJoin(
+                        source.clone(),
+                    ),
+                )
+            } else if let Some(capacity) = mutation.team_capacity() {
+                let roster_digest =
+                    mutation
+                        .initial_roster_digest()
+                        .ok_or(OperationsError::Corrupt(
+                            "Team create roster digest evidence",
+                        ))?;
+                Some(
+                    crate::team_expansion::TeamMutationSourceEvidence::CappedCreate {
+                        capacity: (*capacity).clone(),
+                        roster_digest,
+                    },
+                )
+            } else {
+                None
+            };
+            Ok(crate::team_expansion::TeamMutationOwnerReadback::new(
+                mutation, source,
+            ))
+        })
+        .transpose()?;
+    commit_team_read(transaction)?;
+    Ok(readback)
+}
+
+fn team_mutation_actor_matches_reader(
+    connection: &Connection,
+    workspace_id: WorkspaceId,
+    team_id: Uuid,
+    request_id: Uuid,
+    reader: &ResolvedOperationalActor,
+) -> Result<bool, OperationsError> {
+    let (Some(participation_id), Some(profile_id)) =
+        (reader.participation_id(), reader.profile_id())
+    else {
+        return Ok(false);
+    };
+    let actor: Option<(Value, Value)> = connection
+        .query_row(
+            "SELECT actor_participation_id,actor_profile_id FROM ops_team_requests WHERE workspace_id=?1 AND team_id=?2 AND request_id=?3",
+            params![
+                workspace_id.into_uuid().as_bytes(),
+                team_id.as_bytes(),
+                request_id.as_bytes(),
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(matches!(
+        actor,
+        Some((Value::Blob(stored_participation), Value::Blob(stored_profile)))
+            if stored_participation.as_slice() == participation_id.into_uuid().as_bytes()
+                && stored_profile.as_slice() == profile_id.as_bytes()
+    ))
 }
 
 fn read_team_mutation_in_transaction(
@@ -2068,6 +2700,29 @@ fn read_team_mutation_in_transaction(
 }
 
 impl crate::OperationsCatalog {
+    /// Read one Team mutation and its source proof only when the caller is its
+    /// original stable Profile or the current Workspace Orchestrator. Generic
+    /// Team reads do not project source evidence.
+    ///
+    /// # Errors
+    /// Rejects invalid identities, unverified Workspace scope, corrupt source
+    /// receipts, or storage failures.
+    pub fn team_mutation_owner_readback(
+        &self,
+        workspace_id: WorkspaceId,
+        team_id: Uuid,
+        request_id: Uuid,
+        actor: OperationalActor,
+    ) -> Result<Option<crate::team_expansion::TeamMutationOwnerReadback>, OperationsError> {
+        read_team_mutation_owner_readback_for_actor(
+            &self.connection,
+            workspace_id,
+            team_id,
+            request_id,
+            actor,
+        )
+    }
+
     /// Read the current Team, a bounded member page, and an optional historical
     /// mutation receipt from one verified Workspace snapshot.
     ///
@@ -2161,12 +2816,16 @@ impl TeamRow {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use forge_domain::{ActivityId, AgentInstanceId, AgentSessionId};
     use rusqlite::Connection;
     use std::error::Error;
     use std::path::PathBuf;
+
+    mod capacity;
+    mod home_membership;
+    mod temporary_dispatch_capacity;
 
     const WORKSPACE: Uuid = Uuid::from_u128(0x1000);
     const WORKSPACE_TWO: Uuid = Uuid::from_u128(0x2000);
@@ -2209,7 +2868,85 @@ mod tests {
         }
     }
 
-    fn create_connection(path: Option<&PathBuf>) -> Result<Connection, Box<dyn Error>> {
+    fn participant_two() -> OperationalActor {
+        OperationalActor::Participant {
+            activity_id: ActivityId::from_uuid(ACTIVITY_TWO),
+            agent_id: AgentInstanceId::from_uuid(AGENT_TWO),
+            session_id: AgentSessionId::from_uuid(SESSION_TWO),
+        }
+    }
+
+    /// Test helper supplies explicit cap under a synthetic current Workspace
+    /// Orchestrator. Production capless create remains fail-closed.
+    pub(crate) fn ensure_team_expansion_schema(
+        connection: &Connection,
+    ) -> Result<(), OperationsError> {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ops_team_capacity_events')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            let transaction = connection.unchecked_transaction()?;
+            crate::team_expansion::create_schema(&transaction)?;
+            transaction.commit()?;
+        }
+        let transfers_exist: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ops_team_expansion_existing_home_transfers')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !transfers_exist {
+            let transaction = connection.unchecked_transaction()?;
+            crate::team_expansion::create_existing_home_transfer_schema(&transaction)?;
+            transaction.commit()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_test_workspace_orchestrator(
+        connection: &Connection,
+    ) -> Result<(), OperationsError> {
+        let election_subject_schema_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ops_election_subject_cutovers')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !election_subject_schema_exists {
+            crate::election_subject::create_schema(connection)?;
+        }
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ops_leadership WHERE workspace_id=?1 AND scope_kind=0 AND activity_id IS NULL AND team_id IS NULL)",
+            params![workspace(WORKSPACE).into_uuid().as_bytes()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            connection.execute(
+                "INSERT INTO ops_leadership(workspace_id,scope_kind,activity_id,team_id,state,leader_participant_id,leadership_revision,stabilization_until_ms,current_election_id,updated_at_ms) VALUES(?1,0,NULL,NULL,'ACTIVE',?2,1,NULL,NULL,1)",
+                params![workspace(WORKSPACE).into_uuid().as_bytes(), PARTICIPANT.as_bytes()],
+            )?;
+            connection.execute(
+                "INSERT INTO ops_leadership_receipts(workspace_id,scope_kind,activity_id,team_id,receipt_ordinal,receipt_kind,participant_id,leadership_revision,recorded_at_ms) VALUES(?1,0,zeroblob(16),zeroblob(16),1,'CONFIRMED',?2,1,1)",
+                params![workspace(WORKSPACE).into_uuid().as_bytes(), PARTICIPANT.as_bytes()],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn create_team(
+        connection: &mut Connection,
+        command: TeamCreateCommand,
+    ) -> Result<TeamMutationRecord, OperationsError> {
+        ensure_team_expansion_schema(connection)?;
+        ensure_test_workspace_orchestrator(connection)?;
+        create_team_with_capacity(
+            connection,
+            command,
+            crate::team_expansion::TeamMemberCapacity::new(8)?,
+        )
+    }
+
+    pub(crate) fn create_connection(path: Option<&PathBuf>) -> Result<Connection, Box<dyn Error>> {
         let fresh = path.is_none_or(|value| !value.exists());
         let connection = match path {
             Some(path) => Connection::open(path)?,
@@ -2230,7 +2967,14 @@ mod tests {
         }
         if fresh {
             create_schema(&connection)?;
+            crate::team_create_source::create_schema(&connection)?;
+            crate::temporary_dispatch::lifecycle::create_lifecycle_schema(&connection)?;
+            crate::session_replacement::create_schema(&connection)?;
             crate::leadership::create_schema(&connection)?;
+            crate::team_permanent_transfer::schema::create_schema(&connection)?;
+            crate::team_permanent_transfer::generation::create_schema(&connection)?;
+            crate::team_permanent_transfer::preparation::schema::create_schema(&connection)?;
+            crate::home_acceptance::schema::create_schema(&connection)?;
             seed_workspace(&connection, workspace(WORKSPACE))?;
             seed_workspace(&connection, workspace(WORKSPACE_TWO))?;
             seed_participant(&connection, workspace(WORKSPACE))?;
@@ -2297,7 +3041,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn seed_participant_identity(
+    pub(crate) fn seed_participant_identity(
         connection: &Connection,
         workspace: WorkspaceId,
         profile: Uuid,
@@ -2335,6 +3079,306 @@ mod tests {
         Ok(())
     }
 
+    #[derive(Clone)]
+    struct SyntheticProfileActor {
+        activity_id: Uuid,
+        agent_id: Uuid,
+        session_id: Uuid,
+        participation_id: Uuid,
+        profile_id: Uuid,
+        participant_id: Uuid,
+        display_name: String,
+    }
+
+    fn synthetic_profile_actor(
+        connection: &Connection,
+        actor: OperationalActor,
+    ) -> Result<SyntheticProfileActor, Box<dyn Error>> {
+        let OperationalActor::Participant {
+            activity_id,
+            agent_id,
+            session_id,
+        } = actor
+        else {
+            return Err("synthetic Team expansion actor must be a Profile participant".into());
+        };
+        let row = connection.query_row(
+            "SELECT mapping.participation_id,mapping.agent_profile_id,mapping.participant_id,logical.display_name FROM ops_workspace_participation_mappings AS mapping JOIN ops_current_effect_bindings AS binding ON binding.workspace_id=mapping.workspace_id AND binding.participant_id=mapping.participant_id AND binding.session_id=mapping.session_id JOIN ops_logical_members AS logical ON logical.workspace_id=mapping.workspace_id AND logical.participant_id=mapping.participant_id AND logical.session_id=mapping.session_id WHERE mapping.workspace_id=?1 AND binding.activity_id=?2 AND binding.agent_id=?3 AND binding.session_id=?4",
+            params![
+                workspace(WORKSPACE).into_uuid().as_bytes(),
+                activity_id.into_uuid().as_bytes(),
+                agent_id.into_uuid().as_bytes(),
+                session_id.into_uuid().as_bytes(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        Ok(SyntheticProfileActor {
+            activity_id: activity_id.into_uuid(),
+            agent_id: agent_id.into_uuid(),
+            session_id: session_id.into_uuid(),
+            participation_id: Uuid::from_slice(&row.0)?,
+            profile_id: Uuid::from_slice(&row.1)?,
+            participant_id: Uuid::from_slice(&row.2)?,
+            display_name: row.3,
+        })
+    }
+
+    fn synthetic_team_leader(
+        connection: &Connection,
+        team_id: Uuid,
+    ) -> Result<SyntheticProfileActor, Box<dyn Error>> {
+        let row = connection.query_row(
+            "SELECT binding.activity_id,binding.agent_id,binding.session_id,mapping.participation_id,mapping.agent_profile_id,mapping.participant_id,logical.display_name FROM ops_team_members AS member JOIN ops_workspace_participations AS participation ON participation.workspace_id=member.workspace_id AND participation.participation_id=member.participation_id JOIN ops_workspace_participation_mappings AS mapping ON mapping.workspace_id=member.workspace_id AND mapping.participation_id=member.participation_id AND mapping.agent_profile_id=participation.agent_profile_id JOIN ops_current_effect_bindings AS binding ON binding.workspace_id=mapping.workspace_id AND binding.participant_id=mapping.participant_id AND binding.session_id=mapping.session_id JOIN ops_logical_members AS logical ON logical.workspace_id=binding.workspace_id AND logical.participant_id=binding.participant_id AND logical.session_id=binding.session_id WHERE member.workspace_id=?1 AND member.team_id=?2 AND member.state='JOINED' ORDER BY member.participation_id LIMIT 1",
+            params![workspace(WORKSPACE).into_uuid().as_bytes(), team_id.as_bytes()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )?;
+        Ok(SyntheticProfileActor {
+            activity_id: Uuid::from_slice(&row.0)?,
+            agent_id: Uuid::from_slice(&row.1)?,
+            session_id: Uuid::from_slice(&row.2)?,
+            participation_id: Uuid::from_slice(&row.3)?,
+            profile_id: Uuid::from_slice(&row.4)?,
+            participant_id: Uuid::from_slice(&row.5)?,
+            display_name: row.6,
+        })
+    }
+
+    /// Seed an explicitly synthetic owner decision/anchor/assignment set for
+    /// Team membership boundary tests. This does not exercise Orchestrator
+    /// authorization or provisioning; those owner paths are tested separately.
+    #[derive(Clone, Copy)]
+    pub(crate) struct SyntheticExpansionSlotSeed<'a> {
+        team_id: Uuid,
+        decision_id: Uuid,
+        request_id: Uuid,
+        assignment_request_seed: Uuid,
+        expected_team_revision: u64,
+        targets: &'a [OperationalActor],
+        base_time_ms: i64,
+    }
+
+    struct SyntheticExpansionSlotContext {
+        capacity_revision: i64,
+        leader: SyntheticProfileActor,
+        orchestrator: SyntheticProfileActor,
+    }
+
+    pub(crate) fn seed_synthetic_expansion_slots(
+        connection: &Connection,
+        seed: SyntheticExpansionSlotSeed<'_>,
+    ) -> Result<Vec<crate::team_expansion::TeamExpansionSlotRef>, Box<dyn Error>> {
+        let seed = &seed;
+        if seed.targets.is_empty() || seed.targets.len() > 8 {
+            return Err("synthetic expansion target count is out of range".into());
+        }
+        let context = synthetic_expansion_slot_context(connection, seed)?;
+        seed_synthetic_expansion_request(connection, seed, &context)?;
+        seed_synthetic_expansion_decision(connection, seed, &context)?;
+        seed_synthetic_expansion_cooldown_anchor(connection, seed, &context)?;
+        seed_synthetic_expansion_slot_assignments(connection, seed, &context)
+    }
+
+    fn synthetic_expansion_slot_context(
+        connection: &Connection,
+        seed: &SyntheticExpansionSlotSeed<'_>,
+    ) -> Result<SyntheticExpansionSlotContext, Box<dyn Error>> {
+        let leader = synthetic_team_leader(connection, seed.team_id)?;
+        let orchestrator = synthetic_profile_actor(connection, participant())?;
+        let capacity_revision: i64 = connection.query_row(
+            "SELECT capacity_revision FROM ops_team_capacity_events WHERE workspace_id=?1 AND team_id=?2 ORDER BY capacity_revision DESC LIMIT 1",
+            params![workspace(WORKSPACE).into_uuid().as_bytes(), seed.team_id.as_bytes()],
+            |row| row.get(0),
+        )?;
+        let team_leadership_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ops_leadership WHERE workspace_id=?1 AND scope_kind=2 AND activity_id IS NULL AND team_id=?2)",
+            params![workspace(WORKSPACE).into_uuid().as_bytes(), seed.team_id.as_bytes()],
+            |row| row.get(0),
+        )?;
+        if !team_leadership_exists {
+            connection.execute(
+                "INSERT INTO ops_leadership(workspace_id,scope_kind,activity_id,team_id,state,leader_participant_id,leadership_revision,stabilization_until_ms,current_election_id,updated_at_ms) VALUES(?1,2,NULL,?2,'ACTIVE',?3,1,NULL,NULL,?4)",
+                params![
+                    workspace(WORKSPACE).into_uuid().as_bytes(),
+                    seed.team_id.as_bytes(),
+                    leader.participant_id.as_bytes(),
+                    seed.base_time_ms,
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO ops_leadership_receipts(workspace_id,scope_kind,activity_id,team_id,receipt_ordinal,receipt_kind,participant_id,leadership_revision,recorded_at_ms) VALUES(?1,2,zeroblob(16),?2,1,'CONFIRMED',?3,1,?4)",
+                params![
+                    workspace(WORKSPACE).into_uuid().as_bytes(),
+                    seed.team_id.as_bytes(),
+                    leader.participant_id.as_bytes(),
+                    seed.base_time_ms,
+                ],
+            )?;
+        }
+        Ok(SyntheticExpansionSlotContext {
+            capacity_revision,
+            leader,
+            orchestrator,
+        })
+    }
+
+    fn seed_synthetic_expansion_request(
+        connection: &Connection,
+        seed: &SyntheticExpansionSlotSeed<'_>,
+        context: &SyntheticExpansionSlotContext,
+    ) -> Result<(), Box<dyn Error>> {
+        connection.execute(
+            "INSERT INTO ops_team_expansion_requests(request_id,workspace_id,team_id,expected_team_revision,capacity_revision,requester_leadership_revision,requested_count,reason,actor_activity_id,actor_agent_id,actor_session_id,actor_participation_id,actor_profile_id,actor_participant_id,actor_display_name,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,1,?6,'synthetic owner fixture',?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![
+                seed.request_id.as_bytes(),
+                workspace(WORKSPACE).into_uuid().as_bytes(),
+                seed.team_id.as_bytes(),
+                i64::try_from(seed.expected_team_revision)?,
+                context.capacity_revision,
+                i64::try_from(seed.targets.len())?,
+                context.leader.activity_id.as_bytes(),
+                context.leader.agent_id.as_bytes(),
+                context.leader.session_id.as_bytes(),
+                context.leader.participation_id.as_bytes(),
+                context.leader.profile_id.as_bytes(),
+                context.leader.participant_id.as_bytes(),
+                context.leader.display_name.as_str(),
+                seed.base_time_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn seed_synthetic_expansion_decision(
+        connection: &Connection,
+        seed: &SyntheticExpansionSlotSeed<'_>,
+        context: &SyntheticExpansionSlotContext,
+    ) -> Result<(), Box<dyn Error>> {
+        connection.execute(
+            "INSERT INTO ops_team_expansion_decisions(decision_id,request_id,workspace_id,team_id,state,approved_count,expected_team_revision,capacity_revision,leadership_revision,actor_activity_id,actor_agent_id,actor_session_id,actor_participation_id,actor_profile_id,actor_participant_id,actor_display_name,decided_at_ms) VALUES(?1,?2,?3,?4,'APPROVED',?5,?6,?7,1,?8,?9,?10,?11,?12,?13,?14,?15)",
+            params![
+                seed.decision_id.as_bytes(),
+                seed.request_id.as_bytes(),
+                workspace(WORKSPACE).into_uuid().as_bytes(),
+                seed.team_id.as_bytes(),
+                i64::try_from(seed.targets.len())?,
+                i64::try_from(seed.expected_team_revision)?,
+                context.capacity_revision,
+                context.orchestrator.activity_id.as_bytes(),
+                context.orchestrator.agent_id.as_bytes(),
+                context.orchestrator.session_id.as_bytes(),
+                context.orchestrator.participation_id.as_bytes(),
+                context.orchestrator.profile_id.as_bytes(),
+                context.orchestrator.participant_id.as_bytes(),
+                context.orchestrator.display_name.as_str(),
+                seed.base_time_ms + 1,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn seed_synthetic_expansion_cooldown_anchor(
+        connection: &Connection,
+        seed: &SyntheticExpansionSlotSeed<'_>,
+        context: &SyntheticExpansionSlotContext,
+    ) -> Result<(), Box<dyn Error>> {
+        let anchor_at = seed.base_time_ms + 2;
+        let cooldown_until = anchor_at + 3_600_000;
+        connection.execute(
+            "INSERT INTO ops_team_expansion_cooldown_anchors(request_id,decision_id,workspace_id,team_id,anchor_at_ms,cooldown_until_ms,finalized_by_participation_id,finalized_by_profile_id,finalized_by_participant_id,finalized_by_activity_id,finalized_by_agent_id,finalized_by_session_id,finalized_by_display_name,finalized_by_leadership_revision) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,1)",
+            params![
+                seed.request_id.as_bytes(),
+                seed.decision_id.as_bytes(),
+                workspace(WORKSPACE).into_uuid().as_bytes(),
+                seed.team_id.as_bytes(),
+                anchor_at,
+                cooldown_until,
+                context.orchestrator.participation_id.as_bytes(),
+                context.orchestrator.profile_id.as_bytes(),
+                context.orchestrator.participant_id.as_bytes(),
+                context.orchestrator.activity_id.as_bytes(),
+                context.orchestrator.agent_id.as_bytes(),
+                context.orchestrator.session_id.as_bytes(),
+                context.orchestrator.display_name.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn seed_synthetic_expansion_slot_assignments(
+        connection: &Connection,
+        seed: &SyntheticExpansionSlotSeed<'_>,
+        context: &SyntheticExpansionSlotContext,
+    ) -> Result<Vec<crate::team_expansion::TeamExpansionSlotRef>, Box<dyn Error>> {
+        let mut result = Vec::with_capacity(seed.targets.len());
+        for (ordinal, target_input) in seed.targets.iter().copied().enumerate() {
+            let assignment_request_id = seed
+                .assignment_request_seed
+                .as_u128()
+                .checked_add(u128::try_from(ordinal)?)
+                .ok_or_else(|| std::io::Error::other("synthetic assignment request identity"))?;
+            let target = synthetic_profile_actor(connection, target_input)?;
+            connection.execute(
+                "INSERT INTO ops_team_expansion_slots(decision_id,request_id,ordinal,workspace_id,team_id) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    seed.decision_id.as_bytes(),
+                    seed.request_id.as_bytes(),
+                    i64::try_from(ordinal)?,
+                    workspace(WORKSPACE).into_uuid().as_bytes(),
+                    seed.team_id.as_bytes(),
+                ],
+            )?;
+            connection.execute(
+                "INSERT INTO ops_team_expansion_slot_assignments(request_id,decision_id,ordinal,workspace_id,team_id,target_participation_id,target_profile_id,target_participant_id,target_activity_id,target_agent_id,target_session_id,target_display_name,actor_participation_id,actor_profile_id,actor_participant_id,actor_activity_id,actor_agent_id,actor_session_id,actor_display_name,expected_team_revision,capacity_revision,leadership_revision,recorded_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,1,?22)",
+                params![
+                    Uuid::from_u128(assignment_request_id).as_bytes(),
+                    seed.decision_id.as_bytes(),
+                    i64::try_from(ordinal)?,
+                    workspace(WORKSPACE).into_uuid().as_bytes(),
+                    seed.team_id.as_bytes(),
+                    target.participation_id.as_bytes(),
+                    target.profile_id.as_bytes(),
+                    target.participant_id.as_bytes(),
+                    target.activity_id.as_bytes(),
+                    target.agent_id.as_bytes(),
+                    target.session_id.as_bytes(),
+                    target.display_name.as_str(),
+                    context.orchestrator.participation_id.as_bytes(),
+                    context.orchestrator.profile_id.as_bytes(),
+                    context.orchestrator.participant_id.as_bytes(),
+                    context.orchestrator.activity_id.as_bytes(),
+                    context.orchestrator.agent_id.as_bytes(),
+                    context.orchestrator.session_id.as_bytes(),
+                    context.orchestrator.display_name.as_str(),
+                    i64::try_from(seed.expected_team_revision)?,
+                    context.capacity_revision,
+                    seed.base_time_ms + 3 + i64::try_from(ordinal)?,
+                ],
+            )?;
+            result.push(crate::team_expansion::TeamExpansionSlotRef::new(
+                seed.decision_id,
+                u8::try_from(ordinal)?,
+            ));
+        }
+        Ok(result)
+    }
+
     fn create_command(
         request_id: Uuid,
         workspace_id: WorkspaceId,
@@ -2343,8 +3387,8 @@ mod tests {
             request_id,
             team_id: Uuid::from_u128(0xA100),
             workspace_id,
-            actor: local(),
-            expected_sender_leadership_revision: None,
+            actor: participant(),
+            expected_sender_leadership_revision: Some(1),
             name: "Review Team".to_owned(),
             purpose: "Review durable work".to_owned(),
             initial_members: vec![
@@ -2384,7 +3428,7 @@ mod tests {
         stale_second.initial_members[1].session_id =
             AgentSessionId::from_uuid(Uuid::from_u128(0xDEAD));
         let mut not_leader = base.clone();
-        not_leader.actor = participant();
+        not_leader.actor = participant_two();
         not_leader.expected_sender_leadership_revision = Some(1);
         for command in [
             blank_purpose,
@@ -2426,7 +3470,8 @@ mod tests {
         assert_eq!(
             connection.query_row("SELECT COUNT(*) FROM ops_leadership", [], |row| row
                 .get::<_, i64>(0))?,
-            0
+            1,
+            "synthetic Workspace authority must remain while invalid Team requests roll back"
         );
         Ok(())
     }
@@ -2436,14 +3481,6 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let mut connection = create_connection(None)?;
         crate::election_subject::create_schema(&connection)?;
-        connection.execute(
-            "INSERT INTO ops_leadership(workspace_id,scope_kind,activity_id,team_id,state,leader_participant_id,leadership_revision,stabilization_until_ms,current_election_id,updated_at_ms) VALUES(?1,0,NULL,NULL,'ACTIVE',?2,1,NULL,NULL,1)",
-            params![workspace(WORKSPACE).into_uuid().as_bytes(),PARTICIPANT.as_bytes()],
-        )?;
-        connection.execute(
-            "INSERT INTO ops_leadership_receipts(workspace_id,scope_kind,activity_id,team_id,receipt_ordinal,receipt_kind,participant_id,leadership_revision,recorded_at_ms) VALUES(?1,0,zeroblob(16),zeroblob(16),1,'CONFIRMED',?2,1,1)",
-            params![workspace(WORKSPACE).into_uuid().as_bytes(),PARTICIPANT.as_bytes()],
-        )?;
         let mut command = create_command(Uuid::from_u128(0xAD02), workspace(WORKSPACE))?;
         command.actor = participant();
         command.expected_sender_leadership_revision = Some(2);
@@ -2497,7 +3534,10 @@ mod tests {
             let team = read_team(&connection, workspace(WORKSPACE), Uuid::from_u128(0xA100))?
                 .ok_or_else(|| std::io::Error::other("team exists"))?;
             assert_eq!(team.name(), "Review Team");
-            assert_eq!(team.created_by().key(), "operator");
+            assert_eq!(
+                team.created_by().key(),
+                format!("participant:{PARTICIPATION}").as_str()
+            );
         }
         std::fs::remove_file(path)?;
         Ok(())
@@ -2581,30 +3621,64 @@ mod tests {
             &mut connection,
             create_command(Uuid::from_u128(0xA102), workspace(WORKSPACE))?,
         )?;
+        let team_id = team.team().team_id();
+        assert_local_operator_join_requires_a_profile(&mut connection, team_id)?;
+        assert_join_leave_replay_preserves_audit(&mut connection, team_id)?;
+        Ok(())
+    }
+
+    fn assert_local_operator_join_requires_a_profile(
+        connection: &mut Connection,
+        team_id: Uuid,
+    ) -> Result<(), Box<dyn Error>> {
         let local_join = TeamJoinCommand {
             request_id: Uuid::from_u128(0xA103),
             workspace_id: workspace(WORKSPACE),
-            team_id: team.team().team_id(),
+            team_id,
             expected_team_revision: 1,
             actor: local(),
             role: "reviewer".to_owned(),
+            expansion_slot: None,
             observed_at: timestamp(20)?,
         };
         assert!(matches!(
-            join_team(&mut connection, local_join),
+            join_team(connection, local_join),
             Err(OperationsError::Conflict(
                 "team membership requires participant"
             ))
         ));
+        Ok(())
+    }
+
+    fn assert_join_leave_replay_preserves_audit(
+        connection: &mut Connection,
+        team_id: Uuid,
+    ) -> Result<(), Box<dyn Error>> {
+        let slot = seed_synthetic_expansion_slots(
+            connection,
+            SyntheticExpansionSlotSeed {
+                team_id,
+                decision_id: Uuid::from_u128(0xA130),
+                request_id: Uuid::from_u128(0xA131),
+                assignment_request_seed: Uuid::from_u128(0xA132),
+                expected_team_revision: 1,
+                targets: &[participant()],
+                base_time_ms: 15,
+            },
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| std::io::Error::other("synthetic Team expansion slot"))?;
         let joined = join_team(
-            &mut connection,
+            connection,
             TeamJoinCommand {
                 request_id: Uuid::from_u128(0xA104),
                 workspace_id: workspace(WORKSPACE),
-                team_id: team.team().team_id(),
+                team_id,
                 expected_team_revision: 1,
                 actor: participant(),
                 role: "reviewer".to_owned(),
+                expansion_slot: Some(slot),
                 observed_at: timestamp(20)?,
             },
         )?;
@@ -2615,11 +3689,11 @@ mod tests {
         assert_eq!(joined_membership.profile_id(), Some(PROFILE));
         assert_eq!(joined_membership.role(), Some("reviewer"));
         let left = leave_team(
-            &mut connection,
+            connection,
             TeamLeaveCommand {
                 request_id: Uuid::from_u128(0xA105),
                 workspace_id: workspace(WORKSPACE),
-                team_id: team.team().team_id(),
+                team_id,
                 expected_team_revision: 2,
                 actor: participant(),
                 observed_at: timestamp(30)?,
@@ -2629,22 +3703,22 @@ mod tests {
             .membership()
             .ok_or_else(|| std::io::Error::other("left membership"))?;
         assert_eq!(left_membership.state(), TeamMembershipState::Left);
-        let members =
-            list_team_members(&connection, workspace(WORKSPACE), team.team().team_id(), 10)?;
+        let members = list_team_members(connection, workspace(WORKSPACE), team_id, 10)?;
         assert_eq!(members.items().len(), 3);
         assert!(!members.truncated());
         assert_eq!(members.items()[0].state(), TeamMembershipState::Left);
         assert_eq!(members.items()[0].profile_id(), Some(PROFILE));
         assert!(matches!(
             join_team(
-                &mut connection,
+                connection,
                 TeamJoinCommand {
                     request_id: Uuid::from_u128(0xA10A),
                     workspace_id: workspace(WORKSPACE),
-                    team_id: team.team().team_id(),
+                    team_id,
                     expected_team_revision: 1,
                     actor: participant(),
                     role: "stale".to_owned(),
+                    expansion_slot: None,
                     observed_at: timestamp(31)?
                 }
             ),
@@ -2656,11 +3730,11 @@ mod tests {
             })?;
         assert_eq!(events, 4);
         let replay = leave_team(
-            &mut connection,
+            connection,
             TeamLeaveCommand {
                 request_id: Uuid::from_u128(0xA105),
                 workspace_id: workspace(WORKSPACE),
-                team_id: team.team().team_id(),
+                team_id,
                 expected_team_revision: 2,
                 actor: participant(),
                 observed_at: timestamp(30)?,
@@ -2702,9 +3776,15 @@ mod tests {
         assert_eq!(current.purpose(), "Review durable work");
         assert_eq!(current.state(), TeamState::Active);
         assert_eq!(current.revision(), 1);
-        assert_eq!(current.created_by().key(), "operator");
-        assert_eq!(current.created_by().display_name(), "Local operator");
-        assert_eq!(current.created_by().participation_id(), None);
+        assert_eq!(
+            current.created_by().key(),
+            format!("participant:{PARTICIPATION}").as_str()
+        );
+        assert_eq!(current.created_by().display_name(), "Participant");
+        assert_eq!(
+            current.created_by().participation_id(),
+            Some(WorkspaceParticipationId::from_uuid(PARTICIPATION)?)
+        );
         assert_eq!(current.created_at(), timestamp(10)?);
         assert_eq!(current.updated_at(), timestamp(10)?);
         assert_eq!(current.formed_at(), Some(timestamp(10)?));
@@ -2853,6 +3933,7 @@ mod tests {
                     expected_team_revision: 2,
                     actor: participant(),
                     role: "observer".to_owned(),
+                    expansion_slot: None,
                     observed_at: timestamp(50)?
                 }
             ),

@@ -78,6 +78,9 @@ pub mod leadership;
 pub mod member_list;
 pub mod membership;
 pub mod membership_source;
+pub mod mission_evaluation;
+pub mod mission_evidence;
+pub mod mission_t2_checkpoint;
 pub mod node_assignment_admission;
 pub mod node_team;
 pub mod participation;
@@ -86,8 +89,14 @@ pub mod profiles;
 pub mod provider_chat;
 pub mod provider_worker;
 pub mod provisioning;
+pub mod reviewer_participation;
+pub mod reviewer_qualification_rule;
 pub mod sessions;
+pub mod team_expansion;
+pub mod team_permanent_transfer;
 pub mod teams;
+pub mod temporary_dispatch;
+pub mod temporary_dispatch_lifecycle;
 pub mod work_credit;
 
 const OPERATIONS_CATALOG_FILE_NAME: &str = "agent-operations.sqlite3";
@@ -790,6 +799,7 @@ fn profile_error_to_runtime(error: AgentProfileError) -> RuntimeError {
         | AgentProfileError::InvalidText { .. }
         | AgentProfileError::TooManyCapabilities { .. }
         | AgentProfileError::DuplicateCapability
+        | AgentProfileError::HomeAcceptanceProfilePageLimit
         | AgentProfileError::Timestamp(_) => RuntimeError::InvalidInput,
         AgentProfileError::ProfileMissing(_) => RuntimeError::NotFound,
         AgentProfileError::ProfileRevisionConflict { .. }
@@ -799,6 +809,8 @@ fn profile_error_to_runtime(error: AgentProfileError) -> RuntimeError {
         | AgentProfileError::ProfileMutationReplayConflict(_)
         | AgentProfileError::LogicalSessionReplayConflict(_)
         | AgentProfileError::LogicalSessionProfileConflict { .. }
+        | AgentProfileError::HomeAcceptanceProfilePinned
+        | AgentProfileError::HomeAcceptanceProfileConflict
         | AgentProfileError::ProfileNotActive { .. }
         | AgentProfileError::ProfileIdConflict(_) => RuntimeError::Conflict,
         other => RuntimeError::ProfileCatalog(other),

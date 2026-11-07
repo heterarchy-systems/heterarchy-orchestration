@@ -188,6 +188,7 @@ fn session_error(error: AgentSessionCatalogError) -> RuntimeError {
         | AgentSessionCatalogError::ForeignPrincipal(_) => RuntimeError::Forbidden,
         AgentSessionCatalogError::SessionIdConflict(_)
         | AgentSessionCatalogError::RevisionConflict(_)
+        | AgentSessionCatalogError::HomeAcceptancePending(_)
         | AgentSessionCatalogError::Transition(_) => RuntimeError::Conflict,
         AgentSessionCatalogError::Timestamp(_) | AgentSessionCatalogError::Revision(_) => {
             RuntimeError::InvalidInput

@@ -6,9 +6,14 @@ use hyper::Method;
 use hyper::header::HeaderValue;
 use uuid::Uuid;
 
+use crate::wire::team_commands::{
+    TeamCreateRequest, TeamCreateV2Request, TeamJoinRequest, TeamJoinV2Request,
+    TeamMutationReaderV2Wire, TeamMutationResponse, TeamMutationV2Intent,
+    TeamMutationV2ReadbackRequest, TeamMutationV2ReadbackResponse, TeamMutationV2Response,
+};
 use crate::wire::teams::{
     TeamGetQueryRequest, TeamGetQueryResponse, TeamListQueryRequest, TeamListQueryResponse,
-    TeamMemberWire, TeamMutationWire, TeamWire,
+    TeamMemberWire, TeamMutationV2Wire, TeamMutationWire, TeamWire,
 };
 
 use super::{ClientError, OrchestrationHttpClient};
@@ -72,6 +77,214 @@ impl OrchestrationHttpClient {
         }
         Ok(response)
     }
+
+    /// Read back an uncertain v1 create by its original v1 roster intent.
+    /// The read query can use a current Workspace Session after credential
+    /// or Session recovery; the immutable mutation receipt is still checked
+    /// against the original v1 create payload. This route cannot confirm a v2
+    /// capacity-bearing create or its source roster digest.
+    ///
+    /// # Errors
+    /// Rejects mismatched selectors or any receipt that differs from the
+    /// original create intent.
+    pub async fn team_create_mutation_readback(
+        &self,
+        authorization: &HeaderValue,
+        query: &TeamGetQueryRequest,
+        original: &TeamCreateRequest,
+    ) -> Result<Option<TeamMutationResponse>, ClientError> {
+        super::team_commands::validate_create_request(original)?;
+        validate_create_readback_query(query, original)?;
+        let response = self.team_get(authorization, query).await?;
+        let Some(mutation) = response.mutation else {
+            return Ok(None);
+        };
+        if !valid_mutation(&mutation, query.scope.workspace_id, query.team_id)
+            || !super::team_commands::valid_create_mutation(&mutation, original)
+        {
+            return Err(ClientError::Protocol);
+        }
+        Ok(Some(TeamMutationResponse {
+            scope: response.scope,
+            request_id: original.request_id,
+            team_id: original.team_id,
+            mutation,
+        }))
+    }
+
+    /// Read back an uncertain v1 join by its original join intent. This route
+    /// cannot confirm a v2 decision-slot-backed join and never retries it.
+    ///
+    /// # Errors
+    /// Rejects mismatched selectors or any receipt that differs from the
+    /// original join and expansion-slot intent.
+    pub async fn team_join_mutation_readback(
+        &self,
+        authorization: &HeaderValue,
+        query: &TeamGetQueryRequest,
+        original: &TeamJoinRequest,
+    ) -> Result<Option<TeamMutationResponse>, ClientError> {
+        super::team_commands::validate_join_request(original)?;
+        validate_join_readback_query(query, original)?;
+        let response = self.team_get(authorization, query).await?;
+        let Some(mutation) = response.mutation else {
+            return Ok(None);
+        };
+        if !valid_mutation(&mutation, query.scope.workspace_id, query.team_id)
+            || !super::team_commands::valid_join_mutation(&mutation, original)
+        {
+            return Err(ClientError::Protocol);
+        }
+        Ok(Some(TeamMutationResponse {
+            scope: response.scope,
+            request_id: original.request_id,
+            team_id: original.team_id,
+            mutation,
+        }))
+    }
+
+    /// Read an exact v2 create receipt through the owner-scoped source route.
+    /// This never falls back to the general v1 Team query.
+    ///
+    /// # Errors
+    /// Rejects malformed original intent, an invalid current reader selector,
+    /// or a source receipt that differs from the original v2 create.
+    pub async fn team_create_mutation_readback_v2(
+        &self,
+        authorization: &HeaderValue,
+        original: &TeamCreateV2Request,
+        reader: TeamMutationReaderV2Wire,
+    ) -> Result<Option<TeamMutationV2Response>, ClientError> {
+        super::team_commands::validate_create_v2_request(original)?;
+        validate_v2_reader(reader)?;
+        let request = TeamMutationV2ReadbackRequest {
+            reader,
+            intent: TeamMutationV2Intent::Create(original.clone()),
+        };
+        let response: TeamMutationV2ReadbackResponse = self
+            .call(
+                authorization,
+                Method::POST,
+                format!(
+                    "/internal/v2/workspaces/{}/teams/{}/receipts/query",
+                    original.scope.workspace_id, original.team_id
+                ),
+                Some(&request),
+                None,
+            )
+            .await?;
+        if response.scope != original.scope
+            || response.request_id != original.request_id
+            || response.team_id != original.team_id
+        {
+            return Err(ClientError::Protocol);
+        }
+        let Some(mutation) = response.receipt else {
+            return Ok(None);
+        };
+        if !valid_v2_mutation(&mutation, original.scope.workspace_id, original.team_id)
+            || !super::team_commands::valid_create_v2_mutation(&mutation, original)
+        {
+            return Err(ClientError::Protocol);
+        }
+        Ok(Some(TeamMutationV2Response {
+            scope: response.scope,
+            request_id: response.request_id,
+            team_id: response.team_id,
+            mutation,
+        }))
+    }
+
+    /// Read an exact v2 join receipt through the owner-scoped source route.
+    /// This never falls back to the general v1 Team query.
+    ///
+    /// # Errors
+    /// Rejects malformed original intent, an invalid current reader selector,
+    /// or a source receipt that differs from the original slot-backed join.
+    pub async fn team_join_mutation_readback_v2(
+        &self,
+        authorization: &HeaderValue,
+        original: &TeamJoinV2Request,
+        reader: TeamMutationReaderV2Wire,
+    ) -> Result<Option<TeamMutationV2Response>, ClientError> {
+        super::team_commands::validate_join_v2_request(original)?;
+        validate_v2_reader(reader)?;
+        let request = TeamMutationV2ReadbackRequest {
+            reader,
+            intent: TeamMutationV2Intent::Join(original.clone()),
+        };
+        let response: TeamMutationV2ReadbackResponse = self
+            .call(
+                authorization,
+                Method::POST,
+                format!(
+                    "/internal/v2/workspaces/{}/teams/{}/receipts/query",
+                    original.scope.workspace_id, original.team_id
+                ),
+                Some(&request),
+                None,
+            )
+            .await?;
+        if response.scope != original.scope
+            || response.request_id != original.request_id
+            || response.team_id != original.team_id
+        {
+            return Err(ClientError::Protocol);
+        }
+        let Some(mutation) = response.receipt else {
+            return Ok(None);
+        };
+        if !valid_v2_mutation(&mutation, original.scope.workspace_id, original.team_id)
+            || !mutation
+                .expansion_join_source
+                .as_ref()
+                .is_some_and(|source| super::team_commands::valid_join_v2_source(source, original))
+            || !super::team_commands::valid_join_v2_mutation(&mutation, original)
+        {
+            return Err(ClientError::Protocol);
+        }
+        Ok(Some(TeamMutationV2Response {
+            scope: response.scope,
+            request_id: response.request_id,
+            team_id: response.team_id,
+            mutation,
+        }))
+    }
+}
+
+fn validate_v2_reader(reader: TeamMutationReaderV2Wire) -> Result<(), ClientError> {
+    if reader.activity_id.is_nil() || reader.session_id.is_nil() {
+        return Err(ClientError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn validate_create_readback_query(
+    query: &TeamGetQueryRequest,
+    original: &TeamCreateRequest,
+) -> Result<(), ClientError> {
+    validate_get_request(query)?;
+    if query.scope.workspace_id != original.scope.workspace_id
+        || query.team_id != original.team_id
+        || query.request_id != Some(original.request_id)
+    {
+        return Err(ClientError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn validate_join_readback_query(
+    query: &TeamGetQueryRequest,
+    original: &TeamJoinRequest,
+) -> Result<(), ClientError> {
+    validate_get_request(query)?;
+    if query.scope.workspace_id != original.scope.workspace_id
+        || query.team_id != original.team_id
+        || query.request_id != Some(original.request_id)
+    {
+        return Err(ClientError::InvalidRequest);
+    }
+    Ok(())
 }
 
 fn validate_list_request(request: &TeamListQueryRequest) -> Result<(), ClientError> {
@@ -210,6 +423,92 @@ pub(super) fn valid_mutation(
             .iter()
             .all(|member| valid_member(member, workspace_id, team_id))
         && unique_member_ids(&mutation.initial_members)
+}
+
+pub(super) fn valid_v2_mutation(
+    mutation: &TeamMutationV2Wire,
+    workspace_id: Uuid,
+    team_id: Uuid,
+) -> bool {
+    valid_team(&mutation.team, workspace_id, Some(team_id))
+        && mutation
+            .membership
+            .as_ref()
+            .is_none_or(|member| valid_member(member, workspace_id, team_id))
+        && mutation.initial_members.len() <= MAX_TEAM_MEMBERS
+        && mutation
+            .initial_members
+            .iter()
+            .all(|member| valid_member(member, workspace_id, team_id))
+        && mutation.capacity.as_ref().is_none_or(|capacity| {
+            capacity.workspace_id == workspace_id
+                && capacity.team_id == team_id
+                && capacity.max_members <= 8
+                && capacity.revision > 0
+                && capacity.leadership_revision > 0
+                && capacity.recorded_at_ms >= mutation.team.created_at_ms
+                && capacity.recorded_at_ms <= mutation.team.updated_at_ms
+                && valid_v2_capacity_actor(&capacity.actor)
+        })
+        && mutation
+            .initial_roster_digest_v1
+            .as_deref()
+            .is_none_or(valid_v1_roster_digest)
+        && mutation.expansion_slot.is_none_or(|slot| {
+            !slot.decision_id.is_nil()
+                && slot.ordinal < 8
+                && mutation
+                    .membership
+                    .as_ref()
+                    .is_some_and(|membership| membership.state == "joined")
+        })
+        && mutation
+            .expansion_join_source
+            .as_ref()
+            .is_none_or(|source| {
+                !source.activity_id.is_nil()
+                    && !source.agent_id.is_nil()
+                    && !source.session_id.is_nil()
+                    && !source.decision_id.is_nil()
+                    && source.ordinal < 8
+                    && (1..=256).contains(&source.role.len())
+                    && !source.role.chars().any(char::is_control)
+                    && mutation.expansion_slot.is_some_and(|slot| {
+                        slot.decision_id == source.decision_id && slot.ordinal == source.ordinal
+                    })
+                    && mutation
+                        .membership
+                        .as_ref()
+                        .is_some_and(|membership| membership.state == "joined")
+            })
+        && matches!(
+            (
+                mutation.capacity.is_some(),
+                mutation.initial_roster_digest_v1.is_some()
+            ),
+            (true, true) | (false, false)
+        )
+        && unique_member_ids(&mutation.initial_members)
+}
+
+fn valid_v2_capacity_actor(
+    actor: &crate::wire::team_expansion::TeamExpansionActorReceiptWire,
+) -> bool {
+    !actor.activity_id.is_nil()
+        && !actor.agent_id.is_nil()
+        && !actor.session_id.is_nil()
+        && !actor.participation_id.is_nil()
+        && !actor.profile_id.is_nil()
+        && !actor.participant_id.is_nil()
+        && (1..=128).contains(&actor.display_name.len())
+        && !actor.display_name.chars().any(char::is_control)
+}
+
+fn valid_v1_roster_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn unique_team_ids(teams: &[TeamWire]) -> bool {

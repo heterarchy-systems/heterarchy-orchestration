@@ -2,7 +2,10 @@
 //! This proves import transport and the Team/AgentRequest read gate, not provider execution.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -13,15 +16,16 @@ use forge_backend::remote_authority::RemoteAgentSessionAuthority;
 use forge_backend::{BackendConfig as ForgeConfig, ForgeHttpClient};
 use forge_control::{ActivityBootstrapStatus, AgentSessionResolveRequest, ForgeControlClient};
 use forge_control::{
-    AgentAssignmentMutation, AgentAssignmentMutationRequest, AgentContextRequest,
-    AgentDagPlanCommitRequest, AgentExecutionAuthorityRequest, AgentFocusRequest,
-    ApprovalOnceRequest, ApprovalSubmissionStatus, DagNodeStartRequest,
-    EffectFactOutboxReadRequest, SubmitExecutionForApproval,
+    AgentAssignmentGetRequest, AgentAssignmentMutation, AgentAssignmentMutationRequest,
+    AgentAssignmentReadAuthority, AgentContextRequest, AgentDagPlanCommitRequest,
+    AgentExecutionAuthorityRequest, AgentFocusRequest, ApprovalOnceRequest,
+    ApprovalSubmissionStatus, DagNodeStartRequest, EffectFactOutboxReadRequest,
+    SubmitExecutionForApproval,
 };
 use forge_control::{
     AgentOperationsFreezeReadRequest, AgentOperationsFreezeReleaseRequest,
     AgentOperationsFreezeRequest, ForgeApprovalCoordinator, ForgeControl, ForgeControlWorker,
-    ForgeExecutionCoordinator, ResolvedWorkspaceScope,
+    ForgeExecutionCoordinator, HomeTransferSourceService, ResolvedWorkspaceScope,
 };
 use forge_domain::{
     ActivityCoordinatorActor, AgentAssignmentId, AgentAssignmentState, AgentAssignmentTarget,
@@ -35,8 +39,9 @@ use forge_domain::{
 };
 use forge_domain::{ActivityId, AgentSessionId, RuntimeInstanceId};
 use forge_domain::{
-    AuthenticatedPrincipal, DirectTokenId, EstablishWorkspace, ForgeBackendId, LocationId,
-    LocationRevision, OrchestrationIssuerId, TimestampMillis, WorkspaceId, WorkspaceRoot,
+    AuthenticatedPrincipal, CancelAgentAssignment, DirectTokenId, EstablishWorkspace,
+    ForgeBackendId, LocationId, LocationRevision, OrchestrationIssuerId, TimestampMillis,
+    WorkspaceId, WorkspaceRoot,
 };
 use forge_domain::{
     ExecutionAttribution, ExecutionId, ExecutionKind, ExecutionLimits, ExecutionListLimit,
@@ -51,7 +56,9 @@ use heterarchy_orchestration_auth::{
     McpTokenCatalog, McpTokenIssueRequest, McpTokenLabel, McpTokenRuntime, McpTokenService,
     McpTokenWorker,
 };
-use heterarchy_orchestration_backend::client::{ClientError, OrchestrationHttpClient};
+use heterarchy_orchestration_backend::client::{
+    ClientError, OrchestrationHttpClient, ReadbackTarget,
+};
 use heterarchy_orchestration_backend::forge_commands::ForgeCommandHttpClient;
 use heterarchy_orchestration_backend::forge_source::ForgeSourceHttpClient;
 use heterarchy_orchestration_backend::internal_session::{
@@ -82,12 +89,16 @@ use heterarchy_orchestration_backend::wire::node_team::{
     NodeTeamQueryRequest, NodeTeamScopeWire, NodeTeamSetRequest,
 };
 use heterarchy_orchestration_backend::wire::operations_import::{
-    ImportPhaseWire, ImportPrepareRequest, ImportProgressWire, ImportStepRequest,
+    ImportHandoffSealRequest, ImportPhaseWire, ImportPrepareRequest, ImportProgressWire,
+    ImportStepRequest,
 };
 use heterarchy_orchestration_backend::wire::team_commands::{
-    TeamCreateRequest, TeamRosterMemberRequest,
+    TeamCreateV2Request, TeamMutationReaderV2Wire, TeamMutationV2Response, TeamRosterMemberRequest,
 };
 use heterarchy_orchestration_backend::wire::teams::{TeamGetQueryRequest, TeamListQueryRequest};
+use heterarchy_orchestration_backend::wire::workspace_project::{
+    WorkspaceProjectConfigureRequest, WorkspaceProjectQueryRequest, WorkspaceProjectReadbackRequest,
+};
 use heterarchy_orchestration_backend::wire::{
     AgentProfileCreateRequest, AgentSessionOpenRequest, ProfileSessionBindRequest,
     WorkspaceQueryScope,
@@ -106,10 +117,28 @@ use uuid::Uuid;
 
 #[path = "../../heterarchy-orchestration-runtime/tests/support/broker_cluster.rs"]
 mod broker_cluster;
+#[path = "bootstrap_http/legacy_slot_recovery.rs"]
+mod legacy_slot_recovery;
+#[path = "bootstrap_http/mission_evaluation.rs"]
+mod mission_evaluation;
+#[path = "bootstrap_http/mission_evidence.rs"]
+mod mission_evidence;
+#[path = "bootstrap_http/mission_t2_checkpoint.rs"]
+mod mission_t2_checkpoint;
 #[path = "bootstrap_http/native_membership.rs"]
 mod native_membership;
 #[path = "bootstrap_http/p10.rs"]
 mod p10;
+#[path = "bootstrap_http/reviewer_participation.rs"]
+mod reviewer_participation;
+#[path = "bootstrap_http/reviewer_qualification_rule.rs"]
+mod reviewer_qualification_rule;
+#[path = "bootstrap_http/team_expansion.rs"]
+mod team_expansion;
+#[path = "bootstrap_http/team_expansion_v3_existing_home.rs"]
+mod team_expansion_v3_existing_home;
+#[path = "bootstrap_http/temporary_dispatch_lifecycle.rs"]
+mod temporary_dispatch_lifecycle;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 const FORGE_SECRET: &str = "isolated-bootstrap-http-fixture";
@@ -125,6 +154,7 @@ struct ForgeHost {
     control_client: ForgeControlClient,
     scope: ResolvedWorkspaceScope,
     client: ForgeHttpClient,
+    issuer: OrchestrationIssuerId,
     address: std::net::SocketAddr,
     boot_instance: RuntimeInstanceId,
     verified_ci: bool,
@@ -135,6 +165,22 @@ struct ForgeExecutionService {
     backend: ForgeBackendId,
     issuer: OrchestrationIssuerId,
     activity_runtime: RuntimeInstanceId,
+}
+
+struct SourceAssignmentFixture {
+    bootstrap_assignment_id: AgentAssignmentId,
+    bootstrap_target: AgentAssignmentTarget,
+    goal: RegisteredGoal,
+    mission_node: RegisteredDagNode,
+    dispatch_node: RegisteredDagNode,
+    unassigned_node: NodeTeamScopeWire,
+}
+
+#[derive(Clone, Copy)]
+struct MissionAssignmentSource {
+    assignment_id: AgentAssignmentId,
+    target: AgentAssignmentTarget,
+    source_sequence: u64,
 }
 
 fn establish_source(root: &Path) -> TestResult<ResolvedWorkspaceScope> {
@@ -242,6 +288,7 @@ impl ForgeHost {
             control_client: control,
             scope,
             client,
+            issuer,
             address,
             boot_instance,
             verified_ci,
@@ -400,125 +447,393 @@ async fn assert_session_open_fails_closed_without_broker(
     Ok(())
 }
 
-/// The real Broker authorizes Sessions; an already Verified import still
-/// requires the separate Forge delegation seal before membership mutation.
-async fn assert_real_broker_agent_request_flow(
-    client: &OrchestrationHttpClient,
-    bearer: &HeaderValue,
+/// Inputs and authenticated source context for the real Broker flow.
+struct RealBrokerAgentRequestFlow<'a> {
+    client: &'a OrchestrationHttpClient,
+    bearer: &'a HeaderValue,
+    backend_address: std::net::SocketAddr,
     principal: AuthenticatedPrincipal,
-    scope: &WorkspaceQueryScope,
-    progress: &ImportProgressWire,
-    case: (&ForgeHost, Uuid, ForgeExecutionService),
-) -> TestResult {
-    let (source, activity_id, service) = case;
-    let nonce = Uuid::now_v7();
-    let opened = client
+    scope: &'a WorkspaceQueryScope,
+    progress: &'a ImportProgressWire,
+    source: &'a ForgeHost,
+    activity_id: Uuid,
+    service: ForgeExecutionService,
+    non_operator: &'a reviewer_qualification_rule::NonOperatorCredential,
+    transfer_exercise: TransferExercise,
+}
+
+#[derive(Clone, Copy)]
+struct VerifiedBrokerOperatorSession {
+    session_id: Uuid,
+    revision: i64,
+}
+
+/// The real Broker authorizes Sessions; a Verified import still requires
+/// Forge's exact delegation seal before membership mutation.
+async fn assert_real_broker_agent_request_flow(
+    flow: &RealBrokerAgentRequestFlow<'_>,
+) -> TestResult<u64> {
+    let operator_session = open_verified_operator_session(flow).await?;
+    let readback_session = open_verified_operator_session(flow).await?;
+    assert_ne!(operator_session.session_id, readback_session.session_id);
+    let reviewer_rule_flow = reviewer_qualification_rule::ReviewerQualificationRuleFlow {
+        client: flow.client,
+        operator_bearer: flow.bearer,
+        source: flow.source,
+        scope: flow.scope,
+        operator_principal: flow.principal,
+        original_session: reviewer_qualification_rule::RuleSession {
+            session_id: operator_session.session_id,
+            revision: operator_session.revision,
+        },
+        readback_session: reviewer_qualification_rule::RuleSession {
+            session_id: readback_session.session_id,
+            revision: readback_session.revision,
+        },
+        non_operator: flow.non_operator,
+    };
+    reviewer_qualification_rule::assert_reviewer_qualification_rule_http_flow(&reviewer_rule_flow)
+        .await?;
+    let target = MemberTarget {
+        scope: flow.scope.clone(),
+        activity_id: flow.activity_id,
+        session_id: operator_session.session_id,
+    };
+    let request_id = assert_undelegated_member_absent(flow.client, flow.bearer, &target).await?;
+    assert_verified_import_handoff(flow).await?;
+    let first_member =
+        register_and_admit_operator_member(flow, &target, request_id, operator_session).await?;
+    assert_team_flow_and_rebind_second_session(flow, &target, first_member).await
+}
+
+async fn open_verified_operator_session(
+    flow: &RealBrokerAgentRequestFlow<'_>,
+) -> TestResult<VerifiedBrokerOperatorSession> {
+    let request_id = Uuid::now_v7();
+    let opened = flow
+        .client
         .open_session(
-            bearer,
+            flow.bearer,
             &AgentSessionOpenRequest {
-                request_id: nonce.to_string(),
+                request_id: request_id.to_string(),
             },
         )
         .await?;
     assert!(opened.created);
-    assert_eq!(opened.session.request_id, nonce);
+    assert_eq!(opened.session.request_id, request_id);
     assert_eq!(opened.session.state, "open");
     assert_eq!(
-        client
-            .session_open_readback(bearer, nonce)
+        flow.client
+            .session_open_readback(flow.bearer, request_id)
             .await?
             .ok_or("Broker-backed Session receipt missing")?
             .session_id,
         opened.session.session_id
     );
     let session_id = AgentSessionId::from_uuid(opened.session.session_id);
-    let forge_control = source.control_client.clone();
+    let control = flow.source.control_client.clone();
+    let principal = flow.principal;
     let original = tokio::task::spawn_blocking(move || {
-        forge_control.agent_session_resolve(AgentSessionResolveRequest {
+        control.agent_session_resolve(AgentSessionResolveRequest {
             session_id,
             principal,
         })
     })
     .await??;
     assert_eq!(original.id().into_uuid(), opened.session.session_id);
-    assert_eq!(original.principal(), principal);
-    let target = MemberTarget {
-        scope: scope.clone(),
-        activity_id,
+    assert_eq!(original.principal(), flow.principal);
+    Ok(VerifiedBrokerOperatorSession {
         session_id: opened.session.session_id,
+        revision: opened.session.revision,
+    })
+}
+
+async fn assert_verified_import_handoff(flow: &RealBrokerAgentRequestFlow<'_>) -> TestResult {
+    let sealed =
+        seal_verified_source_import(flow.source, flow.service.issuer, flow.progress).await?;
+    assert_eq!(sealed["manifest_digest"], flow.progress.verify_digest);
+    assert_eq!(
+        flow.service.backend,
+        flow.source.client.expected_backend_id()
+    );
+    assert_eq!(
+        flow.progress.destination_id,
+        flow.source.client.destination_id()
+    );
+    let request = ImportHandoffSealRequest {
+        scope: flow.scope.clone(),
+        destination_id: flow.source.client.destination_id(),
+        expected_source_revision: flow.progress.source_revision,
+        expected_verified_digest: flow.progress.verify_digest.clone(),
     };
-    let request_id = assert_undelegated_member_absent(client, bearer, &target).await?;
-    let sealed = seal_verified_source_import(source, service.issuer, progress).await?;
-    assert_eq!(sealed["manifest_digest"], progress.verify_digest);
-    native_membership::assert_native_member_registration(
-        client,
-        bearer,
-        principal,
-        source,
-        scope,
-        activity_id,
-    )
-    .await?;
-    bind_fixture_profile_session(
-        client,
-        bearer,
-        opened.session.session_id,
-        "isolated-bootstrap-planner",
-    )
-    .await?;
-    let registration =
-        native_membership::assert_profile_member_registration(client, bearer, &target, request_id)
-            .await?;
-    let revision = assert_live_forge_coordinator(
-        source,
-        principal,
-        activity_id,
-        opened.session.session_id,
-        registration.progress.agent_id,
-    )
-    .await?;
-    assert!(revision > 0);
-    assert_durable_agent_request(
-        client,
-        bearer,
-        &registration.target,
-        registration.progress.agent_id,
-        revision,
-    )
-    .await?;
-    assert_two_member_team_and_close(
-        client,
-        bearer,
-        principal,
-        source,
-        &target,
-        ReadyFixtureMember {
-            session_id: opened.session.session_id,
-            agent_id: registration.progress.agent_id,
-            participant_id: registration.progress.participant_id,
-            revision: opened.session.revision,
-        },
-        service,
-    )
-    .await?;
+    let handoff = flow
+        .client
+        .import_handoff_seal(flow.bearer, flow.progress.migration_id, &request)
+        .await?;
+    assert_eq!(handoff.migration_id, flow.progress.migration_id);
+    assert_eq!(handoff.workspace_id, flow.scope.workspace_id);
+    assert_eq!(handoff.destination_id, flow.source.client.destination_id());
+    assert_eq!(handoff.source_revision, flow.progress.source_revision);
+    assert_eq!(handoff.verified_digest, flow.progress.verify_digest);
+    assert_eq!(handoff.issuer_id, flow.service.issuer.into_uuid());
+    assert_eq!(handoff.backend_id, flow.service.backend.into_uuid());
+    assert_eq!(
+        flow.client
+            .import_handoff_seal_readback(flow.bearer, flow.progress.migration_id, &request)
+            .await?,
+        Some(handoff)
+    );
     Ok(())
 }
 
-async fn assert_two_member_team_and_close(
+async fn register_and_admit_operator_member(
+    flow: &RealBrokerAgentRequestFlow<'_>,
+    target: &MemberTarget,
+    request_id: Uuid,
+    session: VerifiedBrokerOperatorSession,
+) -> TestResult<ReadyFixtureMember> {
+    native_membership::assert_native_member_registration(
+        flow.client,
+        flow.bearer,
+        flow.principal,
+        flow.source,
+        flow.scope,
+        flow.activity_id,
+        match flow.transfer_exercise {
+            TransferExercise::Preparation | TransferExercise::SourceDispatch => {
+                native_membership::ProfileLinkTiming::BeforeWorkspaceRegistration
+            }
+            _ => native_membership::ProfileLinkTiming::AfterWorkspaceRegistration,
+        },
+    )
+    .await?;
+    let profile_id = bind_fixture_profile_session(
+        flow.client,
+        flow.bearer,
+        session.session_id,
+        "isolated-bootstrap-planner",
+    )
+    .await?;
+    let registration = native_membership::assert_profile_member_registration(
+        flow.client,
+        flow.bearer,
+        target,
+        request_id,
+    )
+    .await?;
+    let leadership_revision = assert_live_forge_coordinator(
+        flow.source,
+        flow.principal,
+        flow.activity_id,
+        session.session_id,
+        registration.progress.agent_id,
+    )
+    .await?;
+    assert!(leadership_revision > 0);
+    configure_fixture_workspace_project(flow.client, flow.bearer, flow.scope).await?;
+    assert_durable_agent_request(
+        flow.client,
+        flow.bearer,
+        &registration.target,
+        registration.progress.agent_id,
+        leadership_revision,
+    )
+    .await?;
+    Ok(ReadyFixtureMember {
+        session_id: session.session_id,
+        agent_id: registration.progress.agent_id,
+        participant_id: registration.progress.participant_id,
+        profile_id,
+        revision: session.revision,
+    })
+}
+
+/// Supply the required provider route in this isolated fixture before admission
+/// prepares a new `RuntimeSession`; this does not dispatch provider work.
+async fn configure_fixture_workspace_project(
     client: &OrchestrationHttpClient,
     bearer: &HeaderValue,
-    principal: AuthenticatedPrincipal,
-    source: &ForgeHost,
+    scope: &WorkspaceQueryScope,
+) -> TestResult {
+    const PROJECT_ID: &str = "g-p-6ad231f7ad7c8191bfc1d5ff782c171f";
+
+    let query = WorkspaceProjectQueryRequest {
+        scope: scope.clone(),
+    };
+    let before = client.workspace_project_binding(bearer, &query).await?;
+    assert!(
+        before.binding.is_none(),
+        "isolated bootstrap Workspace unexpectedly already has a Project binding"
+    );
+
+    let request = WorkspaceProjectConfigureRequest {
+        request_id: Uuid::now_v7(),
+        scope: scope.clone(),
+        expected_revision: None,
+        project_id: PROJECT_ID.to_owned(),
+    };
+    let readback_request = WorkspaceProjectReadbackRequest {
+        request_id: request.request_id,
+        scope: request.scope.clone(),
+    };
+    let response_receipt = match client.configure_workspace_project(bearer, &request).await {
+        Ok(response) => {
+            assert!(!response.replayed);
+            assert!(response.work_authorized);
+            assert_eq!(response.current_binding.project_id, request.project_id);
+            Some(response.receipt)
+        }
+        Err(
+            error @ (ClientError::ReadbackRequired { .. } | ClientError::UnknownOutcome { .. }),
+        ) => {
+            let readback_matches = match &error {
+                ClientError::ReadbackRequired {
+                    readback: ReadbackTarget::WorkspaceProjectBinding(original),
+                }
+                | ClientError::UnknownOutcome {
+                    readback: ReadbackTarget::WorkspaceProjectBinding(original),
+                } => original.as_ref() == &readback_request,
+                _ => false,
+            };
+            if !readback_matches {
+                return Err(format!(
+                    "Workspace Project configure has a foreign readback target: {error:?}"
+                )
+                .into());
+            }
+            None
+        }
+        Err(error) => {
+            return Err(format!("Workspace Project configure failed: {error:?}").into());
+        }
+    };
+
+    let readback = client
+        .workspace_project_binding_readback(bearer, &readback_request)
+        .await?;
+    let receipt = readback
+        .receipt
+        .ok_or("exact Workspace Project configure receipt missing")?;
+    assert_eq!(receipt.request_id, request.request_id);
+    assert_eq!(receipt.scope, request.scope);
+    assert_eq!(receipt.expected_revision, request.expected_revision);
+    assert_eq!(receipt.project_id, request.project_id);
+    assert_eq!(receipt.binding.workspace_id, request.scope.workspace_id);
+    assert_eq!(receipt.binding.project_id, request.project_id);
+    assert_eq!(receipt.binding.revision, "1");
+    if let Some(response_receipt) = response_receipt {
+        assert_eq!(receipt, response_receipt);
+    }
+
+    let current = client.workspace_project_binding(bearer, &query).await?;
+    let binding = current
+        .binding
+        .ok_or("configured Workspace Project binding is not current")?;
+    assert!(current.work_authorized);
+    assert_eq!(binding.project_id, request.project_id);
+    assert_eq!(binding.revision, receipt.binding.revision);
+    Ok(())
+}
+
+async fn assert_team_flow_and_rebind_second_session(
+    flow: &RealBrokerAgentRequestFlow<'_>,
     target: &MemberTarget,
     first: ReadyFixtureMember,
-    service: ForgeExecutionService,
+) -> TestResult<u64> {
+    let members = provision_team_flow_members(flow, target, &first).await?;
+    assert_reviewer_participation_for_team_flow(flow, target, &members).await?;
+    assert_no_initial_workspace_leadership(flow, target).await?;
+
+    let outcome = assert_team_leadership_and_execution(flow, target, &first, &members).await?;
+    if flow.transfer_exercise == TransferExercise::SourceDispatch {
+        // Source preparation fences fresh target work; this exercise ends
+        // before the ordinary Session-rebind path.
+        return Ok(outcome.final_source_assignment.source_sequence);
+    }
+    let final_source_sequence =
+        assert_rebind_preserves_mission_evidence(flow, target, &members, &outcome).await?;
+    close_initial_operator_session(flow, target, &first).await?;
+    Ok(final_source_sequence)
+}
+
+struct TeamFlowMembers {
+    reviewer: ReadyFixtureMember,
+    mission_assignee: ReadyFixtureMember,
+}
+
+struct TeamFlowOutcome {
+    evidence: mission_evidence::MissionEvidenceRecoveryFixture,
+    mission_assignment: MissionAssignmentSource,
+    final_source_assignment: MissionAssignmentSource,
+}
+
+async fn provision_team_flow_members(
+    flow: &RealBrokerAgentRequestFlow<'_>,
+    target: &MemberTarget,
+    first: &ReadyFixtureMember,
+) -> TestResult<TeamFlowMembers> {
+    let reviewer = assert_ready_profile_member(
+        flow.client,
+        flow.bearer,
+        flow.principal,
+        flow.source,
+        target,
+        "isolated-bootstrap-reviewer",
+    )
+    .await?;
+    let mission_assignee = assert_ready_profile_member(
+        flow.client,
+        flow.bearer,
+        flow.principal,
+        flow.source,
+        target,
+        "isolated-bootstrap-mission-assignee",
+    )
+    .await?;
+    assert_ne!(reviewer.session_id, first.session_id);
+    assert_ne!(reviewer.agent_id, first.agent_id);
+    assert_ne!(reviewer.participant_id, first.participant_id);
+    assert_ne!(mission_assignee.session_id, first.session_id);
+    assert_ne!(mission_assignee.agent_id, first.agent_id);
+    assert_ne!(mission_assignee.participant_id, first.participant_id);
+    assert_ne!(mission_assignee.session_id, reviewer.session_id);
+    assert_ne!(mission_assignee.agent_id, reviewer.agent_id);
+    assert_ne!(mission_assignee.participant_id, reviewer.participant_id);
+    Ok(TeamFlowMembers {
+        reviewer,
+        mission_assignee,
+    })
+}
+
+async fn assert_reviewer_participation_for_team_flow(
+    flow: &RealBrokerAgentRequestFlow<'_>,
+    target: &MemberTarget,
+    members: &TeamFlowMembers,
 ) -> TestResult {
-    let second = assert_second_ready_member(client, bearer, principal, source, target).await?;
-    assert_ne!(second.session_id, first.session_id);
-    assert_ne!(second.agent_id, first.agent_id);
-    let leadership = client
+    reviewer_participation::assert_reviewer_participation_http_flow(
+        &reviewer_participation::ReviewerParticipationFlow {
+            client: flow.client,
+            operator_bearer: flow.bearer,
+            operator_principal: flow.principal,
+            non_operator: flow.non_operator,
+            source: flow.source,
+            scope: &target.scope,
+            activity_id: target.activity_id,
+            target_a: &members.reviewer,
+            target_b: &members.mission_assignee,
+        },
+    )
+    .await
+}
+
+async fn assert_no_initial_workspace_leadership(
+    flow: &RealBrokerAgentRequestFlow<'_>,
+    target: &MemberTarget,
+) -> TestResult {
+    let leadership = flow
+        .client
         .leadership_view(
-            bearer,
+            flow.bearer,
             &LeadershipQueryRequest {
                 scope: target.scope.clone(),
                 session_id: Some(target.session_id),
@@ -533,46 +848,124 @@ async fn assert_two_member_team_and_close(
         leadership.leadership.is_none(),
         "This empty-Forge fixture has no AssignmentOffered evidence to authorize Workspace leadership"
     );
-    let (assignment_id, unassigned_node) =
-        issue_real_forge_assignment_offer(source, principal, target.activity_id, &second).await?;
-    let approved = assert_team_from_source_leadership(
-        client,
-        bearer,
-        source,
-        target,
-        &second,
-        assignment_id,
-        unassigned_node,
+    Ok(())
+}
+
+async fn assert_team_leadership_and_execution(
+    flow: &RealBrokerAgentRequestFlow<'_>,
+    target: &MemberTarget,
+    first: &ReadyFixtureMember,
+    members: &TeamFlowMembers,
+) -> TestResult<TeamFlowOutcome> {
+    let assignments = issue_bootstrap_forge_assignment_offer(
+        flow.source,
+        flow.principal,
+        target.activity_id,
+        &members.reviewer,
     )
-    .await
-    .map_err(|error| format!("P10 Team/Orchestration approval stage: {error:?}"))?;
-    assert_real_approved_forge_execution(
-        source,
-        principal,
-        target,
-        &first,
-        service,
-        unassigned_node,
-        &approved,
-    )
-    .await
-    .map_err(|error| format!("P10 Forge approved execution stage: {error:?}"))?;
-    assert_forge_terminal_effect_consumed(client, bearer, source, target, approved.request.id())
+    .await?;
+    let leadership_case = SourceLeadershipTeamCase {
+        client: flow.client,
+        bearer: flow.bearer,
+        source: flow.source,
+        creator: target,
+        leader: &members.reviewer,
+        third: &members.mission_assignee,
+        assignments: &assignments,
+        principal: flow.principal,
+    };
+    let leadership_outcome = assert_team_from_source_leadership(&leadership_case)
+        .await
+        .map_err(|error| format!("P10 Team/Orchestration approval stage: {error:?}"))?;
+    if flow.source.verified_ci {
+        assert_real_approved_forge_execution(
+            flow.source,
+            flow.principal,
+            target,
+            first,
+            flow.service,
+            assignments.unassigned_node,
+            &leadership_outcome.approved,
+        )
+        .await
+        .map_err(|error| format!("P10 Forge approved execution stage: {error:?}"))?;
+        assert_forge_terminal_effect_consumed(
+            flow.client,
+            flow.bearer,
+            flow.source,
+            target,
+            leadership_outcome.approved.request.id(),
+        )
         .await
         .map_err(|error| format!("P10 source-terminal consumption stage: {error:?}"))?;
-    let second_closed = client
-        .close_session(
-            bearer,
-            second.session_id,
-            &heterarchy_orchestration_backend::wire::AgentSessionCloseRequest {
-                expected_revision: second.revision,
+    }
+    let final_source_assignment =
+        temporary_dispatch_lifecycle::assert_temporary_dispatch_http_flow(
+            &temporary_dispatch_lifecycle::TemporaryDispatchFlowContext {
+                client: flow.client,
+                bearer: flow.bearer,
+                backend_address: flow.backend_address,
+                principal: flow.principal,
+                source: flow.source,
+                creator: target,
+                workspace_leader: &members.reviewer,
+                workspace_leadership_revision: leadership_outcome.workspace_leadership_revision,
+                home_team_id: leadership_outcome.team_id,
+                home_leader: &members.mission_assignee,
+                target: first,
+                assignments: &assignments,
+                transfer_exercise: flow.transfer_exercise,
             },
         )
         .await?;
-    assert_eq!(second_closed.state, "closed");
-    let closed = client
+    Ok(TeamFlowOutcome {
+        evidence: leadership_outcome.evidence,
+        mission_assignment: leadership_outcome.mission_assignment,
+        final_source_assignment,
+    })
+}
+
+async fn assert_rebind_preserves_mission_evidence(
+    flow: &RealBrokerAgentRequestFlow<'_>,
+    target: &MemberTarget,
+    members: &TeamFlowMembers,
+    outcome: &TeamFlowOutcome,
+) -> TestResult<u64> {
+    // Bootstrap is fixture history. Detach vacates its O leadership row; this
+    // readback checks the same semantic actor's original evidence receipts.
+    mission_evidence::assert_session_rebind_readback(
+        flow.client,
+        flow.bearer,
+        flow.source,
+        target,
+        flow.principal,
+        &members.reviewer,
+        &outcome.evidence,
+    )
+    .await?;
+    assert_mission_assignment_remains_offered(
+        flow.source,
+        outcome.mission_assignment,
+        target.activity_id,
+    )
+    .await?;
+    temporary_dispatch_lifecycle::assert_final_source_cursor(
+        flow,
+        target,
+        outcome.final_source_assignment,
+    )
+    .await
+}
+
+async fn close_initial_operator_session(
+    flow: &RealBrokerAgentRequestFlow<'_>,
+    target: &MemberTarget,
+    first: &ReadyFixtureMember,
+) -> TestResult {
+    let closed = flow
+        .client
         .close_session(
-            bearer,
+            flow.bearer,
             target.session_id,
             &heterarchy_orchestration_backend::wire::AgentSessionCloseRequest {
                 expected_revision: first.revision,
@@ -592,21 +985,23 @@ fn fixture_registration(target: &MemberTarget) -> MemberRegisterRequest {
     }
 }
 
-/// Create a distinct, real Profile-bound Session and activate its own
-/// source-attested Agent binding. The roster must never share one participant.
+/// A Ready member remains bound to one exact Profile, logical Session and
+/// source-attested Forge Agent.
 struct ReadyFixtureMember {
     session_id: Uuid,
     agent_id: Uuid,
     participant_id: Uuid,
+    profile_id: Uuid,
     revision: i64,
 }
 
-async fn assert_second_ready_member(
+async fn assert_ready_profile_member(
     client: &OrchestrationHttpClient,
     bearer: &HeaderValue,
     principal: AuthenticatedPrincipal,
     source: &ForgeHost,
     first: &MemberTarget,
+    stable_name: &str,
 ) -> TestResult<ReadyFixtureMember> {
     let opened = client
         .open_session(
@@ -629,13 +1024,8 @@ async fn assert_second_ready_member(
     .await??;
     assert_eq!(verified.id().into_uuid(), session.session_id);
     assert_eq!(verified.principal(), principal);
-    bind_fixture_profile_session(
-        client,
-        bearer,
-        session.session_id,
-        "isolated-bootstrap-reviewer",
-    )
-    .await?;
+    let profile_id =
+        bind_fixture_profile_session(client, bearer, session.session_id, stable_name).await?;
     let target = MemberTarget {
         scope: first.scope.clone(),
         activity_id: first.activity_id,
@@ -652,6 +1042,7 @@ async fn assert_second_ready_member(
         session_id: session.session_id,
         agent_id: registration.progress.agent_id,
         participant_id: registration.progress.participant_id,
+        profile_id,
         revision: session.revision,
     })
 }
@@ -815,7 +1206,50 @@ async fn assert_durable_agent_request(
         independence: AdmissionIndependenceWire::IndependentFromCurrentWriter,
         reason: "Independent source-backed evidence review".to_owned(),
     };
-    let result = client.admit_agent_request(bearer, &request).await?;
+    let result = match client.admit_agent_request(bearer, &request).await {
+        Ok(result) => result,
+        Err(
+            error @ (ClientError::ReadbackRequired { .. } | ClientError::UnknownOutcome { .. }),
+        ) => {
+            use heterarchy_orchestration_backend::client::ReadbackTarget;
+
+            let readback_target_matches = match &error {
+                ClientError::ReadbackRequired {
+                    readback: ReadbackTarget::AgentRequestAdmission(original),
+                }
+                | ClientError::UnknownOutcome {
+                    readback: ReadbackTarget::AgentRequestAdmission(original),
+                } => original.as_ref() == &request,
+                _ => false,
+            };
+            if !readback_target_matches {
+                return Err(format!(
+                    "AgentRequest admission has a foreign readback target: {error:?}"
+                )
+                .into());
+            }
+            let recovered = client
+                .recover_agent_request_admission(bearer, &request)
+                .await
+                .map_err(|readback_error| {
+                    format!(
+                        "AgentRequest exact readback failed after {error:?}: {readback_error:?}"
+                    )
+                })?;
+            if recovered.request != request {
+                return Err("AgentRequest readback changed the original request".into());
+            }
+            let evidence = match recovered.snapshot {
+                Some(snapshot) => format!("snapshot={snapshot:?}"),
+                None => "exact request snapshot absent".to_owned(),
+            };
+            return Err(format!(
+                "AgentRequest admission unresolved: original={error:?}; {evidence}; the snapshot cannot prove the original created flag, so no success is reconstructed and no mutation is retried"
+            )
+            .into());
+        }
+        Err(error) => return Err(error.into()),
+    };
     assert_eq!(result.request, request);
     assert!(result.receipt.created);
     assert_eq!(result.receipt.request_id, request.request_id);
@@ -847,13 +1281,21 @@ async fn assert_durable_agent_request(
     Ok(())
 }
 
+struct SourceGoalPlan {
+    goal: RegisteredGoal,
+    bootstrap_node: RegisteredDagNode,
+    mission_node: RegisteredDagNode,
+    free_node: RegisteredDagNode,
+    dispatch_node: RegisteredDagNode,
+}
+
 /// Plan one genuine Forge Goal and initial DAG through its Coordinator-owned
 /// control worker. This is source planning truth, never an Operations seed.
 fn plan_source_goal(
     control: &ForgeControlClient,
     scope: &ResolvedWorkspaceScope,
     actor: ActivityCoordinatorActor,
-) -> TestResult<(RegisteredGoal, RegisteredDagNode, RegisteredDagNode)> {
+) -> TestResult<SourceGoalPlan> {
     let now = TimestampMillis::new(current_test_time()?)?;
     let goal = RegisteredGoal::create(
         GoalId::from_uuid(Uuid::now_v7()),
@@ -881,34 +1323,62 @@ fn plan_source_goal(
             "Review receipt is readable".to_owned(),
         )?],
     )?;
-    let free_definition = DagNodeDefinition::new(
+    let mission_definition = DagNodeDefinition::new(
         DagNodeId::from_uuid(Uuid::now_v7()),
         DagNodeOrdinal::new(1)?,
-        DagNodeTitle::new("Independent review".to_owned())?,
-        DagNodeObjective::new("Route a second unassigned source node to Team".to_owned())?,
+        DagNodeTitle::new("Mission source review".to_owned())?,
+        DagNodeObjective::new("Record a second source-backed review obligation".to_owned())?,
         vec![DagAcceptanceCriterion::new(
-            "Team binding retains its source node identity".to_owned(),
+            "Mission evidence retains the exact offered assignment".to_owned(),
         )?],
     )?;
+    let free_definition = DagNodeDefinition::new(
+        DagNodeId::from_uuid(Uuid::now_v7()),
+        DagNodeOrdinal::new(2)?,
+        DagNodeTitle::new("Unassigned team node".to_owned())?,
+        DagNodeObjective::new("Keep one exact source node unassigned for Team binding".to_owned())?,
+        vec![DagAcceptanceCriterion::new(
+            "Team binding retains its unassigned source node identity".to_owned(),
+        )?],
+    )?;
+    let dispatch_definition = dispatch_bootstrap_node_definition()?;
     let revision = DagRevision::new(
         DagRevisionId::from_uuid(Uuid::now_v7()),
         saved.id(),
         saved.revision(),
         DagRevisionNumber::INITIAL,
         None,
-        vec![definition.clone(), free_definition.clone()],
+        vec![
+            definition.clone(),
+            mission_definition.clone(),
+            free_definition.clone(),
+            dispatch_definition.clone(),
+        ],
         Vec::new(),
         now,
     )?;
     let node = RegisteredDagNode::create(saved.id(), revision.number(), definition, now);
+    let mission_node =
+        RegisteredDagNode::create(saved.id(), revision.number(), mission_definition, now);
     let free_node = RegisteredDagNode::create(saved.id(), revision.number(), free_definition, now);
+    let dispatch_node =
+        RegisteredDagNode::create(saved.id(), revision.number(), dispatch_definition, now);
     let plan = AgentDagPlanRequest::new(
         AgentDagPlanRequestId::from_uuid(Uuid::now_v7()),
         actor,
         GoalAttribution::new(saved.id(), saved.revision()),
         None,
         None,
-        AgentDagDraft::new(revision, vec![node.clone(), free_node.clone()], Vec::new())?,
+        AgentDagDraft::new(
+            revision,
+            vec![
+                node.clone(),
+                mission_node.clone(),
+                free_node.clone(),
+                dispatch_node.clone(),
+            ],
+            Vec::new(),
+        )?,
         AgentWorkUpdateId::from_uuid(Uuid::now_v7()),
         AgentWorkUpdateSequence::INITIAL,
         now,
@@ -918,18 +1388,37 @@ fn plan_source_goal(
         request: plan,
     })?;
     assert_eq!(committed.revision().revision().goal_id(), saved.id());
-    Ok((saved, node, free_node))
+    Ok(SourceGoalPlan {
+        goal: saved,
+        bootstrap_node: node,
+        mission_node,
+        free_node,
+        dispatch_node,
+    })
 }
 
-/// An Offer is an actual Forge-owned assignment with an exact Ready Agent,
-/// Goal/DAG/node and current principal-bound Coordinator; its effect is
-/// subsequently consumed through Orchestration's official source query.
-async fn issue_real_forge_assignment_offer(
+fn dispatch_bootstrap_node_definition() -> TestResult<DagNodeDefinition> {
+    Ok(DagNodeDefinition::new(
+        DagNodeId::from_uuid(Uuid::now_v7()),
+        DagNodeOrdinal::new(3)?,
+        DagNodeTitle::new("Temporary dispatch Team bootstrap".to_owned())?,
+        DagNodeObjective::new(
+            "Offer one source-backed assignment to the receiving Team Leader".to_owned(),
+        )?,
+        vec![DagAcceptanceCriterion::new(
+            "Receiving Team leadership retains its exact source offer".to_owned(),
+        )?],
+    )?)
+}
+
+/// Create only the bootstrap offer. It is canceled after its durable O
+/// leadership evidence is confirmed, before Mission terms are frozen.
+async fn issue_bootstrap_forge_assignment_offer(
     source: &ForgeHost,
     principal: AuthenticatedPrincipal,
     activity_id: Uuid,
     second: &ReadyFixtureMember,
-) -> TestResult<(Uuid, NodeTeamScopeWire)> {
+) -> TestResult<SourceAssignmentFixture> {
     let actor = ForgeSourceHttpClient::new(ForgeCommandHttpClient::new(
         source.address,
         FORGE_SECRET,
@@ -943,8 +1432,14 @@ async fn issue_real_forge_assignment_offer(
     let target_session = AgentSessionId::from_uuid(second.session_id);
     let target_agent = AgentInstanceId::from_uuid(second.agent_id);
     let assignment = tokio::task::spawn_blocking(move || {
-        (|| -> TestResult<(Uuid, NodeTeamScopeWire)> {
-            let (goal, node, free_node) = plan_source_goal(&control, &scope, actor)?;
+        (|| -> TestResult<SourceAssignmentFixture> {
+            let SourceGoalPlan {
+                goal,
+                bootstrap_node,
+                mission_node,
+                free_node,
+                dispatch_node,
+            } = plan_source_goal(&control, &scope, actor)?;
             let current = control
                 .agent_get_context(AgentContextRequest {
                     scope: scope.clone(),
@@ -958,41 +1453,48 @@ async fn issue_real_forge_assignment_offer(
             let target = current.attachment().agent();
             assert_eq!(target.session_id(), Some(target_session));
             assert_eq!(target.principal(), principal);
-            let assignment_id = AgentAssignmentId::from_uuid(Uuid::now_v7());
+            let bootstrap_assignment_id = AgentAssignmentId::from_uuid(Uuid::now_v7());
+            let bootstrap_target = AgentAssignmentTarget::new(
+                target.id(),
+                target_session,
+                principal,
+                target.revision(),
+            );
             let offered = control.agent_assignment_mutate(AgentAssignmentMutationRequest {
                 scope,
                 mutation: AgentAssignmentMutation::Offer(OfferAgentAssignment::new(
-                    assignment_id,
+                    bootstrap_assignment_id,
                     actor,
-                    AgentAssignmentTarget::new(
-                        target.id(),
-                        target_session,
-                        principal,
-                        target.revision(),
-                    ),
+                    bootstrap_target,
                     goal.id(),
                     goal.revision(),
                     goal.timestamps().created_at(),
-                    node.dag_revision(),
+                    bootstrap_node.dag_revision(),
                     DagHeadRevision::INITIAL,
-                    node.id(),
-                    node.revision(),
+                    bootstrap_node.id(),
+                    bootstrap_node.revision(),
                     None,
                     TimestampMillis::new(current_test_time()?)?,
                 )),
             })?;
             assert_eq!(offered.state(), AgentAssignmentState::Offered);
-            Ok((
-                assignment_id.into_uuid(),
-                NodeTeamScopeWire {
-                    activity_id: actor.activity_id().into_uuid(),
-                    goal_id: goal.id().into_uuid(),
-                    goal_created_at_ms: goal.timestamps().created_at().get(),
-                    dag_revision: free_node.dag_revision().get(),
-                    dag_base_goal_revision: goal.revision().get(),
-                    node_id: free_node.id().into_uuid(),
-                },
-            ))
+            assert_eq!(offered.target(), bootstrap_target);
+            let unassigned_node = NodeTeamScopeWire {
+                activity_id: actor.activity_id().into_uuid(),
+                goal_id: goal.id().into_uuid(),
+                goal_created_at_ms: goal.timestamps().created_at().get(),
+                dag_revision: free_node.dag_revision().get(),
+                dag_base_goal_revision: goal.revision().get(),
+                node_id: free_node.id().into_uuid(),
+            };
+            Ok(SourceAssignmentFixture {
+                bootstrap_assignment_id,
+                bootstrap_target,
+                goal,
+                mission_node,
+                dispatch_node,
+                unassigned_node,
+            })
         })()
         .map_err(|error| error.to_string())
     })
@@ -1079,16 +1581,198 @@ async fn source_confirmed_team_leadership(
     Ok(confirmed.leadership_revision)
 }
 
-/// Form two actual Ready members with the current leader's source revision,
+/// Exact fixture state needed to cancel its now-unbound bootstrap offer.
+struct BootstrapOfferCancellationCase<'a> {
+    client: &'a OrchestrationHttpClient,
+    bearer: &'a HeaderValue,
+    source: &'a ForgeHost,
+    creator: &'a MemberTarget,
+    leader: &'a ReadyFixtureMember,
+    leadership_revision: i64,
+    assignment: &'a SourceAssignmentFixture,
+    principal: AuthenticatedPrincipal,
+}
+
+/// Cancel the now-unbound bootstrap-only offer through the current Forge
+/// Coordinator after its `AssignmentOffered` fact has established legacy O
+/// leadership. An Offered assignment cancels terminally without target ACK.
+async fn cancel_bootstrap_offer_after_leadership(
+    case: &BootstrapOfferCancellationCase<'_>,
+) -> TestResult {
+    let commands = ForgeCommandHttpClient::new(case.source.address, FORGE_SECRET, DEADLINE)?;
+    let coordinator = ForgeSourceHttpClient::new(commands)
+        .coordinator_actor(&case.source.scope, case.creator.activity_id, case.principal)
+        .await?
+        .ok_or("current Forge Coordinator is missing before bootstrap-offer cancellation")?;
+    assert_ne!(coordinator.agent_id().into_uuid(), case.leader.agent_id);
+    assert_ne!(coordinator.session_id().into_uuid(), case.leader.session_id);
+
+    cancel_bootstrap_assignment(case, coordinator).await?;
+    assert_bootstrap_leadership_retained(case).await
+}
+
+async fn cancel_bootstrap_assignment(
+    case: &BootstrapOfferCancellationCase<'_>,
+    coordinator: ActivityCoordinatorActor,
+) -> TestResult {
+    let scope = case.source.scope.clone();
+    let assignment_id = case.assignment.bootstrap_assignment_id;
+    let target = case.assignment.bootstrap_target;
+    let cancel_at = TimestampMillis::new(current_test_time()?)?;
+    let control = case.source.control_client.clone();
+    let (offered, cancelled, readback) = tokio::task::spawn_blocking(move || {
+        let get_request = AgentAssignmentGetRequest {
+            scope: scope.clone(),
+            activity_id: coordinator.activity_id(),
+            assignment_id,
+            authority: AgentAssignmentReadAuthority {
+                session_id: target.session_id(),
+                agent_id: target.agent_id(),
+                expected_agent_revision: target.agent_revision(),
+                principal: target.principal(),
+            },
+        };
+        let offered = control
+            .agent_assignment_get(get_request.clone())
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "bootstrap Assignment was absent before cancellation".to_owned())?;
+        if offered.state() != AgentAssignmentState::Offered
+            || offered.target() != target
+            || offered.cancellation_requested()
+        {
+            return Err(format!(
+                "bootstrap Assignment state drifted before cancellation: {:?}",
+                offered.state()
+            ));
+        }
+        let expected_revision = offered
+            .revision()
+            .checked_next()
+            .map_err(|error| error.to_string())?;
+        let command = CancelAgentAssignment::new(
+            assignment_id,
+            coordinator,
+            offered.revision(),
+            cancel_at,
+        );
+        let cancel_result = control
+            .agent_assignment_mutate(AgentAssignmentMutationRequest {
+                scope: scope.clone(),
+                mutation: AgentAssignmentMutation::Cancel(command),
+            })
+            .map_err(|error| error.to_string());
+        let cancelled = match cancel_result {
+            Ok(cancelled) => cancelled,
+            Err(mutation_error) => {
+                let observed = control
+                    .agent_assignment_get(get_request.clone())
+                    .map_err(|error| error.to_string());
+                match observed {
+                    Ok(Some(assignment))
+                        if assignment.id() == assignment_id
+                            && assignment.target() == target
+                            && assignment.state() == AgentAssignmentState::Cancelled
+                            && assignment.cancellation_requested()
+                            && assignment.revision() == expected_revision =>
+                    {
+                        assignment
+                    }
+                    other => {
+                        return Err(format!(
+                            "bootstrap offer cancellation was not confirmed; mutation={mutation_error:?}, readback={other:?}"
+                        ));
+                    }
+                }
+            }
+        };
+        assert_eq!(cancelled.state(), AgentAssignmentState::Cancelled);
+        assert!(cancelled.cancellation_requested());
+        assert!(cancelled.result().is_none());
+        assert_eq!(cancelled.revision(), expected_revision);
+        let readback = control
+            .agent_assignment_get(get_request)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(readback.as_ref(), Some(&cancelled));
+        Ok::<_, String>((offered, cancelled, readback))
+    })
+    .await??;
+    assert_eq!(offered.state(), AgentAssignmentState::Offered);
+    assert_eq!(cancelled.state(), AgentAssignmentState::Cancelled);
+    assert_eq!(readback.as_ref(), Some(&cancelled));
+    Ok(())
+}
+
+async fn assert_bootstrap_leadership_retained(
+    case: &BootstrapOfferCancellationCase<'_>,
+) -> TestResult {
+    let leadership = case
+        .client
+        .leadership_view(
+            case.bearer,
+            &LeadershipQueryRequest {
+                scope: case.creator.scope.clone(),
+                session_id: Some(case.leader.session_id),
+                activity_id: None,
+                team_id: None,
+                review_after: None,
+                limit: 10,
+            },
+        )
+        .await?
+        .leadership
+        .ok_or("Workspace leadership disappeared after bootstrap-offer cancellation")?;
+    assert_eq!(
+        leadership.leader_participant_id,
+        Some(case.leader.participant_id)
+    );
+    assert_eq!(leadership.leadership_revision, case.leadership_revision);
+    Ok(())
+}
+
+async fn assert_mission_assignment_remains_offered(
+    source: &ForgeHost,
+    mission_assignment: MissionAssignmentSource,
+    activity_id: Uuid,
+) -> TestResult {
+    let scope = source.scope.clone();
+    let control = source.control_client.clone();
+    let assignment = tokio::task::spawn_blocking(move || {
+        control.agent_assignment_get(AgentAssignmentGetRequest {
+            scope,
+            activity_id: forge_domain::ActivityId::from_uuid(activity_id),
+            assignment_id: mission_assignment.assignment_id,
+            authority: AgentAssignmentReadAuthority {
+                session_id: mission_assignment.target.session_id(),
+                agent_id: mission_assignment.target.agent_id(),
+                expected_agent_revision: mission_assignment.target.agent_revision(),
+                principal: mission_assignment.target.principal(),
+            },
+        })
+    })
+    .await??
+    .ok_or("Mission source assignment disappeared after evidence cut")?;
+    assert_eq!(assignment.state(), AgentAssignmentState::Offered);
+    assert!(!assignment.cancellation_requested());
+    assert!(assignment.result().is_none());
+    assert_eq!(assignment.target(), mission_assignment.target);
+    assert_eq!(
+        assignment.revision(),
+        forge_domain::AgentAssignmentRevision::INITIAL
+    );
+    Ok(())
+}
+
+/// Form three actual Ready members with the current leader's source revision,
 /// then inspect the immutable creation receipt, roster and Workspace list.
-async fn assert_real_two_member_team(
+async fn assert_real_three_member_team(
     client: &OrchestrationHttpClient,
     bearer: &HeaderValue,
     first: &MemberTarget,
     second: &ReadyFixtureMember,
+    third: &ReadyFixtureMember,
     expected_sender_leadership_revision: i64,
 ) -> TestResult<Uuid> {
-    let request = TeamCreateRequest {
+    let request = TeamCreateV2Request {
         scope: first.scope.clone(),
         request_id: Uuid::now_v7(),
         team_id: Uuid::now_v7(),
@@ -1096,7 +1780,7 @@ async fn assert_real_two_member_team(
         session_id: second.session_id,
         expected_sender_leadership_revision,
         name: "Source evidence review".to_owned(),
-        purpose: "Two real members review a bounded read-only request".to_owned(),
+        purpose: "Three real members review a bounded source-backed obligation".to_owned(),
         initial_members: vec![
             TeamRosterMemberRequest {
                 activity_id: first.activity_id,
@@ -1108,12 +1792,26 @@ async fn assert_real_two_member_team(
                 session_id: second.session_id,
                 role: "reviewer".to_owned(),
             },
+            TeamRosterMemberRequest {
+                activity_id: first.activity_id,
+                session_id: third.session_id,
+                role: "reviewer".to_owned(),
+            },
         ],
+        max_members: 3,
     };
-    let created = client.create_team(bearer, &request).await?;
-    assert!(created.mutation.created);
-    assert_eq!(created.mutation.team.team_id, request.team_id);
-    assert_eq!(created.mutation.initial_members.len(), 2);
+    let created = client
+        .create_team_v2(bearer, &request)
+        .await
+        .map_err(|error| {
+            format!(
+                "bootstrap H TeamCreateV2 mutation request_id={}: {error:?}",
+                request.request_id
+            )
+        })?;
+    assert_team_create_v2_response(&created, &request, second, third)?;
+    assert_team_create_v2_readback(client, bearer, &request, &created).await?;
+
     let readback = client
         .team_get(
             bearer,
@@ -1121,24 +1819,24 @@ async fn assert_real_two_member_team(
                 scope: first.scope.clone(),
                 session_id: Some(second.session_id),
                 team_id: request.team_id,
-                request_id: Some(request.request_id),
+                request_id: None,
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            format!(
+                "bootstrap H current Team/roster snapshot team_id={}: {error:?}",
+                request.team_id
+            )
+        })?;
     assert_eq!(readback.team.as_ref(), Some(&created.mutation.team));
-    assert_eq!(readback.members.len(), 2);
+    assert_eq!(readback.members.len(), 3);
     assert!(!readback.members_truncated);
-    let historical = readback
-        .mutation
-        .as_ref()
-        .ok_or("Team original creation receipt missing on readback")?;
-    assert!(
-        historical.replayed,
-        "Durable historical receipt must be marked replayed"
-    );
-    assert_eq!(historical.team, created.mutation.team);
-    assert_eq!(historical.initial_members, created.mutation.initial_members);
-    assert_eq!(historical.membership, created.mutation.membership);
+    assert!(readback.members.iter().any(|member| {
+        member.profile_id == Some(third.profile_id)
+            && !member.participation_id.is_nil()
+            && member.state == "joined"
+    }));
     assert_stale_team_leadership_rejected(client, bearer, &request).await?;
     let listing = client
         .team_list(
@@ -1149,10 +1847,99 @@ async fn assert_real_two_member_team(
                 limit: 10,
             },
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            format!(
+                "bootstrap H current Team list query workspace_id={}: {error:?}",
+                first.scope.workspace_id
+            )
+        })?;
     assert_eq!(listing.teams.len(), 1);
     assert_eq!(listing.teams[0].team_id, request.team_id);
     Ok(request.team_id)
+}
+
+fn assert_team_create_v2_response(
+    created: &TeamMutationV2Response,
+    request: &TeamCreateV2Request,
+    creator: &ReadyFixtureMember,
+    third: &ReadyFixtureMember,
+) -> TestResult {
+    assert!(created.mutation.created);
+    assert!(!created.mutation.replayed);
+    assert_eq!(created.mutation.team.team_id, request.team_id);
+    assert_eq!(created.mutation.initial_members.len(), 3);
+    let capacity = created
+        .mutation
+        .capacity
+        .as_ref()
+        .ok_or("v2 Team create omitted its cap receipt")?;
+    assert_eq!(capacity.team_id, request.team_id);
+    assert_eq!(capacity.workspace_id, request.scope.workspace_id);
+    assert_eq!(capacity.max_members, request.max_members);
+    assert_eq!(capacity.revision, 1);
+    assert_eq!(
+        capacity.leadership_revision,
+        request.expected_sender_leadership_revision
+    );
+    assert_eq!(capacity.actor.activity_id, request.activity_id);
+    assert_eq!(capacity.actor.agent_id, creator.agent_id);
+    assert_eq!(capacity.actor.session_id, request.session_id);
+    assert_eq!(capacity.actor.participant_id, creator.participant_id);
+    assert_eq!(capacity.actor.profile_id, creator.profile_id);
+    let creator_membership = created
+        .mutation
+        .initial_members
+        .iter()
+        .find(|member| member.profile_id == Some(creator.profile_id))
+        .ok_or("Team creator's initial membership receipt is absent")?;
+    assert_eq!(
+        capacity.actor.participation_id,
+        creator_membership.participation_id
+    );
+    assert!(created.mutation.expansion_slot.is_none());
+    assert!(created.mutation.expansion_join_source.is_none());
+    assert!(created.mutation.initial_members.iter().any(|member| {
+        member.profile_id == Some(third.profile_id)
+            && !member.participation_id.is_nil()
+            && member.state == "joined"
+    }));
+    let digest = created
+        .mutation
+        .initial_roster_digest_v1
+        .as_ref()
+        .ok_or("v2 Team create omitted its roster digest")?;
+    assert_eq!(digest.len(), 64);
+    Ok(())
+}
+
+async fn assert_team_create_v2_readback(
+    client: &OrchestrationHttpClient,
+    bearer: &HeaderValue,
+    request: &TeamCreateV2Request,
+    created: &TeamMutationV2Response,
+) -> TestResult {
+    let source_receipt = client
+        .team_create_mutation_readback_v2(
+            bearer,
+            request,
+            TeamMutationReaderV2Wire {
+                activity_id: request.activity_id,
+                session_id: request.session_id,
+            },
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "bootstrap H TeamCreateV2 owner readback request_id={}: {error:?}",
+                request.request_id
+            )
+        })?
+        .ok_or("owner-scoped v2 Team create receipt is absent")?;
+    let mut expected = created.mutation.clone();
+    expected.replayed = true;
+    assert_eq!(source_receipt.mutation, expected);
+    Ok(())
 }
 
 /// A different Team request cannot borrow the current leader's identity
@@ -1160,9 +1947,9 @@ async fn assert_real_two_member_team(
 async fn assert_stale_team_leadership_rejected(
     client: &OrchestrationHttpClient,
     bearer: &HeaderValue,
-    original: &TeamCreateRequest,
+    original: &TeamCreateV2Request,
 ) -> TestResult {
-    let incorrect = TeamCreateRequest {
+    let incorrect = TeamCreateV2Request {
         request_id: Uuid::now_v7(),
         team_id: Uuid::now_v7(),
         expected_sender_leadership_revision: original
@@ -1171,42 +1958,203 @@ async fn assert_stale_team_leadership_rejected(
             .ok_or("leadership revision overflow")?,
         ..original.clone()
     };
-    let refused = client.create_team(bearer, &incorrect).await;
+    let refused = client.create_team_v2(bearer, &incorrect).await;
     assert!(
         matches!(
             refused,
             Err(ClientError::Rejected { status, .. })
                 if status == StatusCode::CONFLICT.as_u16()
         ),
-        "a different Team must not inherit stale leadership authority: {refused:?}"
+        "TeamCreateV2 stale-leadership rejection request_id={}: {refused:?}",
+        incorrect.request_id
+    );
+    assert!(
+        client
+            .team_create_mutation_readback_v2(
+                bearer,
+                &incorrect,
+                TeamMutationReaderV2Wire {
+                    activity_id: incorrect.activity_id,
+                    session_id: incorrect.session_id,
+                },
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "TeamCreateV2 stale-request owner readback request_id={}: {error:?}",
+                    incorrect.request_id
+                )
+            })?
+            .is_none(),
+        "stale v2 Team create produced an owner-scoped receipt"
     );
     Ok(())
 }
 
+struct SourceLeadershipTeamCase<'a> {
+    client: &'a OrchestrationHttpClient,
+    bearer: &'a HeaderValue,
+    source: &'a ForgeHost,
+    creator: &'a MemberTarget,
+    leader: &'a ReadyFixtureMember,
+    third: &'a ReadyFixtureMember,
+    assignments: &'a SourceAssignmentFixture,
+    principal: AuthenticatedPrincipal,
+}
+
+struct SourceLeadershipTeamOutcome {
+    approved: ApprovedExecutionFixture,
+    evidence: mission_evidence::MissionEvidenceRecoveryFixture,
+    mission_assignment: MissionAssignmentSource,
+    team_id: Uuid,
+    workspace_leadership_revision: i64,
+}
+
 async fn assert_team_from_source_leadership(
-    client: &OrchestrationHttpClient,
-    bearer: &HeaderValue,
-    source: &ForgeHost,
-    first: &MemberTarget,
-    second: &ReadyFixtureMember,
-    assignment_id: Uuid,
-    unassigned_node: NodeTeamScopeWire,
-) -> TestResult<ApprovedExecutionFixture> {
-    let revision =
-        source_confirmed_team_leadership(client, bearer, first, second, assignment_id).await?;
-    let team_id = assert_real_two_member_team(client, bearer, first, second, revision).await?;
-    assert_node_team_binding(
-        client,
-        bearer,
-        first,
-        second,
-        team_id,
-        revision,
-        unassigned_node,
+    case: &SourceLeadershipTeamCase<'_>,
+) -> TestResult<SourceLeadershipTeamOutcome> {
+    let revision = source_confirmed_team_leadership(
+        case.client,
+        case.bearer,
+        case.creator,
+        case.leader,
+        case.assignments.bootstrap_assignment_id.into_uuid(),
     )
     .await?;
-    assert_unprovisioned_team_node_chat(client, bearer, first, second, unassigned_node).await?;
-    assert_scoped_approval_policy(client, bearer, source, first, second.session_id).await
+    let cancellation_case = BootstrapOfferCancellationCase {
+        client: case.client,
+        bearer: case.bearer,
+        source: case.source,
+        creator: case.creator,
+        leader: case.leader,
+        leadership_revision: revision,
+        assignment: case.assignments,
+        principal: case.principal,
+    };
+    cancel_bootstrap_offer_after_leadership(&cancellation_case).await?;
+    let team_id = assert_real_three_member_team(
+        case.client,
+        case.bearer,
+        case.creator,
+        case.leader,
+        case.third,
+        revision,
+    )
+    .await?;
+    let mission_assignment_id = temporary_dispatch_lifecycle::offer_team_affined_assignment(
+        &temporary_dispatch_lifecycle::TeamAffinedOfferContext {
+            client: case.client,
+            bearer: case.bearer,
+            source: case.source,
+            creator: case.creator,
+            workspace_leader: case.leader,
+            workspace_leadership_revision: revision,
+            principal: case.principal,
+            team_id,
+            target: case.third,
+            assignments: case.assignments,
+            node: &case.assignments.mission_node,
+        },
+    )
+    .await?;
+    temporary_dispatch_lifecycle::confirm_team_leadership(
+        case.client,
+        case.bearer,
+        case.creator,
+        case.third,
+        team_id,
+    )
+    .await?;
+    let evidence = record_mission_evidence(case, revision, team_id, &mission_assignment_id).await?;
+    let approved = assert_team_observations_and_approval(case, revision, team_id).await?;
+    Ok(SourceLeadershipTeamOutcome {
+        approved,
+        evidence,
+        mission_assignment: mission_assignment_id,
+        team_id,
+        workspace_leadership_revision: revision,
+    })
+}
+
+async fn record_mission_evidence(
+    case: &SourceLeadershipTeamCase<'_>,
+    leadership_revision: i64,
+    team_id: Uuid,
+    assignment: &MissionAssignmentSource,
+) -> TestResult<mission_evidence::MissionEvidenceRecoveryFixture> {
+    let selectors = mission_evaluation::assert_mission_evaluation_http_flow(
+        case.client,
+        case.bearer,
+        case.creator,
+        case.leader,
+        case.third,
+        leadership_revision,
+        team_id,
+    )
+    .await?;
+    mission_t2_checkpoint::assert_mission_t2_checkpoint_http_flow(
+        case.client,
+        case.bearer,
+        case.creator,
+        case.leader,
+        case.third,
+        leadership_revision,
+        &selectors,
+    )
+    .await?;
+    let flow = mission_evidence::MissionEvidenceFlow {
+        client: case.client,
+        bearer: case.bearer,
+        source: case.source,
+        target: case.creator,
+        leader: case.leader,
+        assignee: case.third,
+        leadership_revision,
+        mission_id: selectors.mission_id,
+        plan_id: selectors.plan_id,
+        plan_revision: selectors.plan_revision,
+        obligation_id: selectors.obligation_id,
+        work_unit_id: selectors.work_unit_id,
+        assignment_id: assignment.assignment_id.into_uuid(),
+        t1_submission_cutoff_ms: selectors.t1_submission_cutoff_ms,
+    };
+    let evidence = mission_evidence::assert_mission_evidence_http_flow(&flow).await?;
+    assert_mission_assignment_remains_offered(case.source, *assignment, case.creator.activity_id)
+        .await?;
+    Ok(evidence)
+}
+
+async fn assert_team_observations_and_approval(
+    case: &SourceLeadershipTeamCase<'_>,
+    leadership_revision: i64,
+    team_id: Uuid,
+) -> TestResult<ApprovedExecutionFixture> {
+    assert_node_team_binding(
+        case.client,
+        case.bearer,
+        case.creator,
+        case.leader,
+        team_id,
+        leadership_revision,
+        case.assignments.unassigned_node,
+    )
+    .await?;
+    assert_unprovisioned_team_node_chat(
+        case.client,
+        case.bearer,
+        case.creator,
+        case.leader,
+        case.assignments.unassigned_node,
+    )
+    .await?;
+    assert_scoped_approval_policy(
+        case.client,
+        case.bearer,
+        case.source,
+        case.creator,
+        case.leader.session_id,
+    )
+    .await
 }
 
 /// A Ready Team with a genuine Forge Node still has no Provider conversation
@@ -1300,9 +2248,7 @@ fn fixture_forge_execution_request(
     target: &MemberTarget,
     script: &str,
 ) -> TestResult<ExecutionRequest> {
-    let analyzed = forge_control::analyze_shell_script(script.to_owned())?;
-    assert!(!analyzed.permissions().workspace_write());
-    assert!(!analyzed.permissions().network());
+    let permissions = forge_domain::ExecutionPermissions::new(false, false, false);
     Ok(ExecutionRequest::new(
         ExecutionAttribution::new(
             ExecutionId::from_uuid(Uuid::now_v7()),
@@ -1310,14 +2256,14 @@ fn fixture_forge_execution_request(
             ActivityId::from_uuid(target.activity_id),
         ),
         ExecutionKind::Shell {
-            script: analyzed.script().clone(),
+            script: forge_domain::ExecutionScript::new(script.to_owned())?,
         },
         None,
         ExecutionLimits::new(
             ExecutionTimeoutMillis::new(10 * 60 * 1_000)?,
             ExecutionOutputLimit::DEFAULT,
         ),
-        analyzed.permissions(),
+        permissions,
     )?)
 }
 
@@ -2229,7 +3175,7 @@ async fn bind_fixture_profile_session(
     bearer: &HeaderValue,
     session_id: Uuid,
     stable_name: &str,
-) -> TestResult {
+) -> TestResult<Uuid> {
     let created = client
         .create_profile(
             bearer,
@@ -2264,7 +3210,7 @@ async fn bind_fixture_profile_session(
         .await?;
     assert_eq!(observed.request_id, binding.request_id);
     assert!(!observed.created);
-    Ok(())
+    Ok(created.profile.profile_id)
 }
 
 fn current_test_time() -> TestResult<i64> {
@@ -2275,81 +3221,126 @@ fn current_test_time() -> TestResult<i64> {
     )?)
 }
 
-async fn bootstrap_flow(
-    client: &OrchestrationHttpClient,
-    bearer: &HeaderValue,
-    principal: AuthenticatedPrincipal,
-    prepare: &ImportPrepareRequest,
-    broker_case: Option<(&ForgeHost, Uuid, ForgeExecutionService)>,
-) -> TestResult {
-    assert_verified_workspace_query_gate(client, bearer, &prepare.scope, false).await?;
-    let mut progress = client.import_prepare(bearer, prepare).await?;
+async fn bootstrap_flow(flow: &BootstrapHttpFlow<'_>) -> TestResult {
+    let progress = import_and_verify_workspace(flow).await?;
+    if let Some(case) = flow.broker_case {
+        let non_operator = flow
+            .non_operator
+            .ok_or("real Broker fixture is missing its non-operator test credential")?;
+        let agent_flow = RealBrokerAgentRequestFlow {
+            client: flow.client,
+            bearer: flow.bearer,
+            backend_address: flow.backend_address,
+            principal: flow.principal,
+            scope: &flow.prepare.scope,
+            progress: &progress,
+            source: case.0,
+            activity_id: case.1,
+            service: case.2,
+            non_operator,
+            transfer_exercise: flow.transfer_exercise,
+        };
+        let sequence = assert_real_broker_agent_request_flow(&agent_flow).await?;
+        flow.final_source_sequence
+            .store(sequence, Ordering::Release);
+        return Ok(());
+    }
+    abort_unavailable_broker_flow(flow, &progress).await
+}
+
+async fn import_and_verify_workspace(
+    flow: &BootstrapHttpFlow<'_>,
+) -> TestResult<ImportProgressWire> {
+    assert_verified_workspace_query_gate(flow.client, flow.bearer, &flow.prepare.scope, false)
+        .await?;
+    let mut progress = flow
+        .client
+        .import_prepare(flow.bearer, flow.prepare)
+        .await?;
     assert_eq!(progress.phase, ImportPhaseWire::Importing);
     assert_eq!(progress.page_count, 0);
-    let first_request = step_request(prepare, &progress);
-    progress = client
-        .import_next_page(bearer, prepare.migration_id, &first_request)
+    let first_request = step_request(flow.prepare, &progress);
+    progress = flow
+        .client
+        .import_next_page(flow.bearer, flow.prepare.migration_id, &first_request)
         .await?;
     assert!(
-        matches!(client.import_next_page(bearer, prepare.migration_id, &first_request).await,
+        matches!(flow.client.import_next_page(flow.bearer, flow.prepare.migration_id, &first_request).await,
         Err(ClientError::Rejected { status, .. }) if status == StatusCode::CONFLICT.as_u16())
     );
     assert_eq!(
-        client.import_progress(bearer, prepare.migration_id).await?,
+        flow.client
+            .import_progress(flow.bearer, flow.prepare.migration_id)
+            .await?,
         Some(progress.clone())
     );
     // Fresh source has no historical Agent operations. All five table families
     // still cross the real source HTTP and independent destination verification.
     for _ in 1..5 {
-        progress = client
+        progress = flow
+            .client
             .import_next_page(
-                bearer,
-                prepare.migration_id,
-                &step_request(prepare, &progress),
+                flow.bearer,
+                flow.prepare.migration_id,
+                &step_request(flow.prepare, &progress),
             )
             .await?;
     }
     assert_eq!(progress.phase, ImportPhaseWire::Imported);
     assert_eq!(progress.page_count, 5);
     assert_eq!(progress.record_count, 0);
-    assert_eq!(client.import_prepare(bearer, prepare).await?, progress);
+    assert_eq!(
+        flow.client
+            .import_prepare(flow.bearer, flow.prepare)
+            .await?,
+        progress
+    );
     for _ in 0..5 {
-        progress = client
+        progress = flow
+            .client
             .import_verify_next_page(
-                bearer,
-                prepare.migration_id,
-                &step_request(prepare, &progress),
+                flow.bearer,
+                flow.prepare.migration_id,
+                &step_request(flow.prepare, &progress),
             )
             .await?;
     }
     assert_eq!(progress.phase, ImportPhaseWire::Verified);
     assert_eq!(progress.import_digest, progress.verify_digest);
     assert_eq!(progress.verified_pages, progress.page_count);
-    assert_eq!(client.import_prepare(bearer, prepare).await?, progress);
-    assert_verified_workspace_query_gate(client, bearer, &prepare.scope, true).await?;
-    if let Some(case) = broker_case {
-        assert_real_broker_agent_request_flow(
-            client,
-            bearer,
-            principal,
-            &prepare.scope,
-            &progress,
-            case,
-        )
+    assert_eq!(
+        flow.client
+            .import_prepare(flow.bearer, flow.prepare)
+            .await?,
+        progress
+    );
+    assert_verified_workspace_query_gate(flow.client, flow.bearer, &flow.prepare.scope, true)
         .await?;
-        return Ok(());
-    }
-    assert_session_open_fails_closed_without_broker(client, bearer).await?;
-    let aborted = client
+    Ok(progress)
+}
+
+async fn abort_unavailable_broker_flow(
+    flow: &BootstrapHttpFlow<'_>,
+    progress: &ImportProgressWire,
+) -> TestResult {
+    assert_session_open_fails_closed_without_broker(flow.client, flow.bearer).await?;
+    let aborted = flow
+        .client
         .import_abort(
-            bearer,
-            prepare.migration_id,
-            &step_request(prepare, &progress),
+            flow.bearer,
+            flow.prepare.migration_id,
+            &step_request(flow.prepare, progress),
         )
         .await?;
     assert_eq!(aborted.phase, ImportPhaseWire::Aborted);
-    assert_eq!(client.import_prepare(bearer, prepare).await?, aborted);
-    assert_verified_workspace_query_gate(client, bearer, &prepare.scope, false).await?;
+    assert_eq!(
+        flow.client
+            .import_prepare(flow.bearer, flow.prepare)
+            .await?,
+        aborted
+    );
+    assert_verified_workspace_query_gate(flow.client, flow.bearer, &flow.prepare.scope, false)
+        .await?;
     Ok(())
 }
 
@@ -2427,14 +3418,31 @@ async fn assert_release_source_freeze(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_http_bootstrap_verifies_then_aborts_without_native_source_fallback() -> TestResult {
     let (broker_cluster, _broker_port_guards) = unavailable_broker_cluster()?;
-    bootstrap_fixture_with_broker(broker_cluster, false, false).await
+    Box::pin(bootstrap_fixture_with_broker(broker_cluster, false, false)).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires AGENT_BROKERD_BIN for isolated real three-node Broker cluster"]
 async fn real_broker_verified_membership_coordinator_and_agent_request_admission() -> TestResult {
     let cluster = broker_cluster::Cluster::start().await?;
-    let result = bootstrap_fixture_with_broker(cluster.orchestration_config()?, true, false).await;
+    let result = Box::pin(bootstrap_fixture_with_broker(
+        cluster.orchestration_config()?,
+        true,
+        false,
+    ))
+    .await;
+    drop(cluster);
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires AGENT_BROKERD_BIN for isolated real three-node Broker cluster"]
+async fn real_broker_synthetic_pre_hold_legacy_slot_recovery_http() -> TestResult {
+    let cluster = broker_cluster::Cluster::start().await?;
+    let result = Box::pin(legacy_slot_recovery::run_synthetic_pre_hold_recovery(
+        cluster.orchestration_config()?,
+    ))
+    .await;
     drop(cluster);
     result
 }
@@ -2522,8 +3530,20 @@ async fn assert_restarted_control_plane_readback(
                 },
             )
             .await?;
-        assert_eq!(teams.teams.len(), 1);
+        assert_eq!(teams.teams.len(), 2);
         assert!(!teams.truncated);
+        assert!(
+            teams
+                .teams
+                .iter()
+                .any(|team| team.name == "Source evidence review")
+        );
+        assert!(
+            teams
+                .teams
+                .iter()
+                .any(|team| team.name == "Temporary dispatch receiving")
+        );
         let requests = client
             .agent_requests(
                 bearer,
@@ -2595,6 +3615,8 @@ fn assert_persisted_bootstrap_catalog(
     workspace: Uuid,
     migration_id: Uuid,
     actual_broker: bool,
+    verified_ci: bool,
+    expected_final_source_sequence: Option<u64>,
 ) -> TestResult {
     let catalog = OrchestrationRuntime::open_existing_operations_read_only(data_root)?;
     let configured = catalog
@@ -2603,16 +3625,26 @@ fn assert_persisted_bootstrap_catalog(
     assert_eq!(configured.issuer(), issuer);
     assert_eq!(configured.backend_id(), backend);
     let bindings = catalog.node_team_bindings(WorkspaceId::from_uuid(workspace))?;
-    assert_eq!(bindings.bindings().len(), usize::from(actual_broker));
+    assert_eq!(bindings.bindings().len(), if actual_broker { 3 } else { 0 });
     assert!(!bindings.truncated());
     if actual_broker {
-        assert_eq!(bindings.bindings()[0].bound_by(), "orchestrator");
-        assert_eq!(bindings.bindings()[0].revision(), 1);
-        assert!(bindings.bindings()[0].team_id().is_some());
+        let mut team_ids = Vec::new();
+        for binding in bindings.bindings() {
+            assert_eq!(binding.bound_by(), "orchestrator");
+            assert_eq!(binding.revision(), 1);
+            let team_id = binding
+                .team_id()
+                .ok_or("source-backed Node-Team binding lost its Team ID")?;
+            if !team_ids.contains(&team_id) {
+                team_ids.push(team_id);
+            }
+        }
+        assert_eq!(team_ids.len(), 2);
     }
     let terminals = catalog.execution_terminal_projection(migration_id)?;
-    assert_eq!(terminals.len(), usize::from(actual_broker));
-    if actual_broker {
+    let executed = actual_broker && verified_ci;
+    assert_eq!(terminals.len(), usize::from(executed));
+    if executed {
         let terminal = terminals[0];
         assert_eq!(terminal.migration_id(), migration_id);
         assert_eq!(terminal.execution_state(), ExecutionState::Completed);
@@ -2620,7 +3652,10 @@ fn assert_persisted_bootstrap_catalog(
         let progress = catalog
             .effect_fact_progress(migration_id)?
             .ok_or("Forge terminal effect consumer progress missing after restart")?;
-        assert_eq!(progress.last_sequence(), terminal.source_sequence());
+        let expected_final_source_sequence = expected_final_source_sequence
+            .ok_or("real Broker flow did not return its exact final source sequence")?;
+        assert!(expected_final_source_sequence > terminal.source_sequence());
+        assert_eq!(progress.last_sequence(), expected_final_source_sequence);
         assert_eq!(progress.workspace_id().into_uuid(), workspace);
     }
     Ok(())
@@ -2638,8 +3673,9 @@ fn assert_forge_execution_survives_worker_restart(
     let registry = GlobalRegistry::open_existing(root.join("registry.sqlite3"))?;
     let (client, mut worker) = ForgeControlWorker::start(ForgeControl::new(registry))?;
     let records = client.execution_list(scope.clone(), activity_id, ExecutionListLimit::new(4)?)?;
-    assert_eq!(records.len(), usize::from(actual_broker));
-    if actual_broker {
+    let executed = actual_broker && verified_ci;
+    assert_eq!(records.len(), usize::from(executed));
+    if executed {
         assert_eq!(records[0].state(), ExecutionState::Completed);
         assert_eq!(records[0].activity_id(), activity_id);
         if verified_ci {
@@ -2728,19 +3764,202 @@ async fn start_isolated_forge_fixture(
     Ok((session_server, backend, issuer, source))
 }
 
+struct BootstrapHttpFlow<'a> {
+    client: &'a OrchestrationHttpClient,
+    bearer: &'a HeaderValue,
+    backend_address: std::net::SocketAddr,
+    final_source_sequence: Arc<AtomicU64>,
+    principal: AuthenticatedPrincipal,
+    non_operator: Option<&'a reviewer_qualification_rule::NonOperatorCredential>,
+    prepare: &'a ImportPrepareRequest,
+    source: &'a ForgeHost,
+    freeze: &'a AgentOperationsFreeze,
+    destination: Uuid,
+    actual_broker: bool,
+    transfer_exercise: TransferExercise,
+    broker_case: Option<(&'a ForgeHost, Uuid, ForgeExecutionService)>,
+}
+
+async fn run_bootstrap_http_flow(flow: &BootstrapHttpFlow<'_>) -> TestResult {
+    await_import_server(flow.client, flow.bearer, flow.prepare.migration_id).await?;
+    bootstrap_flow(flow).await?;
+    if !flow.actual_broker {
+        assert_release_source_freeze(
+            flow.source,
+            flow.freeze,
+            flow.prepare.migration_id,
+            flow.destination,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+struct RestartReadbackContext<'a> {
+    data_root: &'a Path,
+    broker_cluster: BrokerClusterConfig,
+    principal: AuthenticatedPrincipal,
+    source: &'a ForgeHost,
+    token: &'a McpTokenRuntime,
+    bearer: &'a HeaderValue,
+    prepare: &'a ImportPrepareRequest,
+    actual_broker: bool,
+}
+
+async fn restart_readback_after_success(
+    context: RestartReadbackContext<'_>,
+    flow_succeeded: bool,
+) -> TestResult {
+    if context.actual_broker && flow_succeeded {
+        assert_restarted_control_plane_readback(
+            context.data_root,
+            context.broker_cluster,
+            context.principal,
+            context.source,
+            context.token,
+            context.bearer,
+            context.prepare,
+        )
+        .await
+    } else {
+        Ok(())
+    }
+}
+
+struct PersistedBootstrapContext<'a> {
+    root: &'a Path,
+    data_root: &'a Path,
+    source_scope: &'a ResolvedWorkspaceScope,
+    activity_id: ActivityId,
+    actual_broker: bool,
+    immutable_verification: bool,
+    issuer: OrchestrationIssuerId,
+    backend: ForgeBackendId,
+    workspace_id: Uuid,
+    migration_id: Uuid,
+    expected_final_source_sequence: Option<u64>,
+}
+
+fn assert_persisted_bootstrap_after_success(
+    context: &PersistedBootstrapContext<'_>,
+    flow_succeeded: bool,
+) -> TestResult {
+    if flow_succeeded {
+        assert_forge_execution_survives_worker_restart(
+            context.root,
+            context.source_scope,
+            context.activity_id,
+            context.actual_broker,
+            context.immutable_verification,
+        )?;
+        assert_persisted_bootstrap_catalog(
+            context.data_root,
+            context.issuer,
+            context.backend,
+            context.workspace_id,
+            context.migration_id,
+            context.actual_broker,
+            context.immutable_verification,
+            context.expected_final_source_sequence,
+        )?;
+    }
+    Ok(())
+}
+
+async fn stop_bootstrap_source_fixtures(
+    source: ForgeHost,
+    mut session_server: InternalSessionServerHandle,
+) -> TestResult<(ResolvedWorkspaceScope, bool)> {
+    let source_scope = source.scope.clone();
+    let immutable_verification = source.verified_ci;
+    let source_stopped = source.shutdown().await;
+    let session_stopped = session_server.shutdown(DEADLINE).await;
+    source_stopped.map_err(|error| format!("Forge fixture shutdown failed: {error:?}"))?;
+    assert!(session_stopped.is_successful());
+    Ok((source_scope, immutable_verification))
+}
+
 async fn bootstrap_fixture_with_broker(
     broker_cluster: BrokerClusterConfig,
     actual_broker: bool,
     verified_ci: bool,
 ) -> TestResult {
+    Box::pin(bootstrap_fixture_with_broker_options(
+        broker_cluster,
+        actual_broker,
+        verified_ci,
+        TransferExercise::None,
+    ))
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferExercise {
+    None,
+    SlowRenewal,
+    Preparation,
+    UnattributedPreparation,
+    SourceDispatch,
+}
+
+async fn fixture_source_authority_with_probe(
+    source: &ForgeHost,
+    backend: ForgeBackendId,
+    issuer: OrchestrationIssuerId,
+    destination: Uuid,
+    transfer_exercise: TransferExercise,
+) -> TestResult<(
+    CoordinatorAuthority,
+    Option<team_expansion_v3_existing_home::home_source::SourceHttpProxy>,
+)> {
+    let authority = fixture_source_authority(source)?;
+    if transfer_exercise != TransferExercise::SourceDispatch {
+        return Ok((authority, None));
+    }
+    let proxy =
+        team_expansion_v3_existing_home::home_source::SourceHttpProxy::start(source.address)
+            .await?;
+    let authority = authority.with_home_transfer_source(
+        ForgeHttpClient::new(
+            proxy.address(),
+            FORGE_SECRET,
+            backend,
+            destination,
+            DEADLINE,
+        )?,
+        HomeTransferSourceService {
+            issuer,
+            backend_id: backend,
+            destination_id: destination,
+        },
+        300_000,
+    )?;
+    Ok((authority, Some(proxy)))
+}
+
+async fn bootstrap_fixture_with_broker_options(
+    broker_cluster: BrokerClusterConfig,
+    actual_broker: bool,
+    verified_ci: bool,
+    transfer_exercise: TransferExercise,
+) -> TestResult {
     let (root, data_root, destination) = fixture_storage(broker_cluster)?;
-    let (mut session_server, backend, issuer, source) =
+    let (session_server, backend, issuer, source) =
         start_isolated_forge_fixture(&root, &data_root, destination, verified_ci).await?;
     let (activity_id, activity_runtime, now_ms) = bootstrap_fixture_activity(&source)?;
     let (freeze, prepare) = freeze_fixture_source(&source, destination).await?;
-    let migration_id = prepare.migration_id;
-    let authority = fixture_source_authority(&source)?;
+    let (authority, source_proxy) = fixture_source_authority_with_probe(
+        &source,
+        backend,
+        issuer,
+        destination,
+        transfer_exercise,
+    )
+    .await?;
     let (token, bearer, principal) = token_authority(&root)?;
+    let non_operator = actual_broker
+        .then(|| reviewer_qualification_rule::issue_nonoperator_credential(&token))
+        .transpose()?;
     let address = fixture_http_address()?;
     let runtime = configured_fixture_runtime(
         &data_root,
@@ -2759,76 +3978,123 @@ async fn bootstrap_fixture_with_broker(
         cancellation.clone(),
     ));
     let client = OrchestrationHttpClient::new(address, DEADLINE)?;
-    let result: TestResult = async {
-        await_import_server(&client, &bearer, migration_id).await?;
-        bootstrap_flow(
-            &client,
-            &bearer,
-            principal,
-            &prepare,
-            actual_broker.then_some((
-                &source,
-                activity_id.into_uuid(),
-                ForgeExecutionService {
-                    backend,
-                    issuer,
-                    activity_runtime,
-                },
-            )),
-        )
-        .await?;
-        if !actual_broker {
-            assert_release_source_freeze(&source, &freeze, migration_id, destination).await?;
-        }
-        Ok(())
-    }
-    .await;
-    cancellation.cancel();
-    let stopped = tokio::time::timeout(DEADLINE, server).await;
-    stopped???;
-    let restart_result = if actual_broker && result.is_ok() {
-        assert_restarted_control_plane_readback(
-            &data_root,
+    let http_flow = BootstrapHttpFlow {
+        client: &client,
+        bearer: &bearer,
+        backend_address: address,
+        final_source_sequence: Arc::new(AtomicU64::new(0)),
+        principal,
+        non_operator: non_operator.as_ref(),
+        prepare: &prepare,
+        source: &source,
+        freeze: &freeze,
+        destination,
+        actual_broker,
+        transfer_exercise,
+        broker_case: actual_broker.then_some((
+            &source,
+            activity_id.into_uuid(),
+            ForgeExecutionService {
+                backend,
+                issuer,
+                activity_runtime,
+            },
+        )),
+    };
+    let completion =
+        run_and_stop_bootstrap_http(&http_flow, cancellation, server, source_proxy).await?;
+    let restart_result = restart_readback_after_success(
+        RestartReadbackContext {
+            data_root: &data_root,
             broker_cluster,
             principal,
-            &source,
-            &token,
-            &bearer,
-            &prepare,
-        )
-        .await
-    } else {
-        Ok(())
-    };
-    let source_scope = source.scope.clone();
-    let immutable_verification_fixture = source.verified_ci;
-    let source_stopped = source.shutdown().await;
-    let session_stopped = session_server.shutdown(DEADLINE).await;
-    source_stopped.map_err(|error| format!("Forge fixture shutdown failed: {error:?}"))?;
-    assert!(session_stopped.is_successful());
+            source: &source,
+            token: &token,
+            bearer: &bearer,
+            prepare: &prepare,
+            actual_broker,
+        },
+        completion.result.is_ok(),
+    )
+    .await;
+    let (source_scope, immutable_verification_fixture) =
+        stop_bootstrap_source_fixtures(source, session_server).await?;
     // A failed live flow must retain its original error. Do not replace it
     // with a misleading "missing execution" assertion during teardown.
-    if result.is_ok() {
-        assert_forge_execution_survives_worker_restart(
-            &root,
-            &source_scope,
-            activity_id,
-            actual_broker,
-            immutable_verification_fixture,
-        )?;
-        assert_persisted_bootstrap_catalog(
-            &data_root,
-            issuer,
-            backend,
-            prepare.scope.workspace_id,
-            prepare.migration_id,
-            actual_broker,
-        )?;
+    let persisted = PersistedBootstrapContext {
+        root: &root,
+        data_root: &data_root,
+        source_scope: &source_scope,
+        activity_id,
+        actual_broker,
+        immutable_verification: immutable_verification_fixture,
+        issuer,
+        backend,
+        workspace_id: prepare.scope.workspace_id,
+        migration_id: prepare.migration_id,
+        expected_final_source_sequence: (completion.final_source_sequence > 0)
+            .then_some(completion.final_source_sequence),
+    };
+    finish_bootstrap_fixture(
+        &persisted,
+        completion.result,
+        restart_result,
+        transfer_exercise,
+        completion.source_call_counts,
+    )
+}
+
+struct BootstrapHttpCompletion {
+    result: TestResult,
+    final_source_sequence: u64,
+    source_call_counts: Option<team_expansion_v3_existing_home::home_source::SourceHttpCallCounts>,
+}
+
+async fn run_and_stop_bootstrap_http(
+    flow: &BootstrapHttpFlow<'_>,
+    cancellation: CancellationToken,
+    server: tokio::task::JoinHandle<Result<(), heterarchy_orchestration_backend::BackendError>>,
+    source_proxy: Option<team_expansion_v3_existing_home::home_source::SourceHttpProxy>,
+) -> TestResult<BootstrapHttpCompletion> {
+    let result = run_bootstrap_http_flow(flow).await;
+    let final_source_sequence = flow.final_source_sequence.load(Ordering::Acquire);
+    cancellation.cancel();
+    tokio::time::timeout(DEADLINE, server).await???;
+    let source_call_counts = if let Some(proxy) = source_proxy {
+        Some(proxy.finish().await?)
+    } else {
+        None
+    };
+    Ok(BootstrapHttpCompletion {
+        result,
+        final_source_sequence,
+        source_call_counts,
+    })
+}
+
+fn finish_bootstrap_fixture(
+    persisted: &PersistedBootstrapContext<'_>,
+    result: TestResult,
+    restart_result: TestResult,
+    transfer_exercise: TransferExercise,
+    counts: Option<team_expansion_v3_existing_home::home_source::SourceHttpCallCounts>,
+) -> TestResult {
+    assert_persisted_bootstrap_after_success(persisted, result.is_ok())?;
+    p10::finish_isolated_fixture(persisted.root, persisted.immutable_verification, &result)?;
+    if result.is_ok() && transfer_exercise == TransferExercise::SourceDispatch {
+        let counts = counts.ok_or("Home Source dispatch fixture proxy was absent")?;
+        assert_eq!(
+            counts.get_requests, 2,
+            "one preflight Get and one recovery Get"
+        );
+        assert_eq!(
+            counts.prepare_requests, 1,
+            "exact replay sent a second Prepare"
+        );
     }
-    p10::finish_isolated_fixture(&root, immutable_verification_fixture, &result)?;
     result?;
     restart_result?;
-    if immutable_verification_fixture {
+    if persisted.immutable_verification {
         eprintln!("P10 authentic immutable verification evidence retained in isolated test root");
     }
     Ok(())

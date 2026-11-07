@@ -736,6 +736,7 @@ fn set_node_team_binding(
             "node binding requires legacy admission reconciliation",
         ));
     }
+    crate::home_acceptance::ensure_node_admission_open(&tx, &command.scope)?;
     if crate::team_assignment::has_pending_or_active_affinity_for_scope(&tx, command.scope)? {
         return Err(OperationsError::Conflict(
             "node binding has a pending or active assignment",

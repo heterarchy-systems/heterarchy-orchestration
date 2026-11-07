@@ -124,37 +124,26 @@ pub(super) fn source_submission(
     activity: ActivityId,
     runtime: RuntimeInstanceId,
     request: ExecutionRequest,
-    script: &str,
+    _script: &str,
     project_command: Option<ProjectCommandEvidence>,
 ) -> TestResult<(forge_domain::ExecutionCommandId, SubmitExecutionForApproval)> {
-    let (command_id, submitted) = if let Some(evidence) = project_command {
-        (
-            forge_domain::ExecutionCommandId::new("make:doctor".to_owned())?,
-            SubmitExecutionForApproval::project_command(
-                scope, activity, runtime, request, evidence,
-            )?,
-        )
-    } else {
-        (
-            forge_control::analyze_shell_script(script.to_owned())?
-                .intent_id()
-                .clone(),
-            SubmitExecutionForApproval::analyzed_shell(scope, activity, runtime, request)?,
-        )
-    };
-    Ok((command_id, submitted))
+    let evidence = project_command.ok_or("sealed project command evidence is required")?;
+    Ok((
+        forge_domain::ExecutionCommandId::new("make:doctor".to_owned())?,
+        SubmitExecutionForApproval::project_command(scope, activity, runtime, request, evidence)?,
+    ))
 }
 
 pub(super) fn execution_mode(approved: &ApprovedExecutionFixture) -> serde_json::Value {
-    if let Some(evidence) = approved.project_command {
-        json!({
-            "kind": "sealed_project_command",
-            "command_id": "make:doctor",
-            "expected_catalog_fingerprint": lower_hex_32(evidence.catalog_fingerprint().hash().as_bytes())
-        })
-    } else {
-        json!({"kind": "analyzed_shell", "script": approved.script})
-    }
+    let fingerprint = approved.project_command.map_or_else(
+        || "0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
+        |evidence| lower_hex_32(evidence.catalog_fingerprint().hash().as_bytes()),
+    );
+    json!({
+        "kind": "sealed_project_command",
+        "command_id": "make:doctor",
+        "expected_catalog_fingerprint": fingerprint
+    })
 }
 
 fn lower_hex_32(value: &[u8; 32]) -> String {
@@ -171,7 +160,12 @@ fn lower_hex_32(value: &[u8; 32]) -> String {
 #[ignore = "requires real isolated 3-node AGENT_BROKERD_BIN and SSD RustCI 1.98.0"]
 async fn real_broker_forge_rustci_verification_run_end_to_end() -> TestResult {
     let cluster = broker_cluster::Cluster::start().await?;
-    let result = bootstrap_fixture_with_broker(cluster.orchestration_config()?, true, true).await;
+    let result = Box::pin(bootstrap_fixture_with_broker(
+        cluster.orchestration_config()?,
+        true,
+        true,
+    ))
+    .await;
     drop(cluster);
     result
 }

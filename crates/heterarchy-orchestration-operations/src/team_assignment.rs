@@ -736,6 +736,7 @@ pub fn record_assignment_affinity(
             "assignment affinity requires verified Workspace",
         ));
     }
+    crate::home_acceptance::ensure_node_admission_open(&transaction, &command.node_scope)?;
     validate_node_binding(&transaction, command)?;
     let actor = crate::operational_actor::resolve_actor(
         &transaction,
@@ -1438,7 +1439,7 @@ fn mapped_participation(
     WorkspaceParticipationId::from_uuid(Uuid::from_bytes(wire::id(raw)?))
 }
 
-fn verify_team_membership(
+pub(crate) fn verify_team_membership(
     connection: &Connection,
     workspace_id: WorkspaceId,
     team_id: Uuid,
@@ -2117,6 +2118,8 @@ fn with_replayed(mut stored: StoredAffinity, replayed: bool) -> AssignmentAffini
 
 #[cfg(test)]
 mod tests {
+    mod home_acceptance;
+
     use super::*;
     use crate::OperationalActor;
     use forge_domain::AgentAssignmentState;
@@ -2232,30 +2235,47 @@ mod tests {
 			params![Uuid::from_u128(0xA00C).as_bytes(), workspace.into_uuid().as_bytes(), participation.into_uuid().as_bytes(), profile.as_bytes(), Uuid::from_u128(0xA00D).as_bytes(), session.into_uuid().as_bytes(), participant.as_bytes()],
 		)?;
         let (peer_agent, peer_session) = seed_team_peer(&catalog, workspace, activity)?;
-        let _formed = catalog.create_team(crate::TeamCreateCommand {
-            request_id: Uuid::from_u128(0xAF09),
-            team_id: team,
-            workspace_id: workspace,
-            actor: OperationalActor::LocalOperator,
-            expected_sender_leadership_revision: None,
-            name: "Team".to_owned(),
-            purpose: "scope".to_owned(),
-            initial_members: vec![
-                crate::TeamRosterMemberInput {
+        // Synthetic current Workspace Orchestrator for the explicit-cap
+        // Team-creation fixture; this is not live leadership transition evidence.
+        catalog.connection.execute(
+            "INSERT INTO ops_leadership(workspace_id,scope_kind,activity_id,team_id,state,leader_participant_id,leadership_revision,stabilization_until_ms,current_election_id,updated_at_ms) VALUES(?1,0,NULL,NULL,'ACTIVE',?2,1,NULL,NULL,1)",
+            params![workspace.into_uuid().as_bytes(), participant.as_bytes()],
+        )?;
+        catalog.connection.execute(
+            "INSERT INTO ops_leadership_receipts(workspace_id,scope_kind,activity_id,team_id,receipt_ordinal,receipt_kind,participant_id,leadership_revision,recorded_at_ms) VALUES(?1,0,zeroblob(16),zeroblob(16),1,'CONFIRMED',?2,1,1)",
+            params![workspace.into_uuid().as_bytes(), participant.as_bytes()],
+        )?;
+        let _formed = catalog.create_team_with_capacity(
+            crate::TeamCreateCommand {
+                request_id: Uuid::from_u128(0xAF09),
+                team_id: team,
+                workspace_id: workspace,
+                actor: OperationalActor::Participant {
                     activity_id: activity,
                     agent_id: agent,
                     session_id: session,
-                    role: "implementation".to_owned(),
                 },
-                crate::TeamRosterMemberInput {
-                    activity_id: activity,
-                    agent_id: peer_agent,
-                    session_id: peer_session,
-                    role: "verification".to_owned(),
-                },
-            ],
-            observed_at: TimestampMillis::new(1)?,
-        })?;
+                expected_sender_leadership_revision: Some(1),
+                name: "Team".to_owned(),
+                purpose: "scope".to_owned(),
+                initial_members: vec![
+                    crate::TeamRosterMemberInput {
+                        activity_id: activity,
+                        agent_id: agent,
+                        session_id: session,
+                        role: "implementation".to_owned(),
+                    },
+                    crate::TeamRosterMemberInput {
+                        activity_id: activity,
+                        agent_id: peer_agent,
+                        session_id: peer_session,
+                        role: "verification".to_owned(),
+                    },
+                ],
+                observed_at: TimestampMillis::new(1)?,
+            },
+            crate::team_expansion::TeamMemberCapacity::new(2)?,
+        )?;
         // Existing cases exercise a later exact membership revision.
         catalog.connection.execute("UPDATE ops_team_members SET revision=4 WHERE workspace_id=?1 AND team_id=?2 AND participation_id=?3", params![workspace.into_uuid().as_bytes(),team.as_bytes(),participation.into_uuid().as_bytes()])?;
         let scope = scope_for(workspace, activity, 0xA100)?;

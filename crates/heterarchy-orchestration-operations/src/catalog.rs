@@ -18,7 +18,7 @@ use rusqlite::{
 use std::path::Path;
 use uuid::Uuid;
 const APPLICATION_ID: i64 = 0x484F_4F50;
-pub(crate) const VERSION: i64 = 52;
+pub(crate) const VERSION: i64 = 69;
 const IDENTITY_SQL: &str = "CREATE TABLE ops_catalog_identity (singleton INTEGER PRIMARY KEY CHECK(singleton=1), destination_id BLOB NOT NULL UNIQUE CHECK(length(destination_id)=16))";
 const IMPORTS_SQL: &str = "CREATE TABLE ops_imports (migration_id BLOB PRIMARY KEY NOT NULL CHECK(length(migration_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), destination_id BLOB NOT NULL CHECK(length(destination_id)=16), source_revision INTEGER NOT NULL CHECK(source_revision>=1), phase INTEGER NOT NULL CHECK(phase IN(0,1,2,3)), next_cursor BLOB CHECK(next_cursor IS NULL OR length(next_cursor) BETWEEN 1 AND 512), page_count INTEGER NOT NULL CHECK(page_count>=0), record_count INTEGER NOT NULL CHECK(record_count>=0), import_digest BLOB NOT NULL CHECK(length(import_digest)=32), verified_pages INTEGER NOT NULL CHECK(verified_pages BETWEEN 0 AND page_count), verify_digest BLOB NOT NULL CHECK(length(verify_digest)=32), FOREIGN KEY(destination_id) REFERENCES ops_catalog_identity(destination_id), CHECK(phase NOT IN(1,2) OR page_count>=5), CHECK((phase=0 AND next_cursor IS NOT NULL) OR (phase IN(1,2) AND next_cursor IS NULL) OR phase=3), CHECK(phase!=2 OR (verified_pages=page_count AND import_digest=verify_digest)))";
 const IMPORT_INDEX: &str = "CREATE UNIQUE INDEX ops_imports_workspace_owner_idx ON ops_imports(workspace_id) WHERE phase!=3";
@@ -336,6 +336,23 @@ fn validate_catalog_schema_version(
         49 => validate_schema_v49(connection),
         50 => validate_schema_v50(connection),
         51 => validate_schema_v51(connection),
+        52 => validate_schema_v52(connection),
+        53 => validate_schema_v53(connection),
+        54 => validate_schema_v54(connection),
+        55 => validate_schema_v55(connection),
+        56 => validate_schema_v56(connection),
+        57 => validate_schema_v57(connection),
+        58 => validate_schema_v58(connection),
+        59 => validate_schema_v59(connection),
+        60 => validate_schema_v60(connection),
+        61 => validate_schema_v61(connection),
+        62 => validate_schema_v62(connection),
+        63 => validate_schema_v63(connection),
+        64 => validate_schema_v64(connection),
+        65 => validate_schema_v65(connection),
+        66 => validate_schema_v66(connection),
+        67 => validate_schema_v67(connection),
+        68 => validate_schema_v68(connection),
         VERSION => validate_schema(connection),
         _ => Err(OperationsError::Conflict("foreign catalog")),
     }
@@ -422,6 +439,23 @@ fn initialize_catalog(
             leadership::work_exchange::create_schema(&tx)?;
             crate::registration_profile::create_schema(&tx)?;
             leadership::work_roster::create_schema(&tx)?;
+            crate::mission_evaluation::create_schema(&tx)?;
+            crate::mission_evaluation::create_checkpoint_schema(&tx)?;
+            crate::mission_evidence::create_schema(&tx)?;
+            crate::temporary_dispatch::create_schema(&tx)?;
+            crate::reviewer_qualification_rule::create_schema(&tx)?;
+            crate::temporary_dispatch::lifecycle::create_lifecycle_schema(&tx)?;
+            crate::reviewer_participation::create_schema(&tx)?;
+            crate::team_expansion::create_schema(&tx)?;
+            crate::team_create_source::create_schema(&tx)?;
+            crate::team_expansion::create_workspace_hold_schema(&tx)?;
+            crate::team_expansion::create_legacy_slot_recovery_schema(&tx)?;
+            crate::team_expansion::create_existing_home_transfer_schema(&tx)?;
+            crate::team_permanent_transfer::schema::create_schema(&tx)?;
+            crate::team_permanent_transfer::generation::create_schema(&tx)?;
+            crate::team_permanent_transfer::preparation::schema::create_schema(&tx)?;
+            crate::team_permanent_transfer::source::schema::create_schema(&tx)?;
+            crate::home_acceptance::schema::create_schema(&tx)?;
             seal_catalog_identity(&tx, destination)?;
         }
         version => create_schema_upgrade(&tx, version)?,
@@ -519,7 +553,8 @@ fn create_legacy_schema_upgrade(tx: &Transaction<'_>, version: i64) -> Result<()
             effect_fact::create_assignment_submit_source_refs_schema(tx)?;
         }
         17 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32 | 33 | 34 | 35
-        | 36 | 37 | 38 | 39 | 40 | 41 | 42 | 43 | 44 | 45 | 46 | 47 | 48 | 49 | 50 | 51 => {}
+        | 36 | 37 | 38 | 39 | 40 | 41 | 42 | 43 | 44 | 45 | 46 | 47 | 48 | 49 | 50 | 51 | 52
+        | 53 | 54 | 55 | 56 | 57 | 58 | 59 | 60 | 61 | 62 | 63 | 64 | 65 | 66 | 67 | 68 => {}
         18 => {
             leadership::rebuild_receipts_v19(tx)?;
         }
@@ -650,6 +685,63 @@ fn upgrade_catalog_features(tx: &Transaction<'_>, version: i64) -> Result<(), Op
     }
     if version <= 51 {
         crate::import_handoff::create_schema(tx)?;
+    }
+    if version <= 52 {
+        crate::mission_evaluation::create_schema(tx)?;
+    }
+    if version <= 53 {
+        crate::mission_evidence::create_schema(tx)?;
+    }
+    if version <= 54 {
+        crate::temporary_dispatch::create_schema(tx)?;
+        crate::reviewer_qualification_rule::create_schema(tx)?;
+    }
+    if version <= 55 {
+        crate::temporary_dispatch::lifecycle::create_lifecycle_schema(tx)?;
+    }
+    if version <= 56 {
+        crate::reviewer_participation::create_schema(tx)?;
+    }
+    if version <= 57 {
+        crate::team_expansion::create_schema(tx)?;
+    }
+    if version <= 58 {
+        crate::team_create_source::migrate_v58_to_v59(tx)?;
+    }
+    if version <= 59 {
+        crate::team_expansion::create_workspace_hold_schema(tx)?;
+        crate::team_expansion::classify_pre_hold_decisions(tx)?;
+    }
+    if version <= 60 {
+        crate::team_expansion::create_legacy_slot_recovery_schema(tx)?;
+    }
+    if version <= 61 {
+        crate::mission_evaluation::create_checkpoint_schema(tx)?;
+    }
+    if version <= 62 {
+        crate::team_expansion::create_existing_home_transfer_schema(tx)?;
+    }
+    if version <= 63 {
+        crate::team_permanent_transfer::schema::create_schema(tx)?;
+    } else if version == 64 {
+        crate::team_permanent_transfer::schema::migrate_v64_to_v65(tx)?;
+        validate_schema_v65(tx)?;
+        crate::team_permanent_transfer::schema::migrate_v65_to_v66(tx)?;
+    } else if version == 65 {
+        crate::team_permanent_transfer::schema::migrate_v65_to_v66(tx)?;
+    }
+    if version <= 65 {
+        crate::team_permanent_transfer::generation::create_schema(tx)?;
+        crate::team_permanent_transfer::generation::backfill_v65_roots(tx)?;
+    }
+    if version <= 66 {
+        crate::team_permanent_transfer::preparation::schema::create_schema(tx)?;
+    }
+    if version <= 67 {
+        crate::team_permanent_transfer::source::schema::create_schema(tx)?;
+    }
+    if version <= 68 {
+        crate::home_acceptance::schema::create_schema(tx)?;
     }
     Ok(())
 }
@@ -986,7 +1078,212 @@ fn validate_schema_v43(c: &Connection) -> Result<(), OperationsError> {
 }
 
 fn validate_schema(c: &Connection) -> Result<(), OperationsError> {
-    validate_schema_v52(c)
+    let mut objects = schema_v68_objects();
+    extend_owned(
+        &mut objects,
+        crate::home_acceptance::schema::schema_objects(),
+    );
+    validate_exact_schema_objects(c, &objects)
+}
+
+fn validate_schema_v68(c: &Connection) -> Result<(), OperationsError> {
+    crate::team_permanent_transfer::source::schema::validate_schema(c)?;
+    validate_exact_schema_objects(c, &schema_v68_objects())
+}
+
+fn schema_v68_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v67_objects();
+    extend_owned(
+        &mut objects,
+        crate::team_permanent_transfer::source::schema::schema_objects().to_vec(),
+    );
+    objects
+}
+
+fn validate_schema_v67(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v67_objects())
+}
+
+fn schema_v67_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v66_objects();
+    extend_owned(
+        &mut objects,
+        crate::team_permanent_transfer::preparation::schema::schema_objects().to_vec(),
+    );
+    objects
+}
+
+fn validate_schema_v66(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v66_objects())
+}
+
+fn schema_v66_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v63_objects();
+    extend_owned(
+        &mut objects,
+        crate::team_permanent_transfer::schema::schema_objects().to_vec(),
+    );
+    extend_owned(
+        &mut objects,
+        crate::team_permanent_transfer::generation::schema_objects().to_vec(),
+    );
+    objects
+}
+
+fn validate_schema_v65(c: &Connection) -> Result<(), OperationsError> {
+    let mut objects = schema_v63_objects();
+    extend_owned(
+        &mut objects,
+        crate::team_permanent_transfer::schema::schema_objects_v65().to_vec(),
+    );
+    validate_exact_schema_objects(c, &objects)
+}
+
+fn validate_schema_v64(c: &Connection) -> Result<(), OperationsError> {
+    let mut objects = schema_v63_objects();
+    extend_owned(
+        &mut objects,
+        crate::team_permanent_transfer::schema::schema_objects_v64().to_vec(),
+    );
+    validate_exact_schema_objects(c, &objects)
+}
+
+fn schema_v63_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v62_objects();
+    extend_owned(
+        &mut objects,
+        crate::team_expansion::existing_home_transfer_schema_objects().to_vec(),
+    );
+    objects
+}
+
+fn validate_schema_v63(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v63_objects())
+}
+
+fn schema_v62_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v61_objects();
+    extend_owned(
+        &mut objects,
+        crate::mission_evaluation::checkpoint_schema_objects(),
+    );
+    objects
+}
+
+fn validate_schema_v62(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v62_objects())
+}
+
+fn schema_v61_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v60_objects();
+    extend_owned(
+        &mut objects,
+        crate::team_expansion::legacy_slot_recovery_schema_objects().to_vec(),
+    );
+    objects
+}
+
+fn validate_schema_v61(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v61_objects())
+}
+
+fn schema_v60_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v59_objects();
+    extend_owned(
+        &mut objects,
+        crate::team_expansion::workspace_hold_schema_objects().to_vec(),
+    );
+    objects
+}
+
+fn validate_schema_v60(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v60_objects())
+}
+
+fn schema_v59_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v58_objects();
+    extend_owned(
+        &mut objects,
+        crate::team_create_source::schema_objects().to_vec(),
+    );
+    objects
+}
+
+fn validate_schema_v59(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v59_objects())
+}
+
+fn schema_v58_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v57_objects();
+    extend_owned(
+        &mut objects,
+        crate::team_expansion::schema_objects().to_vec(),
+    );
+    objects
+}
+
+fn validate_schema_v58(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v58_objects())
+}
+
+fn schema_v57_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v56_objects();
+    extend_owned(
+        &mut objects,
+        crate::reviewer_participation::schema_objects().to_vec(),
+    );
+    objects
+}
+
+fn validate_schema_v57(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v57_objects())
+}
+
+fn schema_v56_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v55_objects();
+    extend_owned(
+        &mut objects,
+        crate::temporary_dispatch::lifecycle::lifecycle_schema_objects(),
+    );
+    objects
+}
+
+fn validate_schema_v56(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v56_objects())
+}
+
+fn schema_v55_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v54_objects();
+    extend_owned(&mut objects, crate::temporary_dispatch::schema_objects());
+    extend_owned(
+        &mut objects,
+        crate::reviewer_qualification_rule::schema_objects().to_vec(),
+    );
+    objects
+}
+
+fn validate_schema_v55(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v55_objects())
+}
+
+fn schema_v54_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v53_objects();
+    extend_owned(&mut objects, crate::mission_evidence::schema_objects());
+    objects
+}
+
+fn validate_schema_v54(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v54_objects())
+}
+
+fn schema_v53_objects() -> Vec<(&'static str, &'static str, String)> {
+    let mut objects = schema_v52_objects();
+    extend_owned(&mut objects, crate::mission_evaluation::schema_objects());
+    objects
+}
+
+fn validate_schema_v53(c: &Connection) -> Result<(), OperationsError> {
+    validate_exact_schema_objects(c, &schema_v53_objects())
 }
 
 fn schema_v52_objects() -> Vec<(&'static str, &'static str, String)> {
@@ -1920,6 +2217,294 @@ impl OperationsCatalog {
 /// Reconstruct old catalog fixtures without retaining later application tables.
 /// Production migrations never drop these objects.
 #[cfg(test)]
+pub(crate) fn drop_v53_mission_schema_for_legacy_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    let mut objects = crate::mission_evaluation::schema_objects();
+    objects.extend(crate::mission_evidence::schema_objects());
+    objects.extend(crate::temporary_dispatch::schema_objects());
+    objects.extend(crate::reviewer_qualification_rule::schema_objects());
+    objects.extend(crate::temporary_dispatch::lifecycle::lifecycle_schema_objects());
+    objects.extend_from_slice(crate::reviewer_participation::schema_objects());
+    objects.extend_from_slice(crate::team_expansion::schema_objects());
+    objects.extend_from_slice(crate::team_create_source::schema_objects());
+    objects.extend_from_slice(crate::team_expansion::workspace_hold_schema_objects());
+    objects.extend_from_slice(crate::team_expansion::legacy_slot_recovery_schema_objects());
+    drop_empty_mission_schema_for_legacy_fixture(connection, &objects)
+}
+
+#[cfg(test)]
+pub(crate) fn drop_v54_mission_evidence_schema_for_legacy_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    let mut objects = crate::mission_evidence::schema_objects();
+    objects.extend(crate::temporary_dispatch::schema_objects());
+    objects.extend(crate::reviewer_qualification_rule::schema_objects());
+    objects.extend(crate::temporary_dispatch::lifecycle::lifecycle_schema_objects());
+    objects.extend_from_slice(crate::reviewer_participation::schema_objects());
+    objects.extend_from_slice(crate::team_expansion::schema_objects());
+    objects.extend_from_slice(crate::team_create_source::schema_objects());
+    objects.extend_from_slice(crate::team_expansion::workspace_hold_schema_objects());
+    objects.extend_from_slice(crate::team_expansion::legacy_slot_recovery_schema_objects());
+    drop_empty_mission_schema_for_legacy_fixture(connection, &objects)
+}
+
+/// Reconstruct an empty pre-governance schema for migration fixtures only.
+#[cfg(test)]
+pub(crate) fn drop_v55_governance_schema_for_legacy_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    let mut objects = crate::temporary_dispatch::schema_objects();
+    objects.extend(crate::reviewer_qualification_rule::schema_objects());
+    objects.extend(crate::temporary_dispatch::lifecycle::lifecycle_schema_objects());
+    objects.extend_from_slice(crate::reviewer_participation::schema_objects());
+    objects.extend_from_slice(crate::team_expansion::schema_objects());
+    objects.extend_from_slice(crate::team_create_source::schema_objects());
+    objects.extend_from_slice(crate::team_expansion::workspace_hold_schema_objects());
+    objects.extend_from_slice(crate::team_expansion::legacy_slot_recovery_schema_objects());
+    drop_empty_mission_schema_for_legacy_fixture(connection, &objects)
+}
+
+/// Reconstruct a schema-58 fixture while retaining populated Team history.
+/// Production migrations never drop source receipts or immutable triggers.
+#[cfg(test)]
+pub(crate) fn drop_v59_team_create_source_for_v58_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    drop_empty_mission_schema_for_legacy_fixture(connection, &[])?;
+    let mut objects = crate::team_create_source::schema_objects().to_vec();
+    objects.extend_from_slice(crate::team_expansion::workspace_hold_schema_objects());
+    objects.extend_from_slice(crate::team_expansion::legacy_slot_recovery_schema_objects());
+    for (_, name, _) in objects.iter().rev() {
+        let kind: String = connection
+            .query_row(
+                "SELECT type FROM sqlite_schema WHERE name=?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| "missing".to_owned());
+        match kind.as_str() {
+            "trigger" => connection.execute_batch(&format!("DROP TRIGGER {name};"))?,
+            "index" => connection.execute_batch(&format!("DROP INDEX {name};"))?,
+            "table" => connection.execute_batch(&format!("DROP TABLE {name};"))?,
+            "missing" => {}
+            _ => return Err(OperationsError::Corrupt("Team create source fixture kind")),
+        }
+    }
+    Ok(())
+}
+
+/// Reconstruct schema 59 while retaining populated Team expansion decisions.
+#[cfg(test)]
+pub(crate) fn drop_v60_workspace_holds_for_v59_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    drop_empty_mission_schema_for_legacy_fixture(connection, &[])?;
+    let mut objects = crate::team_expansion::workspace_hold_schema_objects().to_vec();
+    objects.extend_from_slice(crate::team_expansion::legacy_slot_recovery_schema_objects());
+    for (_, name, _) in objects.iter().rev() {
+        let kind: String = connection.query_row(
+            "SELECT type FROM sqlite_schema WHERE name=?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        match kind.as_str() {
+            "trigger" => connection.execute_batch(&format!("DROP TRIGGER {name};"))?,
+            "index" => connection.execute_batch(&format!("DROP INDEX {name};"))?,
+            "table" => connection.execute_batch(&format!("DROP TABLE {name};"))?,
+            _ => return Err(OperationsError::Corrupt("Workspace hold fixture kind")),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn drop_v61_recovery_for_v60_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    drop_empty_mission_schema_for_legacy_fixture(connection, &[])?;
+    for (kind, name, _) in crate::team_expansion::legacy_slot_recovery_schema_objects()
+        .iter()
+        .rev()
+    {
+        let statement = match *kind {
+            "trigger" => format!("DROP TRIGGER {name};"),
+            "table" => format!("DROP TABLE {name};"),
+            _ => return Err(OperationsError::Corrupt("legacy recovery fixture kind")),
+        };
+        connection.execute_batch(&statement)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn drop_v63_existing_home_transfer_for_v62_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    drop_v64_permanent_transfer_for_v63_fixture(connection)?;
+    for table in [
+        "ops_team_expansion_v3_manifests",
+        "ops_team_expansion_existing_home_transfers",
+    ] {
+        let populated: bool = connection.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+            [],
+            |row| row.get(0),
+        )?;
+        if populated {
+            return Err(OperationsError::Conflict(
+                "cannot downgrade populated existing Home transfer fixture",
+            ));
+        }
+    }
+    for (kind, name, _) in crate::team_expansion::existing_home_transfer_schema_objects()
+        .iter()
+        .rev()
+    {
+        let statement = match *kind {
+            "trigger" => format!("DROP TRIGGER {name};"),
+            "table" => format!("DROP TABLE {name};"),
+            _ => {
+                return Err(OperationsError::Corrupt(
+                    "existing Home transfer fixture kind",
+                ));
+            }
+        };
+        connection.execute_batch(&statement)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn drop_v64_permanent_transfer_for_v63_fixture(
+    connection: &Connection,
+) -> Result<(), OperationsError> {
+    for table in [
+        "ops_team_permanent_transfer_preparation_sessions",
+        "ops_team_permanent_transfer_preparation_barriers",
+        "ops_team_permanent_transfer_preparations",
+        "ops_team_permanent_transfer_consents",
+        "ops_team_permanent_transfer_intents",
+    ] {
+        let populated: bool = connection.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+            [],
+            |row| row.get(0),
+        )?;
+        if populated {
+            return Err(OperationsError::Conflict(
+                "cannot downgrade populated permanent transfer fixture",
+            ));
+        }
+    }
+    for (kind, name, _) in crate::team_permanent_transfer::source::schema::schema_objects() {
+        if *kind == "table"
+            && connection.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {name})"), [], |row| {
+                row.get::<_, bool>(0)
+            })?
+        {
+            return Err(OperationsError::Conflict(
+                "cannot downgrade populated transfer Source fixture",
+            ));
+        }
+    }
+    for (kind, name, _) in crate::home_acceptance::schema::schema_objects() {
+        if kind == "table"
+            && connection.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {name})"), [], |row| {
+                row.get::<_, bool>(0)
+            })?
+        {
+            return Err(OperationsError::Conflict(
+                "cannot downgrade populated Home acceptance fixture",
+            ));
+        }
+    }
+    let mut transfer_objects = crate::team_permanent_transfer::schema::schema_objects().to_vec();
+    transfer_objects
+        .extend_from_slice(crate::team_permanent_transfer::generation::schema_objects());
+    transfer_objects
+        .extend_from_slice(crate::team_permanent_transfer::preparation::schema::schema_objects());
+    transfer_objects
+        .extend_from_slice(crate::team_permanent_transfer::source::schema::schema_objects());
+    transfer_objects.extend(crate::home_acceptance::schema::schema_objects());
+    for (kind, name, _) in transfer_objects.iter().rev() {
+        let statement = match *kind {
+            "trigger" => format!("DROP TRIGGER {name};"),
+            "table" => format!("DROP TABLE {name};"),
+            "index" => format!("DROP INDEX {name};"),
+            _ => {
+                return Err(OperationsError::Corrupt("permanent transfer fixture kind"));
+            }
+        };
+        connection.execute_batch(&statement)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn drop_empty_mission_schema_for_legacy_fixture(
+    connection: &Connection,
+    objects: &[(&'static str, &'static str, &'static str)],
+) -> Result<(), OperationsError> {
+    // Every reconstructed pre-v62 catalog must remove the additive T2
+    // checkpoint schema before dropping its older Mission tables. In
+    // particular, the cross-domain request trigger is attached to the
+    // Mission request table and would otherwise outlive its referenced table.
+    let mut fixture_objects = objects.to_vec();
+    fixture_objects.extend(crate::mission_evaluation::checkpoint_schema_objects());
+    fixture_objects
+        .extend_from_slice(crate::team_expansion::existing_home_transfer_schema_objects());
+    fixture_objects.extend_from_slice(crate::team_permanent_transfer::schema::schema_objects());
+    fixture_objects.extend_from_slice(crate::team_permanent_transfer::generation::schema_objects());
+    fixture_objects
+        .extend_from_slice(crate::team_permanent_transfer::preparation::schema::schema_objects());
+    fixture_objects
+        .extend_from_slice(crate::team_permanent_transfer::source::schema::schema_objects());
+    fixture_objects.extend(crate::home_acceptance::schema::schema_objects());
+
+    let tables: Vec<_> = fixture_objects
+        .iter()
+        .filter_map(|(kind, name, _)| (*kind == "table").then_some(*name))
+        .collect();
+    for name in &tables {
+        let present: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+            params![name],
+            |row| row.get(0),
+        )?;
+        if present {
+            let populated: bool = connection.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {name})"),
+                [],
+                |row| row.get(0),
+            )?;
+            if populated {
+                return Err(OperationsError::Conflict(
+                    if *name == "ops_mission_evaluation_t2_deferred_checkpoints" {
+                        "cannot downgrade Mission fixture with T2 checkpoint sources"
+                    } else {
+                        "cannot downgrade populated Mission fixture"
+                    },
+                ));
+            }
+        }
+    }
+    for (kind, name, _) in fixture_objects.iter().rev() {
+        let statement_kind = match *kind {
+            "table" => "TABLE",
+            "index" => "INDEX",
+            "trigger" => "TRIGGER",
+            _ => return Err(OperationsError::Corrupt("Mission fixture schema kind")),
+        };
+        connection.execute_batch(&format!("DROP {statement_kind} IF EXISTS {name};"))?;
+    }
+    Ok(())
+}
+
+/// Reconstruct old catalog fixtures without retaining later application tables.
+/// Production migrations never drop these objects.
+#[cfg(test)]
 pub(crate) fn drop_v31_objects_for_legacy_fixture(
     connection: &Connection,
 ) -> Result<(), OperationsError> {
@@ -1989,6 +2574,7 @@ pub(crate) fn restore_v34_shapes_for_legacy_fixture(
 pub(crate) fn drop_v49_project_schema_for_legacy_fixture(
     connection: &Connection,
 ) -> Result<(), OperationsError> {
+    drop_v53_mission_schema_for_legacy_fixture(connection)?;
     crate::import_handoff::drop_schema_for_legacy_fixture(connection)?;
     drop_v51_unknown_isolation_schema_for_legacy_fixture(connection)?;
     workspace_project::drop_enrollment_schema_for_legacy_fixture(connection)?;
@@ -2280,6 +2866,15 @@ pub(crate) fn restore_v47_assignment_schema_for_legacy_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod existing_home_transfer_v62_upgrade;
+    mod governance_v55_upgrade;
+    mod home_acceptance_v69_upgrade;
+    mod mission_t2_v61_upgrade;
+    mod mission_upgrade;
+    mod reviewer_participation_v56_upgrade;
+    mod team_capacity_v57_upgrade;
+    mod team_create_source_v58_upgrade;
 
     type CatalogTableSnapshot = Vec<Vec<rusqlite::types::Value>>;
     type ForeignKeySnapshotRow = (i64, String, String, String, String);

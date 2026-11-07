@@ -1,10 +1,12 @@
 //! App-global `SQLite` authority for logical Agent session identities.
 //!
-//! A session is issued before a Workspace attachment exists.  This catalog
-//! stores only the opaque session identity, its idempotency nonce, the
-//! authenticated principal identity, and lifecycle timestamps/revision.  It
-//! intentionally has no Workspace, Activity, Goal, transcript, `ChatGPT`, or
-//! bearer-secret authority.
+//! A session is issued before a Workspace attachment exists. The base
+//! `agent_sessions` table stores the opaque session identity, its idempotency
+//! nonce, authenticated principal identity and lifecycle timestamps/revision.
+//! A separate Home-acceptance table may pin one exact canonical take request
+//! while the Session is held; its Workspace/route values remain opaque routing
+//! references, never a second Activity or Goal authority. Neither table stores
+//! transcripts, `ChatGPT` content or bearer secrets.
 
 use std::fmt;
 use std::fs;
@@ -26,12 +28,22 @@ use rusqlite::{
 use thiserror::Error;
 use uuid::Uuid;
 
+mod home_acceptance;
+pub use home_acceptance::{
+    HomeAcceptanceOperationsAdmission, HomeAcceptanceOperationsResolution,
+    HomeAcceptanceSessionAcquireOutcome, HomeAcceptanceSessionError,
+    HomeAcceptanceSessionHoldReference, HomeAcceptanceSessionIntent,
+    HomeAcceptanceSessionPendingPage, HomeAcceptanceSessionRecord, HomeAcceptanceSessionResolution,
+    HomeAcceptanceSessionState,
+};
+
 /// Application identifier written into `PRAGMA application_id` for this
 /// catalog.  It is deliberately distinct from the Location, token, OAuth,
 /// and connection-settings catalogs.
 pub const AGENT_SESSION_APPLICATION_ID: i64 = 0x4846_4153;
 /// Current schema version for the logical Agent session catalog.
-pub const AGENT_SESSION_SCHEMA_VERSION: i64 = 1;
+const AGENT_SESSION_SCHEMA_VERSION_V1: i64 = 1;
+pub const AGENT_SESSION_SCHEMA_VERSION: i64 = 2;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const JOURNAL_MODE_RETRY_LIMIT: usize = 8;
@@ -242,16 +254,24 @@ impl AgentSessionCatalog {
         {
             let snapshot = catalog.connection.transaction()?;
             let (application_id, user_version, object_count) = catalog_ownership(&snapshot)?;
-            if application_id != AGENT_SESSION_APPLICATION_ID
-                || user_version != AGENT_SESSION_SCHEMA_VERSION
-            {
+            if application_id != AGENT_SESSION_APPLICATION_ID {
                 return Err(AgentSessionCatalogError::Ownership {
                     application_id,
                     user_version,
                     object_count,
                 });
             }
-            validate_schema(&snapshot)?;
+            match user_version {
+                AGENT_SESSION_SCHEMA_VERSION_V1 => validate_legacy_schema(&snapshot)?,
+                AGENT_SESSION_SCHEMA_VERSION => validate_schema(&snapshot)?,
+                _ => {
+                    return Err(AgentSessionCatalogError::Ownership {
+                        application_id,
+                        user_version,
+                        object_count,
+                    });
+                }
+            }
             snapshot.commit()?;
         }
         catalog.ensure_live_binding()?;
@@ -404,6 +424,7 @@ impl AgentSessionCatalog {
         if current.principal() != principal {
             return Err(AgentSessionCatalogError::ForeignPrincipal(id));
         }
+        home_acceptance::ensure_session_unpinned(&transaction, id)?;
         let closed = current.close(expected_revision, observed_at)?;
         let (principal_kind, principal_id) = encode_principal(principal);
         let id_bytes = id.into_uuid().into_bytes();
@@ -602,21 +623,70 @@ fn is_busy_error(error: &rusqlite::Error) -> bool {
 }
 
 fn initialize_or_validate(connection: &mut Connection) -> Result<(), AgentSessionCatalogError> {
-    let (application_id, user_version, object_count) = catalog_ownership(connection)?;
-    match (application_id, user_version, object_count) {
-        (0, 0, 0) => create_schema(connection),
-        (AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION, _) => {
-            validate_schema(connection)
+    // First classify and validate in one read snapshot. Existing current
+    // catalogs do not take a writer lock on ordinary opens.
+    let ownership = {
+        let snapshot = connection.transaction()?;
+        let ownership = catalog_ownership(&snapshot)?;
+        match ownership {
+            (0, 0, 0) => {}
+            (AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION_V1, 2) => {
+                validate_legacy_schema(&snapshot)?;
+            }
+            (AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION, _) => {
+                validate_schema(&snapshot)?;
+            }
+            (application_id, user_version, object_count) => {
+                return Err(AgentSessionCatalogError::Ownership {
+                    application_id,
+                    user_version,
+                    object_count,
+                });
+            }
         }
-        _ => Err(AgentSessionCatalogError::Ownership {
-            application_id,
-            user_version,
-            object_count,
-        }),
+        snapshot.commit()?;
+        ownership
+    };
+    if ownership.1 == AGENT_SESSION_SCHEMA_VERSION {
+        return Ok(());
     }
+
+    // A create/migration writer must recheck because another opener may have
+    // won between the read snapshot and this IMMEDIATE transaction.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    match catalog_ownership(&transaction)? {
+        (0, 0, 0) => {
+            transaction.execute_batch(AGENT_SESSIONS_TABLE_SQL)?;
+            transaction.execute_batch(AGENT_SESSIONS_INDEX_SQL)?;
+            home_acceptance::schema::create_schema(&transaction)
+                .map_err(|error| AgentSessionCatalogError::HomeAcceptance(Box::new(error)))?;
+            transaction.pragma_update(None, "application_id", AGENT_SESSION_APPLICATION_ID)?;
+            transaction.pragma_update(None, "user_version", AGENT_SESSION_SCHEMA_VERSION)?;
+        }
+        (AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION_V1, 2) => {
+            validate_legacy_schema(&transaction)?;
+            home_acceptance::schema::create_schema(&transaction)
+                .map_err(|error| AgentSessionCatalogError::HomeAcceptance(Box::new(error)))?;
+            transaction.pragma_update(None, "user_version", AGENT_SESSION_SCHEMA_VERSION)?;
+        }
+        (AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION, _) => {
+            validate_schema(&transaction)?;
+        }
+        (application_id, user_version, object_count) => {
+            return Err(AgentSessionCatalogError::Ownership {
+                application_id,
+                user_version,
+                object_count,
+            });
+        }
+    }
+    transaction.commit()?;
+    validate_schema(connection)
 }
 
-fn catalog_ownership(connection: &Connection) -> Result<(i64, i64, i64), AgentSessionCatalogError> {
+pub(super) fn catalog_ownership(
+    connection: &Connection,
+) -> Result<(i64, i64, i64), AgentSessionCatalogError> {
     let application_id: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let user_version: i64 =
@@ -629,33 +699,35 @@ fn catalog_ownership(connection: &Connection) -> Result<(i64, i64, i64), AgentSe
     Ok((application_id, user_version, object_count))
 }
 
-fn create_schema(connection: &mut Connection) -> Result<(), AgentSessionCatalogError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (application_id, user_version, object_count) = catalog_ownership(&transaction)?;
-    match (application_id, user_version, object_count) {
-        (0, 0, 0) => {
-            transaction.execute_batch(AGENT_SESSIONS_TABLE_SQL)?;
-            transaction.execute_batch(AGENT_SESSIONS_INDEX_SQL)?;
-            transaction.pragma_update(None, "application_id", AGENT_SESSION_APPLICATION_ID)?;
-            transaction.pragma_update(None, "user_version", AGENT_SESSION_SCHEMA_VERSION)?;
-        }
-        (AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION, _) => {
-            transaction.commit()?;
-            return validate_schema(connection);
-        }
-        _ => {
-            return Err(AgentSessionCatalogError::Ownership {
-                application_id,
-                user_version,
-                object_count,
-            });
-        }
-    }
-    transaction.commit()?;
-    validate_schema(connection)
+pub(super) fn validate_schema(connection: &Connection) -> Result<(), AgentSessionCatalogError> {
+    validate_schema_contents(connection, 9)?;
+    home_acceptance::schema::validate_schema(connection)
+        .map_err(|error| AgentSessionCatalogError::HomeAcceptance(Box::new(error)))?;
+    validate_catalog_object_names(connection, true)
 }
 
-fn validate_schema(connection: &Connection) -> Result<(), AgentSessionCatalogError> {
+pub(super) fn validate_legacy_schema(
+    connection: &Connection,
+) -> Result<(), AgentSessionCatalogError> {
+    let (application_id, user_version, object_count) = catalog_ownership(connection)?;
+    if application_id != AGENT_SESSION_APPLICATION_ID
+        || user_version != AGENT_SESSION_SCHEMA_VERSION_V1
+        || object_count != 2
+    {
+        return Err(AgentSessionCatalogError::Ownership {
+            application_id,
+            user_version,
+            object_count,
+        });
+    }
+    validate_schema_contents(connection, 2)?;
+    validate_catalog_object_names(connection, false)
+}
+
+fn validate_schema_contents(
+    connection: &Connection,
+    expected_object_count: i64,
+) -> Result<(), AgentSessionCatalogError> {
     let quick: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
     if quick != "ok" {
         return Err(AgentSessionCatalogError::Integrity);
@@ -665,7 +737,7 @@ fn validate_schema(connection: &Connection) -> Result<(), AgentSessionCatalogErr
         [],
         |row| row.get(0),
     )?;
-    if object_count != 2 {
+    if object_count != expected_object_count {
         return Err(AgentSessionCatalogError::Schema("object count"));
     }
     validate_schema_sql(
@@ -740,6 +812,37 @@ fn validate_schema(connection: &Connection) -> Result<(), AgentSessionCatalogErr
         .is_some();
     if foreign_key_violation {
         return Err(AgentSessionCatalogError::Integrity);
+    }
+    Ok(())
+}
+
+fn validate_catalog_object_names(
+    connection: &Connection,
+    include_home: bool,
+) -> Result<(), AgentSessionCatalogError> {
+    let mut statement = connection.prepare(
+        "SELECT type,name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let actual = rows.collect::<Result<Vec<_>, _>>()?;
+    let mut expected = vec![
+        ("index", "agent_sessions_state_updated_idx"),
+        ("table", "agent_sessions"),
+    ];
+    if include_home {
+        expected.extend(home_acceptance::schema::object_names());
+    }
+    expected.sort_unstable();
+    if actual.len() != expected.len()
+        || actual.iter().zip(expected).any(
+            |((actual_type, actual_name), (expected_type, expected_name))| {
+                actual_type != expected_type || actual_name != expected_name
+            },
+        )
+    {
+        return Err(AgentSessionCatalogError::Schema("catalog object names"));
     }
     Ok(())
 }
@@ -986,6 +1089,10 @@ fn decode_state(value: i64) -> Result<AgentSessionState, AgentSessionCatalogErro
 pub enum AgentSessionCatalogError {
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
+    #[error(transparent)]
+    HomeAcceptance(#[from] Box<HomeAcceptanceSessionError>),
+    #[error("Agent session has a pending Home acceptance hold: {0}")]
+    HomeAcceptancePending(AgentSessionId),
     #[error("failed to open Agent session catalog at {path}")]
     Open {
         path: PathBuf,

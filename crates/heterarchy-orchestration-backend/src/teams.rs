@@ -8,6 +8,12 @@
 
 mod commands;
 pub(crate) mod scoped;
+mod team_expansion;
+mod team_expansion_v2;
+mod team_expansion_v3;
+mod team_permanent_transfer;
+mod temporary_dispatch;
+mod temporary_dispatch_lifecycle;
 
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
@@ -32,6 +38,12 @@ pub(crate) fn routes() -> Router<BackendState> {
             get(list_members),
         )
         .merge(commands::routes())
+        .merge(team_expansion::routes())
+        .merge(team_expansion_v2::routes())
+        .merge(team_expansion_v3::routes())
+        .merge(team_permanent_transfer::routes())
+        .merge(temporary_dispatch::routes())
+        .merge(temporary_dispatch_lifecycle::routes())
 }
 
 async fn read_team(

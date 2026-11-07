@@ -10,15 +10,27 @@ use uuid::Uuid;
 pub mod coordination;
 pub mod departure;
 pub mod handoff;
+pub mod legacy_slot_recovery;
 pub mod member_list;
 pub mod membership;
+pub mod mission_evaluation;
+pub mod mission_evidence;
+pub mod mission_t2_checkpoint;
 pub mod node_assignment_admission;
 pub mod node_chat;
 pub mod node_team;
 pub mod operations_import;
 pub mod participation;
+pub mod reviewer_participation;
+pub mod reviewer_qualification_rule;
 pub mod team_commands;
+pub mod team_expansion;
+pub mod team_expansion_v2;
+pub mod team_expansion_v3;
+pub mod team_permanent_transfer;
 pub mod teams;
+pub mod temporary_dispatch;
+pub mod temporary_dispatch_lifecycle;
 pub mod workspace_project;
 pub use teams::{
     TeamCreatorWire, TeamGetQueryRequest, TeamGetQueryResponse, TeamListQueryRequest,

@@ -67,6 +67,7 @@ catalog; this lookup does not grant admission or coordinator authority.
 - [MCP replacement matrix](docs/mcp-backend-replacement-matrix.md) — historical business-operation inventory; its status claims predate this repair and do not establish completion.
 - [Headless migration progress](docs/glm-headless-backend-progress.md) — dated implementation and verification record, including blocked or unverified gates.
 - [macOS packaging and operator notes](packaging/macos/README.md) — package workflow and the in-progress token-issue operator CLI.
+- [Permanent Home transfer Source dispatch](docs/home-transfer-source-dispatch.md) — explicit Source configuration, first-send authority and recovery; settlement and membership cutover remain separate work.
 
 The target remains headless and MCP-free. Do not remove a missing business
 operation from the requirement set simply because its former GUI or MCP route

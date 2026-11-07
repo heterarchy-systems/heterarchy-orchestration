@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Rust harness
+    environment: private-rust-ci
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out Orchestration repository
+        uses: actions/checkout@v4
+        with:
+          path: heterarchy-orchestration
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Test private Harness CI contract
+        working-directory: heterarchy-orchestration
+        run: bash .github/scripts/test-private-rust-harness.sh orchestration
+
+      - name: Provision pinned private Rust Harness
+        uses: ./heterarchy-orchestration/.github/actions/provision-private-rust-harness
+        with:
+          project: orchestration
+          repository: ${{ vars.HETERARCHY_HARNESS_REPOSITORY }}
+          revision: ${{ vars.HETERARCHY_HARNESS_REVISION }}
+          token: ${{ secrets.HETERARCHY_HARNESS_READ_TOKEN }}
+          checkout-path: heterarchy-orchestration/.ci-private-harness-input
+          working-directory: heterarchy-orchestration
+          forge-revision: ${{ vars.HETERARCHY_FORGE_REVISION }}
+          broker-revision: ${{ vars.HETERARCHY_BROKER_REVISION }}
+
+      - name: Check out pinned Forge source
+        uses: actions/checkout@v4
+        with:
+          repository: heterarchy-systems/heterarchy-forge
+          ref: ${{ vars.HETERARCHY_FORGE_REVISION }}
+          token: ${{ secrets.HETERARCHY_HARNESS_READ_TOKEN }}
+          path: heterarchy-forge
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Check out pinned Broker source
+        uses: actions/checkout@v4
+        with:
+          repository: heterarchy-systems/heterarchy-broker
+          ref: ${{ vars.HETERARCHY_BROKER_REVISION }}
+          token: ${{ secrets.HETERARCHY_HARNESS_READ_TOKEN }}
+          path: heterarchy-broker
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Verify exact sibling source commits
+        working-directory: heterarchy-orchestration
+        shell: bash
+        env:
+          HETERARCHY_HARNESS_PROJECT: orchestration
+          HETERARCHY_HARNESS_REPOSITORY: ${{ vars.HETERARCHY_HARNESS_REPOSITORY }}
+          HETERARCHY_HARNESS_REVISION: ${{ vars.HETERARCHY_HARNESS_REVISION }}
+          HETERARCHY_HARNESS_CHECKOUT_PATH: heterarchy-orchestration/.ci-private-harness-input
+          HETERARCHY_HARNESS_READ_TOKEN: ${{ secrets.HETERARCHY_HARNESS_READ_TOKEN }}
+          HETERARCHY_FORGE_REVISION: ${{ vars.HETERARCHY_FORGE_REVISION }}
+          HETERARCHY_BROKER_REVISION: ${{ vars.HETERARCHY_BROKER_REVISION }}
+        run: bash .github/scripts/private-rust-harness.sh verify-sibling-checkouts
+
+      - name: Install pinned Rust toolchain
+        working-directory: heterarchy-orchestration
+        run: rustup toolchain install 1.98.0 --profile minimal --component clippy --component rustfmt
+
+      - name: Run canonical CI harness
+        working-directory: heterarchy-orchestration
+        shell: bash
+        run: |
+          export CARGO_TARGET_DIR="${RUNNER_TEMP}/heterarchy-orchestration-target"
+          export TMPDIR="${RUNNER_TEMP}/heterarchy-orchestration-tmp"
+          export CARGO_BUILD_JOBS=2
+          export CARGO_INCREMENTAL=0
+          mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
+          make ci
+
+      - name: Clean CI-owned private Harness and sibling inputs
+        if: always()
+        working-directory: heterarchy-orchestration
+        shell: bash
+        run: bash .github/scripts/private-rust-harness.sh cleanup

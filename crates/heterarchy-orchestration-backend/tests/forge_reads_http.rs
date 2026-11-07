@@ -36,6 +36,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+#[path = "../../heterarchy-orchestration-runtime/tests/support/broker_cluster.rs"]
+mod broker_cluster;
+
 const OPERATOR_SECRET: [u8; 32] = [0xA7; 32];
 const FORGE_BEARER_SECRET: &str = "forge-reads-fixture-secret";
 const WORKSPACE_ID: Uuid = Uuid::from_u128(0xA801);
@@ -266,6 +269,7 @@ struct Fixture {
     forge_address: SocketAddr,
     server: tokio::task::JoinHandle<Result<(), heterarchy_orchestration_backend::BackendError>>,
     cancellation: CancellationToken,
+    broker_cluster: broker_cluster::Cluster,
     dir: tempfile_guard::TempDir,
 }
 
@@ -342,6 +346,7 @@ async fn start_fixture() -> Result<Fixture, Box<dyn std::error::Error>> {
 async fn start_fixture_with_scopes(
     scopes: Vec<Value>,
 ) -> Result<Fixture, Box<dyn std::error::Error>> {
+    let broker_cluster = broker_cluster::Cluster::start().await?;
     let dir = tempfile_guard::create("forge-reads-http")?;
     let root = &dir.0;
 
@@ -355,8 +360,11 @@ async fn start_fixture_with_scopes(
     } = auth;
     let runtime_root = root.join("runtime");
     std::fs::create_dir_all(&runtime_root)?;
-    let runtime = OrchestrationRuntime::open(runtime_root.as_path())?
-        .with_operator_policy(OperatorPolicy::new(vec![operator_principal])?);
+    let runtime = OrchestrationRuntime::open_with_broker_cluster(
+        runtime_root.as_path(),
+        broker_cluster.orchestration_config()?,
+    )?
+    .with_operator_policy(OperatorPolicy::new(vec![operator_principal])?);
 
     let location_root = location_root_locator()?.encode();
     let child = child_locator()?.encode();
@@ -405,6 +413,7 @@ async fn start_fixture_with_scopes(
         forge_address,
         server,
         cancellation,
+        broker_cluster,
         dir,
     })
 }
@@ -421,8 +430,11 @@ async fn restart_fixture_with_no_static_scopes(
     );
     let authority = write_source_config_with_scopes(&fixture.dir.0, fixture.forge_address, &[])?;
     let runtime_root = fixture.dir.0.join("runtime");
-    let runtime = OrchestrationRuntime::open(runtime_root.as_path())?
-        .with_operator_policy(OperatorPolicy::new(vec![fixture.operator_principal])?);
+    let runtime = OrchestrationRuntime::open_with_broker_cluster(
+        runtime_root.as_path(),
+        fixture.broker_cluster.orchestration_config()?,
+    )?
+    .with_operator_policy(OperatorPolicy::new(vec![fixture.operator_principal])?);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     drop(listener);

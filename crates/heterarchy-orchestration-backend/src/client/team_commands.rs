@@ -5,11 +5,12 @@ use hyper::header::HeaderValue;
 use uuid::Uuid;
 
 use crate::wire::team_commands::{
-    TeamCreateRequest, TeamJoinRequest, TeamLeaveRequest, TeamMutationResponse, TeamRetireRequest,
-    TeamRosterMemberRequest,
+    TeamCreateRequest, TeamCreateV2Request, TeamJoinRequest, TeamJoinV2Request, TeamLeaveRequest,
+    TeamMutationResponse, TeamMutationV2Response, TeamRetireRequest, TeamRosterMemberRequest,
 };
+use crate::wire::teams::TeamMutationWire;
 
-use super::teams::{valid_mutation, valid_scope};
+use super::teams::{valid_mutation, valid_scope, valid_v2_mutation};
 use super::{ClientError, OrchestrationHttpClient, ReadbackTarget, require_identity};
 
 const MAX_TEAM_NAME_BYTES: usize = 128;
@@ -57,6 +58,39 @@ impl OrchestrationHttpClient {
         Ok(response)
     }
 
+    /// Create one Team under the explicit per-Team cap contract.
+    ///
+    /// An uncertain result retains the complete v2 intent for owner-scoped
+    /// readback; this method never retries the mutation.
+    ///
+    /// # Errors
+    /// Rejects invalid scope/identities/cap/roster, typed service rejection,
+    /// bounded transport failure, or an unknown outcome with exact v2 intent.
+    pub async fn create_team_v2(
+        &self,
+        authorization: &HeaderValue,
+        request: &TeamCreateV2Request,
+    ) -> Result<TeamMutationV2Response, ClientError> {
+        validate_create_v2_request(request)?;
+        let readback = ReadbackTarget::TeamCreateV2Mutation(Box::new(request.clone()));
+        let response: TeamMutationV2Response = self
+            .call(
+                authorization,
+                Method::POST,
+                format!(
+                    "/internal/v2/workspaces/{}/teams/create",
+                    request.scope.workspace_id
+                ),
+                Some(request),
+                Some(readback.clone()),
+            )
+            .await?;
+        if !valid_create_v2_response(&response, request) {
+            return Err(ClientError::UnknownOutcome { readback });
+        }
+        Ok(response)
+    }
+
     /// Join or exactly replay one logical Session's Team membership mutation.
     ///
     /// An uncertain exchange carries the exact Workspace/Team/request receipt
@@ -90,6 +124,39 @@ impl OrchestrationHttpClient {
             )
             .await?;
         if !valid_join_response(&response, request) {
+            return Err(ClientError::UnknownOutcome { readback });
+        }
+        Ok(response)
+    }
+
+    /// Join one Team by consuming an exact Orchestrator decision slot.
+    ///
+    /// An uncertain result retains the complete v2 intent for owner-scoped
+    /// readback; this method never retries or reassigns the slot.
+    ///
+    /// # Errors
+    /// Rejects invalid scope/identities/revision/slot, typed service rejection,
+    /// bounded transport failure, or an unknown outcome with exact v2 intent.
+    pub async fn join_team_v2(
+        &self,
+        authorization: &HeaderValue,
+        request: &TeamJoinV2Request,
+    ) -> Result<TeamMutationV2Response, ClientError> {
+        validate_join_v2_request(request)?;
+        let readback = ReadbackTarget::TeamJoinV2Mutation(Box::new(request.clone()));
+        let response: TeamMutationV2Response = self
+            .call(
+                authorization,
+                Method::POST,
+                format!(
+                    "/internal/v2/workspaces/{}/teams/{}/join",
+                    request.scope.workspace_id, request.team_id
+                ),
+                Some(request),
+                Some(readback.clone()),
+            )
+            .await?;
+        if !valid_join_v2_response(&response, request) {
             return Err(ClientError::UnknownOutcome { readback });
         }
         Ok(response)
@@ -180,7 +247,7 @@ fn mutation_readback(workspace_id: Uuid, team_id: Uuid, request_id: Uuid) -> Rea
     }
 }
 
-fn validate_create_request(request: &TeamCreateRequest) -> Result<(), ClientError> {
+pub(super) fn validate_create_request(request: &TeamCreateRequest) -> Result<(), ClientError> {
     validate_common_request(&request.scope, request.request_id, request.team_id)?;
     require_identity(request.activity_id)?;
     require_identity(request.session_id)?;
@@ -196,7 +263,7 @@ fn validate_create_request(request: &TeamCreateRequest) -> Result<(), ClientErro
     Ok(())
 }
 
-fn validate_join_request(request: &TeamJoinRequest) -> Result<(), ClientError> {
+pub(super) fn validate_join_request(request: &TeamJoinRequest) -> Result<(), ClientError> {
     validate_common_request(&request.scope, request.request_id, request.team_id)?;
     require_identity(request.activity_id)?;
     require_identity(request.session_id)?;
@@ -205,6 +272,60 @@ fn validate_join_request(request: &TeamJoinRequest) -> Result<(), ClientError> {
         return Err(ClientError::InvalidRequest);
     }
     Ok(())
+}
+
+pub(super) fn validate_create_v2_request(request: &TeamCreateV2Request) -> Result<(), ClientError> {
+    let v1_shape = TeamCreateRequest {
+        scope: request.scope.clone(),
+        request_id: request.request_id,
+        team_id: request.team_id,
+        activity_id: request.activity_id,
+        session_id: request.session_id,
+        expected_sender_leadership_revision: request.expected_sender_leadership_revision,
+        name: request.name.clone(),
+        purpose: request.purpose.clone(),
+        initial_members: request.initial_members.clone(),
+    };
+    validate_create_request(&v1_shape)?;
+    if request.max_members > 8 || usize::from(request.max_members) < request.initial_members.len() {
+        return Err(ClientError::InvalidRequest);
+    }
+    expected_roster_digest_v1(request).map(|_| ())
+}
+
+pub(super) fn validate_join_v2_request(request: &TeamJoinV2Request) -> Result<(), ClientError> {
+    validate_join_request(&TeamJoinRequest {
+        scope: request.scope.clone(),
+        request_id: request.request_id,
+        team_id: request.team_id,
+        activity_id: request.activity_id,
+        session_id: request.session_id,
+        expected_team_revision: request.expected_team_revision,
+        role: request.role.clone(),
+    })?;
+    if request.expansion_slot.decision_id.is_nil() || request.expansion_slot.ordinal >= 8 {
+        return Err(ClientError::InvalidRequest);
+    }
+    Ok(())
+}
+
+pub(super) fn expected_roster_digest_v1(
+    request: &TeamCreateV2Request,
+) -> Result<String, ClientError> {
+    let inputs = request
+        .initial_members
+        .iter()
+        .map(|member| {
+            heterarchy_orchestration_operations::team_expansion::TeamRosterDigestInput::new(
+                forge_domain::ActivityId::from_uuid(member.activity_id),
+                forge_domain::AgentSessionId::from_uuid(member.session_id),
+                member.role.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    heterarchy_orchestration_operations::team_expansion::team_create_roster_digest(&inputs)
+        .map(heterarchy_orchestration_operations::team_expansion::TeamCreateRosterDigest::to_hex)
+        .map_err(|_| ClientError::InvalidRequest)
 }
 
 fn validate_leave_request(request: &TeamLeaveRequest) -> Result<(), ClientError> {
@@ -261,40 +382,165 @@ fn valid_text(value: &str, max_bytes: usize) -> bool {
     !value.trim().is_empty() && value.len() <= max_bytes
 }
 
-fn valid_create_response(response: &TeamMutationResponse, request: &TeamCreateRequest) -> bool {
+pub(super) fn valid_create_response(
+    response: &TeamMutationResponse,
+    request: &TeamCreateRequest,
+) -> bool {
     valid_common_response(
         response,
         &request.scope,
         request.request_id,
         request.team_id,
-    ) && response.mutation.created
-        && response.mutation.team.revision == 1
-        && response.mutation.team.state == "active"
-        && response.mutation.team.name == request.name
-        && response.mutation.team.purpose == request.purpose
-        && response.mutation.team.created_by.session_id == Some(request.session_id)
-        && response.mutation.membership.is_none()
-        && same_initial_roster_roles(&request.initial_members, &response.mutation.initial_members)
+    ) && valid_create_mutation(&response.mutation, request)
 }
 
-fn valid_join_response(response: &TeamMutationResponse, request: &TeamJoinRequest) -> bool {
+pub(super) fn valid_create_mutation(
+    mutation: &TeamMutationWire,
+    request: &TeamCreateRequest,
+) -> bool {
+    mutation.created
+        && mutation.team.revision == 1
+        && mutation.team.state == "active"
+        && mutation.team.name == request.name
+        && mutation.team.purpose == request.purpose
+        && mutation.team.created_by.session_id == Some(request.session_id)
+        && mutation.membership.is_none()
+        && same_initial_roster_roles(&request.initial_members, &mutation.initial_members)
+}
+
+pub(super) fn valid_join_response(
+    response: &TeamMutationResponse,
+    request: &TeamJoinRequest,
+) -> bool {
     valid_common_response(
         response,
         &request.scope,
         request.request_id,
         request.team_id,
-    ) && next_team_revision(request.expected_team_revision)
-        .is_some_and(|revision| response.mutation.team.revision == revision)
-        && response.mutation.team.state == "active"
-        && response
-            .mutation
-            .membership
+    ) && valid_join_mutation(&response.mutation, request)
+}
+
+pub(super) fn valid_join_mutation(mutation: &TeamMutationWire, request: &TeamJoinRequest) -> bool {
+    next_team_revision(request.expected_team_revision)
+        .is_some_and(|revision| mutation.team.revision == revision)
+        && mutation.team.team_id == request.team_id
+        && mutation.team.state == "active"
+        && !mutation.created
+        && mutation.membership.as_ref().is_some_and(|membership| {
+            membership.state == "joined"
+                && membership.role.as_deref() == Some(request.role.as_str())
+        })
+        && mutation.initial_members.is_empty()
+}
+
+pub(super) fn valid_create_v2_response(
+    response: &TeamMutationV2Response,
+    request: &TeamCreateV2Request,
+) -> bool {
+    response.scope == request.scope
+        && response.request_id == request.request_id
+        && response.team_id == request.team_id
+        && valid_create_v2_mutation(&response.mutation, request)
+}
+
+pub(super) fn valid_create_v2_mutation(
+    mutation: &crate::wire::teams::TeamMutationV2Wire,
+    request: &TeamCreateV2Request,
+) -> bool {
+    let Some(expected_digest) = expected_roster_digest_v1(request).ok() else {
+        return false;
+    };
+    valid_v2_mutation(mutation, request.scope.workspace_id, request.team_id)
+        && mutation.created
+        && mutation.team.team_id == request.team_id
+        && mutation.team.workspace_id == request.scope.workspace_id
+        && mutation.team.revision == 1
+        && mutation.team.state == "active"
+        && mutation.team.name == request.name
+        && mutation.team.purpose == request.purpose
+        && mutation.team.created_by.session_id == Some(request.session_id)
+        && mutation.capacity.as_ref().is_some_and(|capacity| {
+            capacity.team_id == request.team_id
+                && capacity.workspace_id == request.scope.workspace_id
+                && capacity.max_members == request.max_members
+                && capacity.revision == 1
+                && capacity.recorded_at_ms >= mutation.team.created_at_ms
+                && capacity.recorded_at_ms <= mutation.team.updated_at_ms
+                && capacity.leadership_revision == request.expected_sender_leadership_revision
+                && capacity.actor.activity_id == request.activity_id
+                && capacity.actor.agent_id
+                    == heterarchy_orchestration_runtime::leadership::member_agent_id(
+                        request.scope.workspace_id,
+                        request.activity_id,
+                        request.session_id,
+                    )
+                    .into_uuid()
+                && capacity.actor.session_id == request.session_id
+        })
+        && mutation.initial_roster_digest_v1.as_deref() == Some(expected_digest.as_str())
+        && mutation.membership.is_none()
+        && mutation.expansion_slot.is_none()
+        && mutation.expansion_join_source.is_none()
+        && same_initial_roster_roles(&request.initial_members, &mutation.initial_members)
+}
+
+pub(super) fn valid_join_v2_response(
+    response: &TeamMutationV2Response,
+    request: &TeamJoinV2Request,
+) -> bool {
+    response.scope == request.scope
+        && response.request_id == request.request_id
+        && response.team_id == request.team_id
+        && valid_join_v2_mutation(&response.mutation, request)
+}
+
+pub(super) fn valid_join_v2_mutation(
+    mutation: &crate::wire::teams::TeamMutationV2Wire,
+    request: &TeamJoinV2Request,
+) -> bool {
+    valid_v2_mutation(mutation, request.scope.workspace_id, request.team_id)
+        && next_team_revision(request.expected_team_revision)
+            .is_some_and(|revision| mutation.team.revision == revision)
+        && mutation.team.team_id == request.team_id
+        && mutation.team.workspace_id == request.scope.workspace_id
+        && mutation.team.state == "active"
+        && mutation.membership.as_ref().is_some_and(|membership| {
+            membership.state == "joined"
+                && membership.role.as_deref() == Some(request.role.as_str())
+                && crate::wire::teams::v2_join_created_flag_matches_membership_revision(
+                    mutation.created,
+                    membership.revision,
+                )
+        })
+        && mutation.initial_members.is_empty()
+        && mutation.capacity.is_none()
+        && mutation.initial_roster_digest_v1.is_none()
+        && mutation.expansion_slot.is_some_and(|slot| {
+            slot.decision_id == request.expansion_slot.decision_id
+                && slot.ordinal == request.expansion_slot.ordinal
+        })
+        && mutation
+            .expansion_join_source
             .as_ref()
-            .is_some_and(|membership| {
-                membership.state == "joined"
-                    && membership.role.as_deref() == Some(request.role.as_str())
-            })
-        && response.mutation.initial_members.is_empty()
+            .is_some_and(|source| valid_join_v2_source(source, request))
+}
+
+pub(super) fn valid_join_v2_source(
+    source: &crate::wire::teams::TeamExpansionJoinSourceV2Wire,
+    request: &TeamJoinV2Request,
+) -> bool {
+    source.activity_id == request.activity_id
+        && source.session_id == request.session_id
+        && source.agent_id
+            == heterarchy_orchestration_runtime::leadership::member_agent_id(
+                request.scope.workspace_id,
+                request.activity_id,
+                request.session_id,
+            )
+            .into_uuid()
+        && source.decision_id == request.expansion_slot.decision_id
+        && source.ordinal == request.expansion_slot.ordinal
+        && source.role == request.role
 }
 
 fn valid_leave_response(response: &TeamMutationResponse, request: &TeamLeaveRequest) -> bool {
@@ -371,6 +617,7 @@ mod tests {
     use super::super::{MAX_HEADER_BYTES, MAX_REQUEST_BYTES};
     use super::*;
     use crate::wire::leadership::WorkspaceQueryScope;
+    use crate::wire::team_commands::{TeamMutationReaderV2Wire, TeamMutationV2ReadbackResponse};
     use crate::wire::teams::{TeamCreatorWire, TeamMemberWire, TeamMutationWire, TeamWire};
     use hyper::header::HeaderValue;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -412,6 +659,32 @@ mod tests {
         }
     }
 
+    fn create_v2_request() -> TeamCreateV2Request {
+        TeamCreateV2Request {
+            scope: scope(),
+            request_id: Uuid::from_u128(3),
+            team_id: Uuid::from_u128(4),
+            activity_id: Uuid::from_u128(5),
+            session_id: Uuid::from_u128(6),
+            expected_sender_leadership_revision: 1,
+            name: "review".to_owned(),
+            purpose: "review source".to_owned(),
+            initial_members: vec![
+                TeamRosterMemberRequest {
+                    activity_id: Uuid::from_u128(7),
+                    session_id: Uuid::from_u128(8),
+                    role: "reviewer".to_owned(),
+                },
+                TeamRosterMemberRequest {
+                    activity_id: Uuid::from_u128(9),
+                    session_id: Uuid::from_u128(10),
+                    role: "reviewer".to_owned(),
+                },
+            ],
+            max_members: 2,
+        }
+    }
+
     fn join_request() -> TeamJoinRequest {
         TeamJoinRequest {
             scope: scope(),
@@ -421,6 +694,22 @@ mod tests {
             session_id: Uuid::from_u128(14),
             expected_team_revision: 5,
             role: "reviewer".to_owned(),
+        }
+    }
+
+    fn join_v2_request() -> TeamJoinV2Request {
+        TeamJoinV2Request {
+            scope: scope(),
+            request_id: Uuid::from_u128(11),
+            team_id: Uuid::from_u128(12),
+            activity_id: Uuid::from_u128(13),
+            session_id: Uuid::from_u128(14),
+            expected_team_revision: 5,
+            role: "reviewer".to_owned(),
+            expansion_slot: crate::wire::team_commands::TeamExpansionSlotV2Request {
+                decision_id: Uuid::from_u128(15),
+                ordinal: 0,
+            },
         }
     }
 
@@ -571,6 +860,74 @@ mod tests {
         )
     }
 
+    fn create_v2_response(
+        request: &TeamCreateV2Request,
+    ) -> Result<TeamMutationV2Response, ClientError> {
+        let initial_roster_digest_v1 = expected_roster_digest_v1(request)?;
+        Ok(TeamMutationV2Response {
+            scope: request.scope.clone(),
+            request_id: request.request_id,
+            team_id: request.team_id,
+            mutation: crate::wire::teams::TeamMutationV2Wire {
+                team: team(
+                    &request.scope,
+                    request.team_id,
+                    1,
+                    "active",
+                    request.session_id,
+                ),
+                membership: None,
+                initial_members: vec![
+                    member(
+                        &request.scope,
+                        request.team_id,
+                        Uuid::from_u128(25),
+                        "reviewer",
+                        "joined",
+                        1,
+                        None,
+                    ),
+                    member(
+                        &request.scope,
+                        request.team_id,
+                        Uuid::from_u128(26),
+                        "reviewer",
+                        "joined",
+                        1,
+                        None,
+                    ),
+                ],
+                capacity: Some(crate::wire::teams::TeamCapacityReceiptV2Wire {
+                    team_id: request.team_id,
+                    workspace_id: request.scope.workspace_id,
+                    max_members: request.max_members,
+                    revision: 1,
+                    recorded_at_ms: 10,
+                    actor: crate::wire::team_expansion::TeamExpansionActorReceiptWire {
+                        activity_id: request.activity_id,
+                        agent_id: heterarchy_orchestration_runtime::leadership::member_agent_id(
+                            request.scope.workspace_id,
+                            request.activity_id,
+                            request.session_id,
+                        )
+                        .into_uuid(),
+                        session_id: request.session_id,
+                        participation_id: Uuid::from_u128(33),
+                        profile_id: Uuid::from_u128(34),
+                        participant_id: Uuid::from_u128(35),
+                        display_name: "Creator".to_owned(),
+                    },
+                    leadership_revision: request.expected_sender_leadership_revision,
+                }),
+                initial_roster_digest_v1: Some(initial_roster_digest_v1),
+                expansion_slot: None,
+                expansion_join_source: None,
+                created: true,
+                replayed: false,
+            },
+        })
+    }
+
     fn join_response(request: &TeamJoinRequest) -> TeamMutationResponse {
         mutation_response(
             &MutationResponseSubject {
@@ -592,9 +949,54 @@ mod tests {
                     None,
                 )),
                 initial_members: Vec::new(),
-                created: true,
+                created: false,
             },
         )
+    }
+
+    fn join_v2_response(request: &TeamJoinV2Request) -> TeamMutationV2Response {
+        TeamMutationV2Response {
+            scope: request.scope.clone(),
+            request_id: request.request_id,
+            team_id: request.team_id,
+            mutation: crate::wire::teams::TeamMutationV2Wire {
+                team: team(
+                    &request.scope,
+                    request.team_id,
+                    6,
+                    "active",
+                    Uuid::from_u128(27),
+                ),
+                membership: Some(member(
+                    &request.scope,
+                    request.team_id,
+                    Uuid::from_u128(28),
+                    &request.role,
+                    "joined",
+                    1,
+                    None,
+                )),
+                initial_members: Vec::new(),
+                capacity: None,
+                initial_roster_digest_v1: None,
+                expansion_slot: Some(request.expansion_slot),
+                expansion_join_source: Some(crate::wire::teams::TeamExpansionJoinSourceV2Wire {
+                    activity_id: request.activity_id,
+                    agent_id: heterarchy_orchestration_runtime::leadership::member_agent_id(
+                        request.scope.workspace_id,
+                        request.activity_id,
+                        request.session_id,
+                    )
+                    .into_uuid(),
+                    session_id: request.session_id,
+                    decision_id: request.expansion_slot.decision_id,
+                    ordinal: request.expansion_slot.ordinal,
+                    role: request.role.clone(),
+                }),
+                created: true,
+                replayed: false,
+            },
+        }
     }
 
     fn leave_response(request: &TeamLeaveRequest) -> TeamMutationResponse {
@@ -670,6 +1072,60 @@ mod tests {
         assert!(validate_retire_request(&invalid_retire).is_err());
     }
 
+    #[test]
+    fn v2_create_digest_rejects_swapped_same_role_sessions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = create_v2_request();
+        let response = create_v2_response(&request)?;
+        assert!(valid_create_v2_response(&response, &request));
+
+        let mut swapped_roster = request.clone();
+        let first_session = swapped_roster.initial_members[0].session_id;
+        swapped_roster.initial_members[0].session_id = swapped_roster.initial_members[1].session_id;
+        swapped_roster.initial_members[1].session_id = first_session;
+        let swapped_digest = expected_roster_digest_v1(&swapped_roster)?;
+        let mut substituted = response;
+        substituted.mutation.initial_roster_digest_v1 = Some(swapped_digest);
+
+        assert!(!valid_create_v2_response(&substituted, &request));
+        Ok(())
+    }
+
+    #[test]
+    fn v2_join_receipt_correlates_the_exact_decision_slot() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let request = join_v2_request();
+        let response = join_v2_response(&request);
+        assert!(valid_join_v2_response(&response, &request));
+
+        let mut rejoin = response.clone();
+        rejoin.mutation.created = false;
+        let membership =
+            rejoin.mutation.membership.as_mut().ok_or_else(|| {
+                std::io::Error::other("joined membership missing in test receipt")
+            })?;
+        membership.revision = 2;
+        assert!(valid_join_v2_response(&rejoin, &request));
+
+        let mut inconsistent_first_join = response.clone();
+        inconsistent_first_join.mutation.created = false;
+        assert!(!valid_join_v2_response(&inconsistent_first_join, &request));
+
+        let mut inconsistent_rejoin = rejoin;
+        inconsistent_rejoin.mutation.created = true;
+        assert!(!valid_join_v2_response(&inconsistent_rejoin, &request));
+
+        let mut substituted = response;
+        let slot = substituted
+            .mutation
+            .expansion_slot
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("v2 slot receipt missing in test response"))?;
+        slot.decision_id = Uuid::from_u128(99);
+        assert!(!valid_join_v2_response(&substituted, &request));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn create_wrong_scope_success_preserves_exact_readback_without_retry()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -693,6 +1149,7 @@ mod tests {
         );
         let captured = String::from_utf8(server.await??)?;
         assert!(captured.contains("/teams/create HTTP/1.1"));
+        assert!(!captured.contains("\"maxMembers\""));
         assert!(!captured.contains("\"agentId\""));
         Ok(())
     }
@@ -720,6 +1177,233 @@ mod tests {
         );
         let captured = String::from_utf8(server.await??)?;
         assert!(captured.contains(&format!("/teams/{}/join HTTP/1.1", request.team_id)));
+        assert!(!captured.contains("\"expansionSlot\""));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v2_create_digest_mismatch_preserves_full_intent_without_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = create_v2_request();
+        let mut swapped_roster = request.clone();
+        let first_session = swapped_roster.initial_members[0].session_id;
+        swapped_roster.initial_members[0].session_id = swapped_roster.initial_members[1].session_id;
+        swapped_roster.initial_members[1].session_id = first_session;
+        let swapped_digest = expected_roster_digest_v1(&swapped_roster)?;
+        let mut body = serde_json::to_value(create_v2_response(&request)?)?;
+        body["mutation"]["initialRosterDigestV1"] = serde_json::json!(swapped_digest);
+        let (client, server) = fixture(body).await?;
+
+        assert_eq!(
+            client
+                .create_team_v2(&HeaderValue::from_static(CREDENTIAL), &request)
+                .await
+                .err(),
+            Some(ClientError::UnknownOutcome {
+                readback: ReadbackTarget::TeamCreateV2Mutation(Box::new(request.clone()))
+            })
+        );
+        let captured = String::from_utf8(server.await??)?;
+        assert!(
+            captured.contains("/internal/v2/workspaces/") && captured.contains("/teams/create")
+        );
+        assert!(captured.contains("\"maxMembers\":2"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v2_join_wrong_slot_preserves_full_intent_without_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = join_v2_request();
+        let mut body = serde_json::to_value(join_v2_response(&request))?;
+        body["mutation"]["expansionSlot"]["decisionId"] = serde_json::json!(Uuid::from_u128(99));
+        let (client, server) = fixture(body).await?;
+
+        assert_eq!(
+            client
+                .join_team_v2(&HeaderValue::from_static(CREDENTIAL), &request)
+                .await
+                .err(),
+            Some(ClientError::UnknownOutcome {
+                readback: ReadbackTarget::TeamJoinV2Mutation(Box::new(request.clone()))
+            })
+        );
+        let captured = String::from_utf8(server.await??)?;
+        assert!(
+            captured.contains("/internal/v2/workspaces/") && captured.contains("/join HTTP/1.1")
+        );
+        assert!(captured.contains("\"decisionId\""));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v2_join_missing_source_is_unknown_with_exact_intent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = join_v2_request();
+        let mut body = serde_json::to_value(join_v2_response(&request))?;
+        body["mutation"]["expansionJoinSource"] = serde_json::Value::Null;
+        let (client, server) = fixture(body).await?;
+
+        assert_eq!(
+            client
+                .join_team_v2(&HeaderValue::from_static(CREDENTIAL), &request)
+                .await
+                .err(),
+            Some(ClientError::UnknownOutcome {
+                readback: ReadbackTarget::TeamJoinV2Mutation(Box::new(request.clone()))
+            })
+        );
+        let captured = String::from_utf8(server.await??)?;
+        assert!(captured.contains("/internal/v2/workspaces/"));
+        assert!(captured.contains("/join HTTP/1.1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v2_create_readback_keeps_original_intent_separate_from_rebound_reader()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = create_v2_request();
+        let direct = create_v2_response(&request)?;
+        let body = serde_json::to_value(TeamMutationV2ReadbackResponse {
+            scope: request.scope.clone(),
+            request_id: request.request_id,
+            team_id: request.team_id,
+            receipt: Some(direct.mutation),
+        })?;
+        let (client, server) = fixture(body).await?;
+        let reader = TeamMutationReaderV2Wire {
+            activity_id: request.activity_id,
+            session_id: Uuid::from_u128(90),
+        };
+
+        let readback = client
+            .team_create_mutation_readback_v2(
+                &HeaderValue::from_static(CREDENTIAL),
+                &request,
+                reader,
+            )
+            .await?;
+        assert!(readback.is_some());
+
+        let captured = String::from_utf8(server.await??)?;
+        assert!(captured.contains("/internal/v2/workspaces/"));
+        assert!(captured.contains("/receipts/query HTTP/1.1"));
+        let request_json: serde_json::Value = serde_json::from_str(
+            captured
+                .split_once("\r\n\r\n")
+                .ok_or("readback request body")?
+                .1,
+        )?;
+        assert_eq!(
+            request_json["reader"]["sessionId"],
+            serde_json::json!(Uuid::from_u128(90))
+        );
+        assert_eq!(
+            request_json["intent"]["request"]["sessionId"],
+            serde_json::json!(request.session_id)
+        );
+        assert_eq!(
+            request_json["intent"]["request"]["maxMembers"],
+            serde_json::json!(request.max_members)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v2_join_readback_checks_original_actor_and_decision_slot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = join_v2_request();
+        let mut direct = join_v2_response(&request);
+        direct.mutation.expansion_join_source =
+            Some(crate::wire::teams::TeamExpansionJoinSourceV2Wire {
+                activity_id: request.activity_id,
+                agent_id: heterarchy_orchestration_runtime::leadership::member_agent_id(
+                    request.scope.workspace_id,
+                    request.activity_id,
+                    request.session_id,
+                )
+                .into_uuid(),
+                session_id: request.session_id,
+                decision_id: request.expansion_slot.decision_id,
+                ordinal: request.expansion_slot.ordinal,
+                role: request.role.clone(),
+            });
+        let body = serde_json::to_value(TeamMutationV2ReadbackResponse {
+            scope: request.scope.clone(),
+            request_id: request.request_id,
+            team_id: request.team_id,
+            receipt: Some(direct.mutation),
+        })?;
+        let (client, server) = fixture(body).await?;
+        let readback = client
+            .team_join_mutation_readback_v2(
+                &HeaderValue::from_static(CREDENTIAL),
+                &request,
+                TeamMutationReaderV2Wire {
+                    activity_id: Uuid::from_u128(90),
+                    session_id: Uuid::from_u128(91),
+                },
+            )
+            .await?;
+        assert!(readback.is_some());
+
+        let captured = String::from_utf8(server.await??)?;
+        assert!(captured.contains("/internal/v2/workspaces/"));
+        assert!(captured.contains("/receipts/query HTTP/1.1"));
+        let request_json: serde_json::Value = serde_json::from_str(
+            captured
+                .split_once("\r\n\r\n")
+                .ok_or("readback request body")?
+                .1,
+        )?;
+        assert_eq!(
+            request_json["reader"]["activityId"],
+            serde_json::json!(Uuid::from_u128(90))
+        );
+        assert_eq!(
+            request_json["reader"]["sessionId"],
+            serde_json::json!(Uuid::from_u128(91))
+        );
+        assert_eq!(
+            request_json["intent"]["request"]["expansionSlot"]["decisionId"],
+            serde_json::json!(request.expansion_slot.decision_id)
+        );
+        assert_ne!(
+            request_json["intent"]["request"]["expansionSlot"]["decisionId"],
+            serde_json::json!(request.request_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn v2_readback_without_source_proof_stays_unresolved_without_v1_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = create_v2_request();
+        let body = serde_json::to_value(TeamMutationV2ReadbackResponse {
+            scope: request.scope.clone(),
+            request_id: request.request_id,
+            team_id: request.team_id,
+            receipt: None,
+        })?;
+        let (client, server) = fixture(body).await?;
+
+        assert!(
+            client
+                .team_create_mutation_readback_v2(
+                    &HeaderValue::from_static(CREDENTIAL),
+                    &request,
+                    TeamMutationReaderV2Wire {
+                        activity_id: request.activity_id,
+                        session_id: request.session_id,
+                    },
+                )
+                .await?
+                .is_none()
+        );
+        let captured = String::from_utf8(server.await??)?;
+        assert!(captured.contains("/internal/v2/workspaces/"));
+        assert!(captured.contains("/receipts/query HTTP/1.1"));
+        assert!(captured.contains("\"maxMembers\":2"));
         Ok(())
     }
 

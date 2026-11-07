@@ -1,0 +1,74 @@
+name: Provision pinned private Rust Harness
+description: Restore one project Harness tree from an authenticated immutable Git commit.
+
+inputs:
+  project:
+    description: Project subtree to restore (forge or orchestration).
+    required: true
+  repository:
+    description: Private Harness repository in owner/repository form.
+    required: true
+  revision:
+    description: Full immutable 40-character private Harness commit SHA.
+    required: true
+  token:
+    description: Read-only GitHub token for the private Harness repository.
+    required: true
+  checkout-path:
+    description: Fixed checkout path beneath GITHUB_WORKSPACE.
+    required: true
+  working-directory:
+    description: Repository root relative to GITHUB_WORKSPACE.
+    required: true
+  forge-revision:
+    description: Full Forge source commit SHA required by Orchestration.
+    required: false
+    default: ''
+  broker-revision:
+    description: Full Broker source commit SHA required by Orchestration.
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Validate immutable inputs and empty destinations
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        HETERARCHY_HARNESS_PROJECT: ${{ inputs.project }}
+        HETERARCHY_HARNESS_REPOSITORY: ${{ inputs.repository }}
+        HETERARCHY_HARNESS_REVISION: ${{ inputs.revision }}
+        HETERARCHY_HARNESS_CHECKOUT_PATH: ${{ inputs.checkout-path }}
+        HETERARCHY_HARNESS_READ_TOKEN: ${{ inputs.token }}
+        HETERARCHY_FORGE_REVISION: ${{ inputs.forge-revision }}
+        HETERARCHY_BROKER_REVISION: ${{ inputs.broker-revision }}
+      run: bash "$GITHUB_ACTION_PATH/../../scripts/private-rust-harness.sh" validate
+
+    - name: Checkout pinned private Harness input
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.revision }}
+        token: ${{ inputs.token }}
+        path: ${{ inputs.checkout-path }}
+        fetch-depth: 1
+        persist-credentials: false
+        submodules: false
+        lfs: false
+        sparse-checkout: |
+          projects/${{ inputs.project }}/rust_dev_harness
+        sparse-checkout-cone-mode: true
+
+    - name: Restore the selected private Harness subtree
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        HETERARCHY_HARNESS_PROJECT: ${{ inputs.project }}
+        HETERARCHY_HARNESS_REPOSITORY: ${{ inputs.repository }}
+        HETERARCHY_HARNESS_REVISION: ${{ inputs.revision }}
+        HETERARCHY_HARNESS_CHECKOUT_PATH: ${{ inputs.checkout-path }}
+        HETERARCHY_HARNESS_READ_TOKEN: ${{ inputs.token }}
+        HETERARCHY_FORGE_REVISION: ${{ inputs.forge-revision }}
+        HETERARCHY_BROKER_REVISION: ${{ inputs.broker-revision }}
+      run: bash "$GITHUB_ACTION_PATH/../../scripts/private-rust-harness.sh" restore

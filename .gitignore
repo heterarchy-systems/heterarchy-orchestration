@@ -20,6 +20,7 @@ debug/
 build/
 dist/
 docs/**
+!docs/home-transfer-source-dispatch.md
 PRODUCT.md
 .codex/
 .impeccable/
@@ -38,3 +39,7 @@ DESIGN.md
 .codegraph/
 # Local agent harness material — never pushed
 .agents/
+
+# Authenticated CI-only private Harness staging
+/.ci-private-harness-input/
+/.ci-private-harness-state

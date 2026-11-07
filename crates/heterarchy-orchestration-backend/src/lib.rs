@@ -21,10 +21,15 @@ pub mod forge_read_api;
 pub mod forge_source;
 pub mod forge_source_config;
 mod handoff;
+mod mission_evaluation;
+mod mission_evidence;
+mod mission_t2_checkpoint;
 mod node_assignment_admission;
 pub mod node_chat;
 pub mod node_team;
 mod operations_import;
+mod reviewer_participation;
+mod reviewer_qualification_rule;
 use app_support::runtime_error_response;
 pub use coordinator_authority::{CoordinatorAuthority, CoordinatorAuthorityError};
 mod event_routes;
@@ -1033,6 +1038,11 @@ fn router(state: BackendState, authorizer: auth::BearerAuthorizer) -> Router {
         .merge(provisioning::routes())
         .merge(provider_worker::routes())
         .merge(teams::routes())
+        .merge(mission_evaluation::routes())
+        .merge(mission_t2_checkpoint::routes())
+        .merge(mission_evidence::routes())
+        .merge(reviewer_qualification_rule::routes())
+        .merge(reviewer_participation::routes())
         .merge(participation::routes())
         .merge(membership::routes())
         .merge(member_list::routes())

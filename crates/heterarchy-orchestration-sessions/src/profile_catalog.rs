@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 mod configuration;
 mod deletion;
+mod home_acceptance;
 mod resolver;
 pub use configuration::{
     ProfileConfiguration, ProfileMutation, ProfileMutationCommand, ProfileMutationKind,
@@ -29,6 +30,12 @@ pub use deletion::{
     AgentProfileDeletionCommand, AgentProfileDeletionIntent, AgentProfileDeletionIntentPage,
     AgentProfileDeletionManifest, AgentProfileDeletionRuntimeEntry,
     AgentProfileDeletionRuntimeEntryPage, AgentProfileDeletionRuntimeTarget,
+};
+pub use home_acceptance::{
+    HomeAcceptanceProfileAcquireOutcome, HomeAcceptanceProfileError, HomeAcceptanceProfileIntent,
+    HomeAcceptanceProfileOperationsAdmission, HomeAcceptanceProfileOperationsResolution,
+    HomeAcceptanceProfilePendingPage, HomeAcceptanceProfilePinRecord,
+    HomeAcceptanceProfilePinReference, HomeAcceptanceProfileState,
 };
 pub use resolver::{
     AgentProfileResolutionClaim, AgentProfileResolutionClaimCommand,
@@ -41,10 +48,13 @@ pub use resolver::{
 /// Agent Profile catalog. It is distinct from the logical Session catalog.
 pub const AGENT_PROFILE_APPLICATION_ID: i64 = 0x4846_4150;
 /// Current schema version for the non-authoritative Agent Profile catalog.
-pub const AGENT_PROFILE_SCHEMA_VERSION: i64 = 6;
+pub const AGENT_PROFILE_SCHEMA_VERSION: i64 = 7;
+const AGENT_PROFILE_V6_SCHEMA_VERSION: i64 = 6;
 const AGENT_PROFILE_V3_SCHEMA_VERSION: i64 = 3;
 const AGENT_PROFILE_V4_SCHEMA_VERSION: i64 = 4;
 const AGENT_PROFILE_V5_SCHEMA_VERSION: i64 = 5;
+const AGENT_PROFILE_V6_OBJECT_COUNT: i64 = 11;
+const AGENT_PROFILE_OBJECT_COUNT: i64 = 20;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const JOURNAL_MODE_RETRY_LIMIT: usize = 8;
@@ -1441,28 +1451,27 @@ impl AgentProfileCatalog {
         let Some(profile) = load_profile(&self.connection, profile_id)? else {
             return Ok(None);
         };
-        if profile.lifecycle_state() == AgentProfileLifecycleState::Retired {
-            return Ok(Some(AgentProfileOperationalState::Retired));
-        }
-        let (active, online, failed): (i64, i64, i64) = self.connection.query_row(
-            "SELECT
-                COALESCE(MAX(CASE WHEN state=3 THEN 1 ELSE 0 END),0),
-                COALESCE(MAX(CASE WHEN state IN(2,4) THEN 1 ELSE 0 END),0),
-                COALESCE(MAX(CASE WHEN state=7 THEN 1 ELSE 0 END),0)
-             FROM agent_profile_runtime_sessions WHERE profile_id=?1",
-            params![profile_id.into_uuid().as_bytes()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        let state = if active != 0 {
-            AgentProfileOperationalState::Busy
-        } else if online != 0 {
-            AgentProfileOperationalState::Online
-        } else if failed != 0 {
-            AgentProfileOperationalState::Error
-        } else {
-            AgentProfileOperationalState::Offline
+        Ok(Some(derive_operational_state(&self.connection, &profile)?))
+    }
+
+    /// Resolve one Profile and derive its operational state from the same
+    /// decoded Profile row.
+    ///
+    /// # Errors
+    /// Returns path-integrity, corrupt-row, or SQLite errors. A missing Profile
+    /// is represented as `None`.
+    pub fn resolve_with_operational_state(
+        &self,
+        profile_id: AgentProfileId,
+    ) -> Result<Option<(AgentProfile, AgentProfileOperationalState)>, AgentProfileError> {
+        self.ensure_live_binding()?;
+        let Some(profile) = load_profile(&self.connection, profile_id)? else {
+            return Ok(None);
         };
-        Ok(Some(state))
+        // Preserve the revalidation previously performed by operational_state after resolve.
+        self.ensure_live_binding()?;
+        let state = derive_operational_state(&self.connection, &profile)?;
+        Ok(Some((profile, state)))
     }
 
     /// Resolve one Profile by its global stable identity.
@@ -1840,7 +1849,59 @@ fn is_busy_error(error: &rusqlite::Error) -> bool {
 }
 
 fn initialize_or_validate(connection: &mut Connection) -> Result<(), AgentProfileError> {
-    let ownership = catalog_ownership(connection)?;
+    // Observe all ownership selectors in one SQLite snapshot before deciding
+    // whether to configure or migrate an existing catalog.
+    let snapshot = connection.transaction()?;
+    let ownership = catalog_ownership(&snapshot)?;
+    let known_shape = match ownership {
+        (0, 0, 0) => true,
+        (AGENT_PROFILE_APPLICATION_ID, 1, 3) => {
+            validate_v1_schema(&snapshot)?;
+            true
+        }
+        (AGENT_PROFILE_APPLICATION_ID, 2, 4) => {
+            validate_v2_schema(&snapshot)?;
+            true
+        }
+        (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V3_SCHEMA_VERSION, 6) => {
+            validate_v3_schema(&snapshot)?;
+            true
+        }
+        (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V4_SCHEMA_VERSION, 7) => {
+            validate_v4_schema(&snapshot)?;
+            true
+        }
+        (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V5_SCHEMA_VERSION, 9) => {
+            validate_v5_schema(&snapshot)?;
+            true
+        }
+        (
+            AGENT_PROFILE_APPLICATION_ID,
+            AGENT_PROFILE_V6_SCHEMA_VERSION,
+            AGENT_PROFILE_V6_OBJECT_COUNT,
+        ) => {
+            validate_v6_schema(&snapshot)?;
+            true
+        }
+        (
+            AGENT_PROFILE_APPLICATION_ID,
+            AGENT_PROFILE_SCHEMA_VERSION,
+            AGENT_PROFILE_OBJECT_COUNT,
+        ) => {
+            validate_schema(&snapshot)?;
+            true
+        }
+        _ => false,
+    };
+    if !known_shape {
+        snapshot.commit()?;
+        return Err(AgentProfileError::Ownership {
+            application_id: ownership.0,
+            user_version: ownership.1,
+            object_count: ownership.2,
+        });
+    }
+    snapshot.commit()?;
     match ownership {
         (0, 0, 0) => create_schema(connection),
         (AGENT_PROFILE_APPLICATION_ID, 1, 3) => {
@@ -1848,33 +1909,45 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<(), AgentProfil
             migrate_v2_to_v3(connection)?;
             migrate_v3_to_v4(connection)?;
             migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)
+            migrate_v5_to_v6(connection)?;
+            migrate_v6_to_v7(connection)
         }
         (AGENT_PROFILE_APPLICATION_ID, 2, 4) => {
             migrate_v2_to_v3(connection)?;
             migrate_v3_to_v4(connection)?;
             migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)
+            migrate_v5_to_v6(connection)?;
+            migrate_v6_to_v7(connection)
         }
         (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V3_SCHEMA_VERSION, 6) => {
             migrate_v3_to_v4(connection)?;
             migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)
+            migrate_v5_to_v6(connection)?;
+            migrate_v6_to_v7(connection)
         }
         (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V4_SCHEMA_VERSION, 7) => {
             migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)
+            migrate_v5_to_v6(connection)?;
+            migrate_v6_to_v7(connection)
         }
         (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V5_SCHEMA_VERSION, 9) => {
-            migrate_v5_to_v6(connection)
+            migrate_v5_to_v6(connection)?;
+            migrate_v6_to_v7(connection)
         }
-        (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_SCHEMA_VERSION, 11) => {
-            validate_schema(connection)
-        }
-        (application_id, user_version, object_count) => Err(AgentProfileError::Ownership {
-            application_id,
-            user_version,
-            object_count,
+        (
+            AGENT_PROFILE_APPLICATION_ID,
+            AGENT_PROFILE_V6_SCHEMA_VERSION,
+            AGENT_PROFILE_V6_OBJECT_COUNT,
+        ) => migrate_v6_to_v7(connection),
+        (
+            AGENT_PROFILE_APPLICATION_ID,
+            AGENT_PROFILE_SCHEMA_VERSION,
+            AGENT_PROFILE_OBJECT_COUNT,
+        ) => Ok(()),
+        _ => Err(AgentProfileError::Ownership {
+            application_id: ownership.0,
+            user_version: ownership.1,
+            object_count: ownership.2,
         }),
     }
 }
@@ -1906,10 +1979,16 @@ fn create_schema(connection: &mut Connection) -> Result<(), AgentProfileError> {
             deletion::create_manifest_schema(&transaction)?;
             transaction.execute_batch(AGENT_PROFILE_MUTATION_RECEIPTS_TABLE_SQL)?;
             transaction.execute_batch(AGENT_PROFILE_MUTATION_CAPABILITIES_TABLE_SQL)?;
+            home_acceptance::schema::create_schema(&transaction)
+                .map_err(AgentProfileError::from)?;
             transaction.pragma_update(None, "application_id", AGENT_PROFILE_APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", AGENT_PROFILE_SCHEMA_VERSION)?;
         }
-        (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_SCHEMA_VERSION, 11) => {
+        (
+            AGENT_PROFILE_APPLICATION_ID,
+            AGENT_PROFILE_SCHEMA_VERSION,
+            AGENT_PROFILE_OBJECT_COUNT,
+        ) => {
             transaction.commit()?;
             return validate_schema(connection);
         }
@@ -2025,6 +2104,40 @@ fn migrate_v5_to_v6(connection: &mut Connection) -> Result<(), AgentProfileError
             &original_create_snapshot(&profile),
         )?;
     }
+    transaction.pragma_update(None, "user_version", AGENT_PROFILE_V6_SCHEMA_VERSION)?;
+    transaction.commit()?;
+    validate_v6_schema(connection)
+}
+
+/// Atomically add Home recipient pins to an exact, previously validated v6
+/// catalog. If another opener wins while this connection waits for the writer,
+/// validate and reuse that committed v7 result instead of replaying its DDL.
+fn migrate_v6_to_v7(connection: &mut Connection) -> Result<(), AgentProfileError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    match catalog_ownership(&transaction)? {
+        (
+            AGENT_PROFILE_APPLICATION_ID,
+            AGENT_PROFILE_SCHEMA_VERSION,
+            AGENT_PROFILE_OBJECT_COUNT,
+        ) => {
+            validate_schema(&transaction)?;
+            transaction.commit()?;
+            return validate_schema(connection);
+        }
+        (
+            AGENT_PROFILE_APPLICATION_ID,
+            AGENT_PROFILE_V6_SCHEMA_VERSION,
+            AGENT_PROFILE_V6_OBJECT_COUNT,
+        ) => validate_v6_schema(&transaction)?,
+        (application_id, user_version, object_count) => {
+            return Err(AgentProfileError::Ownership {
+                application_id,
+                user_version,
+                object_count,
+            });
+        }
+    }
+    home_acceptance::schema::create_schema(&transaction)?;
     transaction.pragma_update(None, "user_version", AGENT_PROFILE_SCHEMA_VERSION)?;
     transaction.commit()?;
     validate_schema(connection)
@@ -2177,8 +2290,28 @@ fn validate_v5_schema(connection: &Connection) -> Result<(), AgentProfileError> 
     validate_foreign_keys(connection)
 }
 
+fn validate_v6_schema(connection: &Connection) -> Result<(), AgentProfileError> {
+    validate_v5_schema_shape(
+        connection,
+        AGENT_PROFILE_V6_SCHEMA_VERSION,
+        AGENT_PROFILE_V6_OBJECT_COUNT,
+    )?;
+    validate_profile_mutation_schema(connection)?;
+    validate_foreign_keys(connection)
+}
+
 fn validate_schema(connection: &Connection) -> Result<(), AgentProfileError> {
-    validate_v5_schema_shape(connection, AGENT_PROFILE_SCHEMA_VERSION, 11)?;
+    validate_v5_schema_shape(
+        connection,
+        AGENT_PROFILE_SCHEMA_VERSION,
+        AGENT_PROFILE_OBJECT_COUNT,
+    )?;
+    validate_profile_mutation_schema(connection)?;
+    home_acceptance::schema::validate_schema(connection)?;
+    validate_foreign_keys(connection)
+}
+
+fn validate_profile_mutation_schema(connection: &Connection) -> Result<(), AgentProfileError> {
     validate_schema_sql(
         connection,
         "agent_profile_mutation_receipts",
@@ -2189,7 +2322,7 @@ fn validate_schema(connection: &Connection) -> Result<(), AgentProfileError> {
         "agent_profile_mutation_capabilities",
         AGENT_PROFILE_MUTATION_CAPABILITIES_TABLE_SQL,
     )?;
-    validate_foreign_keys(connection)
+    Ok(())
 }
 
 fn validate_v5_schema_shape(
@@ -3093,6 +3226,7 @@ fn update_profile(
     profile: &AgentProfile,
     expected_revision: AgentProfileRevision,
 ) -> Result<(), AgentProfileError> {
+    home_acceptance::ensure_unpinned(transaction, profile.id())?;
     let changed = transaction.execute(
         "UPDATE agent_profiles
          SET display_name=?1,preferred_model=?2,preferred_reasoning=?3,
@@ -3264,6 +3398,33 @@ fn load_profile(
     }))
 }
 
+fn derive_operational_state(
+    connection: &Connection,
+    profile: &AgentProfile,
+) -> Result<AgentProfileOperationalState, AgentProfileError> {
+    if profile.lifecycle_state() == AgentProfileLifecycleState::Retired {
+        return Ok(AgentProfileOperationalState::Retired);
+    }
+    let (active, online, failed): (i64, i64, i64) = connection.query_row(
+        "SELECT
+            COALESCE(MAX(CASE WHEN state=3 THEN 1 ELSE 0 END),0),
+            COALESCE(MAX(CASE WHEN state IN(2,4) THEN 1 ELSE 0 END),0),
+            COALESCE(MAX(CASE WHEN state=7 THEN 1 ELSE 0 END),0)
+         FROM agent_profile_runtime_sessions WHERE profile_id=?1",
+        params![profile.id().into_uuid().as_bytes()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(if active != 0 {
+        AgentProfileOperationalState::Busy
+    } else if online != 0 {
+        AgentProfileOperationalState::Online
+    } else if failed != 0 {
+        AgentProfileOperationalState::Error
+    } else {
+        AgentProfileOperationalState::Offline
+    })
+}
+
 fn decode_profile_id(
     bytes: &[u8],
     field: &'static str,
@@ -3391,6 +3552,24 @@ pub enum AgentProfileError {
         "Agent Profile has live provider Runtime Sessions; close them before retirement: {0:?}"
     )]
     LiveRuntimeSessions(AgentProfileId),
+    #[error("Agent Profile is pinned by an unresolved Home acceptance")]
+    HomeAcceptanceProfilePinned,
+    #[error("Home Profile acceptance conflicts with current Profile owner state")]
+    HomeAcceptanceProfileConflict,
+    #[error("Home Profile acceptance pending-page bound is invalid")]
+    HomeAcceptanceProfilePageLimit,
+    #[error("Home Profile acceptance {acceptance_id} commit is unconfirmed")]
+    HomeAcceptanceProfileCommitUnconfirmed {
+        acceptance_id: Uuid,
+        #[source]
+        source: rusqlite::Error,
+    },
+    #[error("Home Profile acceptance {acceptance_id} committed but catalog readback is required")]
+    HomeAcceptanceProfileReadbackRequired {
+        acceptance_id: Uuid,
+        #[source]
+        source: Box<AgentProfileError>,
+    },
     #[error("Agent Profile text field {field} has {actual} bytes; expected 1..={maximum}")]
     InvalidText {
         field: &'static str,
@@ -3572,6 +3751,26 @@ mod tests {
         Ok((root.join("agent-profiles.sqlite3"), root))
     }
 
+    struct TestDatabaseDirectory(PathBuf);
+
+    impl Drop for TestDatabaseDirectory {
+        fn drop(&mut self) {
+            if let Err(error) = fs::remove_dir_all(&self.0) {
+                eprintln!(
+                    "failed to remove test database root {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+
+    fn database_with_cleanup(
+        name: &str,
+    ) -> Result<(PathBuf, TestDatabaseDirectory), Box<dyn Error>> {
+        let (path, root) = database(name)?;
+        Ok((path, TestDatabaseDirectory(root)))
+    }
+
     fn command(
         proposed: u128,
         request: u128,
@@ -3712,7 +3911,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(objects, 11);
+        assert_eq!(objects, 20);
         let receipts: i64 = reopened.query_row(
             "SELECT COUNT(*) FROM agent_profile_mutation_receipts",
             [],
@@ -4010,7 +4209,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(objects, 11);
+        assert_eq!(objects, 20);
         drop(reopened);
         drop(catalog);
         fs::remove_dir_all(root)?;
@@ -4106,7 +4305,7 @@ mod tests {
             [],
             |row| row.get(0),
         )?;
-        assert_eq!(objects, 11);
+        assert_eq!(objects, 20);
         drop(reopened);
         drop(catalog);
         fs::remove_dir_all(root)?;
@@ -4239,6 +4438,212 @@ mod tests {
             Some(AgentProfileOperationalState::Offline)
         );
         Ok(closed)
+    }
+
+    fn resolved_profile_and_state(
+        catalog: &AgentProfileCatalog,
+        profile_id: AgentProfileId,
+    ) -> Result<Option<(AgentProfile, AgentProfileOperationalState)>, AgentProfileError> {
+        let Some(profile) = catalog.resolve(profile_id)? else {
+            return Ok(None);
+        };
+        let state = catalog
+            .operational_state(profile_id)?
+            .ok_or(AgentProfileError::ProfileMissing(profile_id))?;
+        Ok(Some((profile, state)))
+    }
+
+    fn assert_combined_profile_state(
+        catalog: &AgentProfileCatalog,
+        profile_id: AgentProfileId,
+        expected_state: AgentProfileOperationalState,
+    ) -> Result<(), Box<dyn Error>> {
+        let existing = resolved_profile_and_state(catalog, profile_id)?;
+        assert_eq!(
+            existing.as_ref().map(|(_, state)| *state),
+            Some(expected_state)
+        );
+        assert_eq!(
+            catalog.resolve_with_operational_state(profile_id)?,
+            existing
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_state_projection_preserves_session_priority_and_missing_behavior()
+    -> Result<(), Box<dyn Error>> {
+        let (path, _root) = database_with_cleanup("profile-state-projection")?;
+        let mut catalog = AgentProfileCatalog::open(&path)?;
+        let created = catalog.create_profile(&command(0xA101, 0xA102, "state-projection")?)?;
+        let profile_id = created.profile().id();
+        let initial = resolved_profile_and_state(&catalog, profile_id)?;
+        assert_eq!(
+            initial,
+            Some((
+                created.profile().clone(),
+                AgentProfileOperationalState::Offline,
+            ))
+        );
+        assert_eq!(catalog.resolve_with_operational_state(profile_id)?, initial);
+
+        let (ready_id, ready) = prepare_ready_runtime(&mut catalog, profile_id)?;
+        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Online)?;
+
+        let failed_id = AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xA103))?;
+        let failed = catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
+            failed_id,
+            Uuid::from_u128(0xA104),
+            profile_id,
+            AgentProfileProviderFamily::ChatGpt,
+            TimestampMillis::new(30)?,
+        )?)?;
+        let failed = catalog.transition_runtime_session(
+            failed_id,
+            failed.session().revision(),
+            AgentProfileRuntimeSessionState::Failed,
+            TimestampMillis::new(31)?,
+        )?;
+        assert_eq!(failed.state(), AgentProfileRuntimeSessionState::Failed);
+        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Online)?;
+
+        let active = catalog.transition_runtime_session(
+            ready_id,
+            ready.revision(),
+            AgentProfileRuntimeSessionState::Active,
+            TimestampMillis::new(32)?,
+        )?;
+        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Busy)?;
+
+        let _failed = catalog.transition_runtime_session(
+            ready_id,
+            active.revision(),
+            AgentProfileRuntimeSessionState::Failed,
+            TimestampMillis::new(33)?,
+        )?;
+        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Error)?;
+        let _retired = catalog.retire_profile(
+            profile_id,
+            created.profile().revision(),
+            TimestampMillis::new(34)?,
+        )?;
+        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Retired)?;
+
+        let missing_id = AgentProfileId::from_uuid(Uuid::from_u128(0xA105))?;
+        let missing = resolved_profile_and_state(&catalog, missing_id)?;
+        assert_eq!(missing, None);
+        assert_eq!(catalog.resolve_with_operational_state(missing_id)?, missing);
+        drop(catalog);
+        Ok(())
+    }
+
+    #[test]
+    fn retired_profile_state_short_circuits_runtime_session_storage() -> Result<(), Box<dyn Error>>
+    {
+        let (path, _root) = database_with_cleanup("retired-profile-state-short-circuit")?;
+        let mut catalog = AgentProfileCatalog::open(&path)?;
+        let created = catalog.create_profile(&command(0xA111, 0xA112, "retired-state")?)?;
+        let profile_id = created.profile().id();
+        let _retired = catalog.retire_profile(
+            profile_id,
+            created.profile().revision(),
+            TimestampMillis::new(11)?,
+        )?;
+        let storage = Connection::open(&path)?;
+        storage.execute("DROP TABLE agent_profile_runtime_sessions", [])?;
+        drop(storage);
+
+        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Retired)?;
+        drop(catalog);
+        Ok(())
+    }
+
+    #[test]
+    fn profile_state_projection_preserves_corrupt_profile_decode_failure()
+    -> Result<(), Box<dyn Error>> {
+        let (path, _root) = database_with_cleanup("corrupt-profile-state-projection")?;
+        let mut catalog = AgentProfileCatalog::open(&path)?;
+        let created = catalog.create_profile(&command(0xA121, 0xA122, "corrupt-state")?)?;
+        let profile_id = created.profile().id();
+        let storage = Connection::open(&path)?;
+        storage.pragma_update(None, "ignore_check_constraints", true)?;
+        storage.execute(
+            "UPDATE agent_profiles SET lifecycle_state=99 WHERE profile_id=?1",
+            params![profile_id.into_uuid().as_bytes()],
+        )?;
+        drop(storage);
+
+        assert!(matches!(
+            resolved_profile_and_state(&catalog, profile_id),
+            Err(AgentProfileError::Corrupt("invalid lifecycle_state"))
+        ));
+        assert!(matches!(
+            catalog.resolve_with_operational_state(profile_id),
+            Err(AgentProfileError::Corrupt("invalid lifecycle_state"))
+        ));
+        drop(catalog);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual isolated-catalog read workload measurement"]
+    fn profile_catalog_read_workload_1_32_256() -> Result<(), Box<dyn Error>> {
+        let (path, _root) = database_with_cleanup("profile-read-workload")?;
+        let mut catalog = AgentProfileCatalog::open(&path)?;
+        let mut profile_ids = Vec::with_capacity(256);
+        for index in 0..256_u128 {
+            let create = command(
+                0xA300 + index,
+                0xA600 + index,
+                &format!("read-workload-{index}"),
+            )?;
+            let created = catalog.create_profile(&create)?;
+            profile_ids.push(created.profile().id());
+        }
+
+        for count in [1, 32, 256] {
+            let selected = &profile_ids[..count];
+            for _ in 0..2 {
+                for profile_id in selected {
+                    std::hint::black_box(
+                        resolved_profile_and_state(&catalog, *profile_id)?
+                            .ok_or(AgentProfileError::ProfileMissing(*profile_id))?,
+                    );
+                    std::hint::black_box(
+                        catalog
+                            .resolve_with_operational_state(*profile_id)?
+                            .ok_or(AgentProfileError::ProfileMissing(*profile_id))?,
+                    );
+                }
+            }
+            let old_started = std::time::Instant::now();
+            for _ in 0..20 {
+                for profile_id in selected {
+                    std::hint::black_box(
+                        resolved_profile_and_state(&catalog, *profile_id)?
+                            .ok_or(AgentProfileError::ProfileMissing(*profile_id))?,
+                    );
+                }
+            }
+            let old_elapsed_us = old_started.elapsed().as_micros();
+            let combined_started = std::time::Instant::now();
+            for _ in 0..20 {
+                for profile_id in selected {
+                    std::hint::black_box(
+                        catalog
+                            .resolve_with_operational_state(*profile_id)?
+                            .ok_or(AgentProfileError::ProfileMissing(*profile_id))?,
+                    );
+                }
+            }
+            eprintln!(
+                "profile_catalog_read_workload profiles={count} iterations=20 old_elapsed_us={old_elapsed_us} combined_elapsed_us={}",
+                combined_started.elapsed().as_micros()
+            );
+        }
+
+        drop(catalog);
+        Ok(())
     }
 
     #[test]

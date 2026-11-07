@@ -159,6 +159,7 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsErr
 pub(crate) fn drop_schema_for_legacy_fixture(
     connection: &Connection,
 ) -> Result<(), OperationsError> {
+    crate::catalog::drop_v53_mission_schema_for_legacy_fixture(connection)?;
     let has_table: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ops_import_handoff_seals')",
         [],
@@ -758,7 +759,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_catalog_has_additive_v52_schema() -> Result<(), Box<dyn Error>> {
+    fn fresh_catalog_preserves_import_handoff_schema() -> Result<(), Box<dyn Error>> {
         let (fixture, catalog) = Fixture::new("schema")?;
         assert_eq!(
             catalog
@@ -766,7 +767,7 @@ mod tests {
                 .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))?,
             VERSION
         );
-        assert_eq!(VERSION, 52);
+        assert_eq!(VERSION, 69);
         let object_count: i64 = catalog.connection.query_row(
             "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'ops_import_handoff_%' OR name LIKE 'ops_import_handoff_sealed_import_%'",
             [],

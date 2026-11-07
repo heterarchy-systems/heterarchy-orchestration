@@ -373,6 +373,7 @@ impl AgentProfileCatalog {
         }
         let profile = load_profile(&transaction, command.profile_id)?
             .ok_or(AgentProfileError::ProfileMissing(command.profile_id))?;
+        super::home_acceptance::ensure_unpinned(&transaction, profile.id())?;
         if profile.revision() != command.expected_profile_revision {
             return Err(AgentProfileError::ProfileRevisionConflict {
                 profile_id: command.profile_id,

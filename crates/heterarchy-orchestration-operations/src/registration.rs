@@ -23,6 +23,8 @@ const MAX_REQUEST_WIRE_BYTES: usize = 4096;
 const NATIVE_SESSION_PARTICIPATION_DOMAIN: &[u8] =
     b"heterarchy-member-native-session-participation-v1\0";
 
+mod capacity;
+
 /// Canonical logical participant identity for one native Workspace Session.
 ///
 /// This is shared by registration admission and actor attribution. The
@@ -343,9 +345,9 @@ impl OperationsCatalog {
             binding.session_id(),
         )?;
 
-        let participant = if let Some(existing) =
-            load_pending_identity(&transaction, workspace, binding.session_id())?
-        {
+        let existing_identity =
+            load_pending_identity(&transaction, workspace, binding.session_id())?;
+        let (participant, create_pending_identity) = if let Some(existing) = existing_identity {
             if existing.principal != binding.principal()
                 || existing.display_name != request.display_name().as_str()
                 || existing.declared_role != request.declared_role().as_str()
@@ -362,7 +364,7 @@ impl OperationsCatalog {
             {
                 return Err(OperationsError::Conflict("pending participant identity"));
             }
-            existing.participant
+            (existing.participant, false)
         } else {
             if pending_participant_exists(
                 &transaction,
@@ -371,9 +373,18 @@ impl OperationsCatalog {
             )? {
                 return Err(OperationsError::Conflict("pending participant identity"));
             }
-            insert_pending_identity(&transaction, workspace, request)?;
-            request.proposed_participant_id()
+            (request.proposed_participant_id(), true)
         };
+        capacity::ensure_admission_capacity(
+            &transaction,
+            workspace,
+            profile_link
+                .map(heterarchy_orchestration_sessions::AgentProfileLogicalSessionLink::profile_id),
+            participant,
+        )?;
+        if create_pending_identity {
+            insert_pending_identity(&transaction, workspace, request)?;
+        }
 
         transaction.execute(
             "INSERT INTO ops_registration_requests(request_id,migration_id,workspace_id,destination_id,activity_id,session_id,participant_id,agent_id,request_wire,phase,reserved_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,NULL)",
@@ -472,6 +483,23 @@ impl OperationsCatalog {
         if existing.phase != RegistrationPhase::Pending {
             return Err(OperationsError::Corrupt("registration phase"));
         }
+        if let Some(scope) = crate::registration_profile::load(&transaction, request_id)? {
+            crate::team_permanent_transfer::preparation::ensure_profile_open(
+                &transaction,
+                scope.workspace_id(),
+                scope.profile_id().into_uuid(),
+            )?;
+        } else {
+            crate::team_permanent_transfer::preparation::ensure_unscoped_open(
+                &transaction,
+                existing.workspace,
+            )?;
+        }
+        crate::team_permanent_transfer::preparation::ensure_session_open(
+            &transaction,
+            existing.workspace,
+            existing_progress.request().binding().session_id(),
+        )?;
         let changed = transaction.execute(
             "UPDATE ops_registration_requests SET phase=?1,reserved_at_ms=?2 WHERE request_id=?3 AND phase=?4 AND reserved_at_ms IS NULL",
             params![

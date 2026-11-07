@@ -6,7 +6,9 @@ use hyper::header::HeaderValue;
 use uuid::Uuid;
 
 use crate::wire::operations_import::{
-    ImportPrepareRequest, ImportProgressResponse, ImportProgressWire, ImportStepRequest,
+    ImportHandoffQueryRequest, ImportHandoffReadbackResponse, ImportHandoffSealRequest,
+    ImportHandoffSealResponse, ImportHandoffSealWire, ImportPrepareRequest, ImportProgressResponse,
+    ImportProgressWire, ImportStepRequest,
 };
 
 use super::{
@@ -17,6 +19,73 @@ use super::{
 const MAX_SCOPE_LOCATOR_BYTES: usize = 4_096;
 
 impl OrchestrationHttpClient {
+    /// Seal an exactly verified destination import without granting source authority.
+    ///
+    /// # Errors
+    /// Rejects invalid selectors and explicit service rejections. Uncertain or
+    /// mismatched replies retain the full original intent for exact readback.
+    pub async fn import_handoff_seal(
+        &self,
+        authorization: &HeaderValue,
+        migration_id: Uuid,
+        request: &ImportHandoffSealRequest,
+    ) -> Result<ImportHandoffSealWire, ClientError> {
+        validate_handoff(migration_id, request)?;
+        let readback =
+            ReadbackTarget::OperationsImport(Box::new(OperationsImportReadback::SealHandoff {
+                migration_id,
+                request: Box::new(request.clone()),
+            }));
+        let response: ImportHandoffSealResponse = self
+            .call(
+                authorization,
+                Method::POST,
+                format!("/internal/v1/operations/imports/{migration_id}/handoff-seal"),
+                Some(request),
+                Some(readback.clone()),
+            )
+            .await?;
+        if !valid_handoff(&response.handoff_seal, migration_id, request) {
+            return Err(ClientError::UnknownOutcome { readback });
+        }
+        Ok(response.handoff_seal)
+    }
+
+    /// Read the exact retained handoff intent, preserving explicit absence.
+    ///
+    /// # Errors
+    /// Rejects invalid selectors, unavailable services, and a seal that does not
+    /// match the original verified source revision, digest, or destination.
+    pub async fn import_handoff_seal_readback(
+        &self,
+        authorization: &HeaderValue,
+        migration_id: Uuid,
+        request: &ImportHandoffSealRequest,
+    ) -> Result<Option<ImportHandoffSealWire>, ClientError> {
+        validate_handoff(migration_id, request)?;
+        let query = ImportHandoffQueryRequest {
+            scope: request.scope.clone(),
+            destination_id: request.destination_id,
+        };
+        let response: ImportHandoffReadbackResponse = self
+            .call(
+                authorization,
+                Method::POST,
+                format!("/internal/v1/operations/imports/{migration_id}/handoff-seal/query"),
+                Some(&query),
+                None,
+            )
+            .await?;
+        if response
+            .handoff_seal
+            .as_ref()
+            .is_some_and(|seal| !valid_handoff(seal, migration_id, request))
+        {
+            return Err(ClientError::Protocol);
+        }
+        Ok(response.handoff_seal)
+    }
+
     /// Prepare or exactly replay one operator import.
     ///
     /// # Errors
@@ -230,6 +299,40 @@ fn validate_prepare(request: &ImportPrepareRequest) -> Result<(), ClientError> {
     require_identity(request.destination_id)
 }
 
+fn validate_handoff(
+    migration_id: Uuid,
+    request: &ImportHandoffSealRequest,
+) -> Result<(), ClientError> {
+    validate_scope(&request.scope)?;
+    require_identity(migration_id)?;
+    require_identity(request.destination_id)?;
+    if request.expected_source_revision == 0
+        || i64::try_from(request.expected_source_revision).is_err()
+        || !valid_digest(&request.expected_verified_digest)
+    {
+        return Err(ClientError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn valid_handoff(
+    seal: &ImportHandoffSealWire,
+    migration_id: Uuid,
+    request: &ImportHandoffSealRequest,
+) -> bool {
+    seal.migration_id == migration_id
+        && seal.workspace_id == request.scope.workspace_id
+        && seal.destination_id == request.destination_id
+        && seal.source_revision == request.expected_source_revision
+        && seal.verified_digest == request.expected_verified_digest
+        && seal.verified_pages == seal.page_count
+        && i64::try_from(seal.page_count).is_ok()
+        && i64::try_from(seal.record_count).is_ok()
+        && !seal.issuer_id.is_nil()
+        && !seal.backend_id.is_nil()
+        && seal.sealed_at_ms >= 0
+}
+
 fn validate_step(migration_id: Uuid, request: &ImportStepRequest) -> Result<(), ClientError> {
     validate_scope(&request.scope)?;
     require_identity(migration_id)?;
@@ -335,6 +438,108 @@ mod tests {
             workspace_revision: 1,
             locator: "workspace".to_owned(),
         }
+    }
+
+    fn handoff_request() -> ImportHandoffSealRequest {
+        ImportHandoffSealRequest {
+            scope: scope(),
+            destination_id: Uuid::from_u128(3),
+            expected_source_revision: 7,
+            expected_verified_digest: "42".repeat(32),
+        }
+    }
+
+    fn handoff_seal(request: &ImportHandoffSealRequest) -> ImportHandoffSealWire {
+        ImportHandoffSealWire {
+            migration_id: Uuid::from_u128(4),
+            workspace_id: request.scope.workspace_id,
+            destination_id: request.destination_id,
+            source_revision: request.expected_source_revision,
+            verified_digest: request.expected_verified_digest.clone(),
+            page_count: 5,
+            record_count: 10,
+            verified_pages: 5,
+            issuer_id: Uuid::from_u128(6),
+            backend_id: Uuid::from_u128(7),
+            sealed_at_ms: 100,
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_lost_and_mismatched_reply_keep_original_verified_intent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = handoff_request();
+        let migration_id = Uuid::from_u128(4);
+        let mut foreign = handoff_seal(&request);
+        foreign.verified_digest = "99".repeat(32);
+        let malformed = reply(
+            "200 OK",
+            &serde_json::to_value(ImportHandoffSealResponse {
+                handoff_seal: foreign,
+            })?,
+        );
+        for response in [None, Some(malformed)] {
+            let (client, server) = fixture(response).await?;
+            assert_eq!(
+                client
+                    .import_handoff_seal(
+                        &HeaderValue::from_static("Bearer original-operator"),
+                        migration_id,
+                        &request,
+                    )
+                    .await,
+                Err(ClientError::UnknownOutcome {
+                    readback: ReadbackTarget::OperationsImport(Box::new(
+                        OperationsImportReadback::SealHandoff {
+                            migration_id,
+                            request: Box::new(request.clone()),
+                        },
+                    )),
+                })
+            );
+            let captured = server.await??;
+            assert!(std::str::from_utf8(&captured)?.contains("/handoff-seal "));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handoff_readback_preserves_absence_and_rejects_foreign_or_unverified_seals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = handoff_request();
+        let expected = handoff_seal(&request);
+        let mut foreign = expected.clone();
+        foreign.destination_id = Uuid::from_u128(99);
+        let mut incomplete = expected.clone();
+        incomplete.verified_pages -= 1;
+        let cases = [
+            (None, true),
+            (Some(expected), true),
+            (Some(foreign), false),
+            (Some(incomplete), false),
+        ];
+        for (seal, valid) in cases {
+            let response = ImportHandoffReadbackResponse {
+                handoff_seal: seal.clone(),
+            };
+            let (client, server) =
+                fixture(Some(reply("200 OK", &serde_json::to_value(response)?))).await?;
+            let result = client
+                .import_handoff_seal_readback(
+                    &HeaderValue::from_static("Bearer current-operator"),
+                    Uuid::from_u128(4),
+                    &request,
+                )
+                .await;
+            if valid {
+                assert_eq!(result?, seal);
+            } else {
+                assert_eq!(result, Err(ClientError::Protocol));
+            }
+            let captured = server.await??;
+            assert!(std::str::from_utf8(&captured)?.contains("/handoff-seal/query "));
+        }
+        Ok(())
     }
 
     #[test]

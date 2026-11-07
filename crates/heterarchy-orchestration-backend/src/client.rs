@@ -35,8 +35,12 @@ mod leadership_lifecycle;
 mod leadership_recalls;
 mod leadership_reviews;
 mod leadership_statements;
+mod legacy_slot_recovery;
 mod member_list;
 mod membership;
+mod mission_evaluation;
+mod mission_evidence;
+mod mission_t2_checkpoint;
 mod node_assignment_admission;
 mod node_chat;
 mod node_team;
@@ -48,8 +52,16 @@ mod profiles;
 mod provider_worker;
 mod provisioning_operations;
 mod provisioning_participation;
+mod reviewer_participation;
+mod reviewer_qualification_rule;
 mod team_commands;
+mod team_expansion;
+mod team_expansion_v2;
+mod team_expansion_v3;
+mod team_permanent_transfer;
 mod teams;
+mod temporary_dispatch;
+mod temporary_dispatch_lifecycle;
 #[cfg(test)]
 mod tests;
 mod work_credit;
@@ -69,6 +81,60 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(5);
 /// Exact durable identity to resolve after an uncertain mutation response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadbackTarget {
+    /// Observe the actor-bound durable receipt for an exact Mission intent.
+    MissionEvaluationMutation(
+        Box<crate::wire::mission_evaluation::MissionEvaluationMutationRequest>,
+    ),
+    /// Preserve the exact source-evidence workflow intent for actor-bound readback.
+    MissionEvidenceMutation(Box<crate::wire::mission_evidence::MissionEvidenceMutationRequest>),
+    /// Preserve the exact temporary-dispatch admission intent for readback.
+    TemporaryDispatch(Box<crate::wire::temporary_dispatch::TemporaryDispatchReadbackIntent>),
+    /// Preserve the original consent, withdrawal, or reservation request.
+    TemporaryDispatchLifecycleMutation(
+        Box<crate::wire::temporary_dispatch_lifecycle::TemporaryDispatchLifecycleMutationRequest>,
+    ),
+    /// Preserve the exact Team cap, expansion approval, and target slot intent.
+    TeamExpansionMutation(Box<crate::wire::team_expansion::TeamExpansionMutationRequest>),
+    /// Preserve the exact V2 approval target plan for lossless recovery.
+    TeamExpansionDecisionV2(Box<crate::wire::team_expansion_v2::TeamExpansionDecisionV2Request>),
+    /// Preserve the exact V3 approval plan and source Home evidence for readback.
+    TeamExpansionDecisionV3(Box<crate::wire::team_expansion_v3::TeamExpansionDecisionV3Request>),
+    /// Preserve the exact Orchestrator-authored permanent-transfer proposal.
+    TeamPermanentTransferIntent(
+        Box<crate::wire::team_permanent_transfer::TeamPermanentTransferIntentRequest>,
+    ),
+    /// Preserve the exact proposal, predecessor and expected generation for renewal recovery.
+    TeamPermanentTransferRenewal(
+        Box<crate::wire::team_permanent_transfer::TeamPermanentTransferRenewalRequest>,
+    ),
+    /// Preserve the exact intent, consent IDs and generation for readback.
+    TeamPermanentTransferPreparation(
+        Box<crate::wire::team_permanent_transfer::TeamPermanentTransferPreparationRequest>,
+    ),
+    /// Preserve the exact first Source dispatch intent for query-only recovery.
+    TeamPermanentTransferSourceDispatch(
+        Box<crate::wire::team_permanent_transfer::TeamPermanentTransferSourceDispatchRequest>,
+    ),
+    /// Preserve the exact current-reader Source readback selector after an
+    /// uncertain receipt reconciliation; recovery never re-dispatches Source.
+    TeamPermanentTransferSourceReadback(
+        Box<crate::wire::team_permanent_transfer::TeamPermanentTransferSourceReadbackRequest>,
+    ),
+    /// Preserve one exact source Leader consent or target Agent acceptance.
+    TeamPermanentTransferConsent(
+        Box<crate::wire::team_permanent_transfer::TeamPermanentTransferConsentRequest>,
+    ),
+    /// Preserve the exact original approval slot and legacy-recovery request.
+    LegacyTeamExpansionSlotRecovery(
+        Box<crate::wire::legacy_slot_recovery::LegacySlotRecoveryReadbackRequest>,
+    ),
+    /// Preserve the original operator rule mutation for authorized readback.
+    ReviewerQualificationRuleMutation(
+        Box<crate::wire::reviewer_qualification_rule::ReviewerQualificationRuleMutationRequest>,
+    ),
+    ReviewerParticipationMutation(
+        Box<crate::wire::reviewer_participation::ReviewerParticipationMutationRequest>,
+    ),
     /// Recover the exact immutable Profile deletion intent without resuming it.
     ProfileDeletionRequest { request_id: Uuid },
     /// Observe current provider deletion selection; not original-request proof.
@@ -162,6 +228,10 @@ pub enum ReadbackTarget {
         team_id: Uuid,
         request_id: Uuid,
     },
+    /// Preserve the exact capped v2 Team create intent for owner-scoped readback.
+    TeamCreateV2Mutation(Box<crate::wire::team_commands::TeamCreateV2Request>),
+    /// Preserve the exact slot-backed v2 Team join intent for owner-scoped readback.
+    TeamJoinV2Mutation(Box<crate::wire::team_commands::TeamJoinV2Request>),
 
     /// Observe presence after an uncertain CAS; the revision is not attribution proof.
     Presence {
@@ -247,6 +317,10 @@ pub enum OperationsImportReadback {
     Abort {
         migration_id: Uuid,
         request: Box<crate::wire::operations_import::ImportStepRequest>,
+    },
+    SealHandoff {
+        migration_id: Uuid,
+        request: Box<crate::wire::operations_import::ImportHandoffSealRequest>,
     },
 }
 
@@ -524,15 +598,13 @@ impl OrchestrationHttpClient {
         body: Option<&B>,
         readback: Option<ReadbackTarget>,
     ) -> Result<T, ClientError> {
-        self.call_with_response_limit(
-            authorization,
-            method,
-            path,
-            body,
-            readback,
-            MAX_RESPONSE_BYTES,
-        )
-        .await
+        let response_limit = if mission_evidence::is_mission_evidence_path(&path) {
+            mission_evidence::MAX_MISSION_EVIDENCE_RESPONSE_BYTES
+        } else {
+            MAX_RESPONSE_BYTES
+        };
+        self.call_with_response_limit(authorization, method, path, body, readback, response_limit)
+            .await
     }
 
     async fn call_with_response_limit<T: DeserializeOwned, B: Serialize>(
@@ -560,7 +632,15 @@ impl OrchestrationHttpClient {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ClientError::Capacity)?;
-        let body = body.map(bounded_json).transpose()?.unwrap_or_default();
+        let request_limit = if mission_evidence::is_mission_evidence_path(&path) {
+            mission_evidence::MAX_MISSION_EVIDENCE_REQUEST_BYTES
+        } else {
+            MAX_REQUEST_BYTES
+        };
+        let body = body
+            .map(|value| bounded_json_with_limit(value, request_limit))
+            .transpose()?
+            .unwrap_or_default();
         let uncertain = || {
             readback
                 .clone()
@@ -670,13 +750,20 @@ fn canonical_identity(value: &str) -> Result<Uuid, ClientError> {
 }
 
 fn bounded_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ClientError> {
-    struct BoundedBody(Vec<u8>);
+    bounded_json_with_limit(value, MAX_REQUEST_BYTES)
+}
+
+fn bounded_json_with_limit<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, ClientError> {
+    struct BoundedBody {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
     impl std::io::Write for BoundedBody {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > MAX_REQUEST_BYTES.saturating_sub(self.0.len()) {
+            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
                 return Err(std::io::Error::other("bounded request exceeded"));
             }
-            self.0.extend_from_slice(bytes);
+            self.bytes.extend_from_slice(bytes);
             Ok(bytes.len())
         }
 
@@ -684,9 +771,12 @@ fn bounded_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ClientError> {
             Ok(())
         }
     }
-    let mut body = BoundedBody(Vec::new());
+    let mut body = BoundedBody {
+        bytes: Vec::new(),
+        limit,
+    };
     serde_json::to_writer(&mut body, value).map_err(|_| ClientError::InvalidRequest)?;
-    Ok(body.0)
+    Ok(body.bytes)
 }
 
 fn require_identity(value: Uuid) -> Result<(), ClientError> {
