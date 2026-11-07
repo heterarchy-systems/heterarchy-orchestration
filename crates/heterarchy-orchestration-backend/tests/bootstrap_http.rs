@@ -3608,26 +3608,20 @@ fn fixture_http_address() -> TestResult<std::net::SocketAddr> {
     Ok(address)
 }
 
-fn assert_persisted_bootstrap_catalog(
-    data_root: &Path,
-    issuer: OrchestrationIssuerId,
-    backend: ForgeBackendId,
-    workspace: Uuid,
-    migration_id: Uuid,
-    actual_broker: bool,
-    verified_ci: bool,
-    expected_final_source_sequence: Option<u64>,
-) -> TestResult {
-    let catalog = OrchestrationRuntime::open_existing_operations_read_only(data_root)?;
+fn assert_persisted_bootstrap_catalog(context: &PersistedBootstrapContext<'_>) -> TestResult {
+    let catalog = OrchestrationRuntime::open_existing_operations_read_only(context.data_root)?;
     let configured = catalog
         .admission_issuer_config()?
         .ok_or("issuer not initialized")?;
-    assert_eq!(configured.issuer(), issuer);
-    assert_eq!(configured.backend_id(), backend);
-    let bindings = catalog.node_team_bindings(WorkspaceId::from_uuid(workspace))?;
-    assert_eq!(bindings.bindings().len(), if actual_broker { 3 } else { 0 });
+    assert_eq!(configured.issuer(), context.issuer);
+    assert_eq!(configured.backend_id(), context.backend);
+    let bindings = catalog.node_team_bindings(WorkspaceId::from_uuid(context.workspace_id))?;
+    assert_eq!(
+        bindings.bindings().len(),
+        if context.actual_broker { 3 } else { 0 }
+    );
     assert!(!bindings.truncated());
-    if actual_broker {
+    if context.actual_broker {
         let mut team_ids = Vec::new();
         for binding in bindings.bindings() {
             assert_eq!(binding.bound_by(), "orchestrator");
@@ -3641,22 +3635,23 @@ fn assert_persisted_bootstrap_catalog(
         }
         assert_eq!(team_ids.len(), 2);
     }
-    let terminals = catalog.execution_terminal_projection(migration_id)?;
-    let executed = actual_broker && verified_ci;
+    let terminals = catalog.execution_terminal_projection(context.migration_id)?;
+    let executed = context.actual_broker && context.immutable_verification;
     assert_eq!(terminals.len(), usize::from(executed));
     if executed {
         let terminal = terminals[0];
-        assert_eq!(terminal.migration_id(), migration_id);
+        assert_eq!(terminal.migration_id(), context.migration_id);
         assert_eq!(terminal.execution_state(), ExecutionState::Completed);
         assert!(terminal.source_sequence() > 1);
         let progress = catalog
-            .effect_fact_progress(migration_id)?
+            .effect_fact_progress(context.migration_id)?
             .ok_or("Forge terminal effect consumer progress missing after restart")?;
-        let expected_final_source_sequence = expected_final_source_sequence
+        let expected_final_source_sequence = context
+            .expected_final_source_sequence
             .ok_or("real Broker flow did not return its exact final source sequence")?;
         assert!(expected_final_source_sequence > terminal.source_sequence());
         assert_eq!(progress.last_sequence(), expected_final_source_sequence);
-        assert_eq!(progress.workspace_id().into_uuid(), workspace);
+        assert_eq!(progress.workspace_id().into_uuid(), context.workspace_id);
     }
     Ok(())
 }
@@ -3852,16 +3847,7 @@ fn assert_persisted_bootstrap_after_success(
             context.actual_broker,
             context.immutable_verification,
         )?;
-        assert_persisted_bootstrap_catalog(
-            context.data_root,
-            context.issuer,
-            context.backend,
-            context.workspace_id,
-            context.migration_id,
-            context.actual_broker,
-            context.immutable_verification,
-            context.expected_final_source_sequence,
-        )?;
+        assert_persisted_bootstrap_catalog(context)?;
     }
     Ok(())
 }

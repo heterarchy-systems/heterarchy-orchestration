@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    ".agents/rust_dev_harness/harness/xtask",
+    "xtask",
     "crates/heterarchy-orchestration-policy",
     "crates/heterarchy-orchestration-auth",
     "crates/heterarchy-orchestration-sessions",
