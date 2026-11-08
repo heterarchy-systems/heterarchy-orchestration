@@ -26,9 +26,7 @@ mod coordinator;
 
 use crate::BackendState;
 use crate::forge_source::ForgeSourceError;
-use crate::forge_source::forge_reads::file::{
-    ForgeFileEntryKind, ForgeSourceEol, ForgeSourceScope,
-};
+use crate::forge_source::forge_reads::ForgeSourceScope;
 use crate::forge_source::forge_reads::goal_dag::{
     ForgeDagCurrent, ForgeDagLifecycle, ForgeDagNodeStatus, ForgeGoal, ForgeGoalStatusKind,
     ForgeVerificationKind,
@@ -59,13 +57,10 @@ use crate::wire::forge_reads::{
 };
 use crate::wire::forge_reads::{
     DiscoveryDispositionWire, DiscoveryKindWire, DiscoveryReasonWire, DiscoverySignalWire,
-    DiscoverySignalsWire, FileEntryKindWire, FileEntryWire, FileListQueryRequest,
-    FileListQueryResponse, FileReadSliceQueryRequest, FileReadSliceQueryResponse,
-    LocationListRequest, LocationListResponse, LocationRowWire, LocationStateWire, SourceEolWire,
-    SourceScopeWire, TextSearchMatchWire, TextSearchQueryRequest, TextSearchQueryResponse,
-    WorkspaceCatalogEntryWire, WorkspaceDiscoverRequest, WorkspaceDiscoverResponse,
-    WorkspaceDiscoveryEntryWire, WorkspaceListRequest, WorkspaceListResponse,
-    WorkspaceResolveRequest, WorkspaceResolveResponse,
+    DiscoverySignalsWire, LocationListRequest, LocationListResponse, LocationRowWire,
+    LocationStateWire, SourceScopeWire, WorkspaceCatalogEntryWire, WorkspaceDiscoverRequest,
+    WorkspaceDiscoverResponse, WorkspaceDiscoveryEntryWire, WorkspaceListRequest,
+    WorkspaceListResponse, WorkspaceResolveRequest, WorkspaceResolveResponse,
 };
 
 /// Forge source read routes; merge before the router takes its state.
@@ -81,18 +76,6 @@ pub(crate) fn routes() -> Router<BackendState> {
         .route(
             "/internal/v1/workspaces/{workspace_id}/forge/workspace-resolve",
             post(workspace_resolve),
-        )
-        .route(
-            "/internal/v1/workspaces/{workspace_id}/forge/file-list",
-            post(file_list),
-        )
-        .route(
-            "/internal/v1/workspaces/{workspace_id}/forge/text-search",
-            post(text_search),
-        )
-        .route(
-            "/internal/v1/workspaces/{workspace_id}/forge/file-read-slice",
-            post(file_read_slice),
         )
         .route(
             "/internal/v1/workspaces/{workspace_id}/forge/goal-list",
@@ -247,7 +230,7 @@ async fn file_read_context(
     principal: forge_domain::AuthenticatedPrincipal,
     activity_id: Uuid,
 ) -> Result<FileReadContext, ApiError> {
-    use crate::forge_source::forge_reads::file::{activity_scope, scope_dto};
+    use crate::forge_source::forge_reads::{activity_scope, scope_dto};
     use forge_control::WorkspaceLocator;
 
     crate::app_support::validate_workspace_reference(scope, session_id)?;
@@ -288,192 +271,6 @@ async fn file_read_context(
         scope: scope_dto,
         activity,
     })
-}
-
-async fn file_list(
-    State(state): State<BackendState>,
-    Path(workspace_id): Path<String>,
-    Extension(principal): Extension<forge_domain::AuthenticatedPrincipal>,
-    Json(body): Json<FileListQueryRequest>,
-) -> Result<Json<FileListQueryResponse>, ApiError> {
-    const MAX_FILE_LIST_RESULTS: u32 = 512;
-    if body.max_results == 0
-        || body.max_results > MAX_FILE_LIST_RESULTS
-        || body.max_output_bytes == 0
-        || body.max_output_bytes > MAX_FILE_OUTPUT_BYTES
-    {
-        return Err(ApiError::InvalidIdentity);
-    }
-    let context = file_read_context(
-        &state,
-        &workspace_id,
-        &body.scope,
-        body.session_id,
-        principal,
-        body.activity_id,
-    )
-    .await?;
-    if let Some(token) = body.directory.as_deref() {
-        let _ = crate::forge_source::forge_reads::file::decode_path_token(token)
-            .map_err(|_| ApiError::InvalidIdentity)?;
-    }
-    let options = forge_domain::FileListOptions::new(
-        usize::try_from(body.max_results).map_err(|_| ApiError::InvalidIdentity)?,
-        usize::try_from(body.max_output_bytes).map_err(|_| ApiError::InvalidIdentity)?,
-    )
-    .map_err(|_| ApiError::InvalidIdentity)?;
-    let (_permit, client) = forge_source(&state).await?;
-    let listing = client
-        .file_list(
-            &context.scope,
-            &context.activity,
-            body.directory.as_deref(),
-            &options,
-        )
-        .await
-        .map_err(map_source_error)?;
-    Ok(Json(FileListQueryResponse {
-        scope: scope_wire(listing.scope()),
-        activity_id: listing.activity_id().to_owned(),
-        directory: listing.directory_token().map(str::to_owned),
-        directory_display_path: listing.directory_display_path().map(str::to_owned),
-        directory_display_path_truncated: listing.directory_display_path_truncated(),
-        entries: listing
-            .entries()
-            .iter()
-            .map(|entry| FileEntryWire {
-                path: entry.path_token().to_owned(),
-                display_path: entry.display_path().to_owned(),
-                display_path_truncated: entry.display_path_truncated(),
-                kind: match entry.kind() {
-                    ForgeFileEntryKind::Directory => FileEntryKindWire::Directory,
-                    ForgeFileEntryKind::RegularFile => FileEntryKindWire::RegularFile,
-                    ForgeFileEntryKind::SymbolicLink => FileEntryKindWire::SymbolicLink,
-                    ForgeFileEntryKind::Other => FileEntryKindWire::Other,
-                },
-                size_bytes: entry.size_bytes(),
-            })
-            .collect(),
-        scanned_entries: listing.scanned_entries(),
-        truncated: listing.truncated(),
-    }))
-}
-
-async fn text_search(
-    State(state): State<BackendState>,
-    Path(workspace_id): Path<String>,
-    Extension(principal): Extension<forge_domain::AuthenticatedPrincipal>,
-    Json(body): Json<TextSearchQueryRequest>,
-) -> Result<Json<TextSearchQueryResponse>, ApiError> {
-    const MAX_TEXT_SEARCH_RESULTS: u32 = 256;
-    if body.max_results == 0
-        || body.max_results > MAX_TEXT_SEARCH_RESULTS
-        || body.max_output_bytes == 0
-        || body.max_output_bytes > MAX_FILE_OUTPUT_BYTES
-    {
-        return Err(ApiError::InvalidIdentity);
-    }
-    let context = file_read_context(
-        &state,
-        &workspace_id,
-        &body.scope,
-        body.session_id,
-        principal,
-        body.activity_id,
-    )
-    .await?;
-    if let Some(token) = body.root.as_deref() {
-        let _ = crate::forge_source::forge_reads::file::decode_path_token(token)
-            .map_err(|_| ApiError::InvalidIdentity)?;
-    }
-    let query = forge_domain::TextSearchQuery::new(body.query.clone())
-        .map_err(|_| ApiError::InvalidIdentity)?;
-    let options = forge_domain::TextSearchOptions::new(
-        usize::try_from(body.max_results).map_err(|_| ApiError::InvalidIdentity)?,
-        usize::try_from(body.max_output_bytes).map_err(|_| ApiError::InvalidIdentity)?,
-    )
-    .map_err(|_| ApiError::InvalidIdentity)?;
-    let (_permit, client) = forge_source(&state).await?;
-    let result = client
-        .text_search(
-            &context.scope,
-            &context.activity,
-            body.root.as_deref(),
-            &query,
-            &options,
-        )
-        .await
-        .map_err(map_source_error)?;
-    Ok(Json(TextSearchQueryResponse {
-        scope: scope_wire(result.scope()),
-        activity_id: result.activity_id().to_owned(),
-        root: result.root_token().map(str::to_owned),
-        root_display_path: result.root_display_path().map(str::to_owned),
-        root_display_path_truncated: result.root_display_path_truncated(),
-        matches: result
-            .matches()
-            .iter()
-            .map(|match_row| TextSearchMatchWire {
-                path: match_row.path_token().to_owned(),
-                display_path: match_row.display_path().to_owned(),
-                display_path_truncated: match_row.display_path_truncated(),
-                line: match_row.line(),
-                preview: match_row.preview().to_owned(),
-            })
-            .collect(),
-        scanned_entries: result.scanned_entries(),
-        scanned_files: result.scanned_files(),
-        truncated: result.truncated(),
-    }))
-}
-
-async fn file_read_slice(
-    State(state): State<BackendState>,
-    Path(workspace_id): Path<String>,
-    Extension(principal): Extension<forge_domain::AuthenticatedPrincipal>,
-    Json(body): Json<FileReadSliceQueryRequest>,
-) -> Result<Json<FileReadSliceQueryResponse>, ApiError> {
-    if body.start_line == 0 || body.end_line < body.start_line {
-        return Err(ApiError::InvalidIdentity);
-    }
-    let context = file_read_context(
-        &state,
-        &workspace_id,
-        &body.scope,
-        body.session_id,
-        principal,
-        body.activity_id,
-    )
-    .await?;
-    let line_range = forge_domain::SourceLineRange::new(body.start_line, body.end_line)
-        .map_err(|_| ApiError::InvalidIdentity)?;
-    let (_permit, client) = forge_source(&state).await?;
-    let slice = client
-        .file_read_slice(&context.scope, &context.activity, &body.path, line_range)
-        .await
-        .map_err(map_source_error)?;
-    Ok(Json(FileReadSliceQueryResponse {
-        scope: scope_wire(slice.scope()),
-        activity_id: slice.activity_id().to_owned(),
-        path: slice.path_token().to_owned(),
-        display_path: slice.display_path().to_owned(),
-        display_path_truncated: slice.display_path_truncated(),
-        content: slice.content().to_owned(),
-        whole_file_hash: slice.whole_file_hash().to_owned(),
-        range_hash: slice.range_hash().to_owned(),
-        line_hashes: slice.line_hashes().to_vec(),
-        start_line: slice.start_line(),
-        end_line: slice.end_line(),
-        total_lines: slice.total_lines(),
-        eol: match slice.eol() {
-            ForgeSourceEol::Lf => SourceEolWire::Lf,
-            ForgeSourceEol::CrLf => SourceEolWire::CrLf,
-            ForgeSourceEol::Cr => SourceEolWire::Cr,
-            ForgeSourceEol::Mixed => SourceEolWire::Mixed,
-            ForgeSourceEol::None => SourceEolWire::None,
-        },
-        has_final_newline: slice.has_final_newline(),
-    }))
 }
 
 const MAX_GOAL_LIST_RESULTS: u32 = 100;
@@ -658,8 +455,6 @@ fn dag_wire(dag: &ForgeDagCurrent) -> DagCurrentWire {
             .collect(),
     }
 }
-
-const MAX_FILE_OUTPUT_BYTES: u32 = 65_536;
 
 async fn command_list(
     State(state): State<BackendState>,
@@ -954,7 +749,7 @@ fn scope_dto_from_wire(
         .to_str()
         .ok_or(ApiError::InvalidIdentity)?
         .to_owned();
-    crate::forge_source::forge_reads::file::scope_dto(
+    crate::forge_source::forge_reads::scope_dto(
         scope.workspace_id,
         scope.workspace_revision,
         scope.location_id,

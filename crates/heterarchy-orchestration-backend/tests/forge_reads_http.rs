@@ -288,10 +288,7 @@ mod tempfile_guard {
         let path = std::env::temp_dir().join(format!(
             "{label}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or_default()
+            uuid::Uuid::now_v7()
         ));
         std::fs::create_dir_all(&path)?;
         Ok(TempDir(path))
@@ -500,25 +497,6 @@ fn dag_row() -> Value {
              "created_at_ms": 31, "updated_at_ms": 32}
         ],
         "edges": [],
-    })
-}
-
-/// File-family readbacks echo the request's own scope and activity.
-fn file_list_result(request: &Value) -> Value {
-    let scope = request["payload"]["scope"].clone();
-    let activity = request["payload"]["activity"]["activity_id"].clone();
-    json!({
-        "scope": scope,
-        "activity_id": activity,
-        "directory_base64": null,
-        "directory_display_path": null,
-        "directory_display_path_truncated": false,
-        "entries": [
-            {"path_base64": "bGliLnJz", "display_path": "lib.rs",
-             "display_path_truncated": false, "kind": "regular_file", "size_bytes": 12}
-        ],
-        "scanned_entries": 3,
-        "truncated": false,
     })
 }
 
@@ -848,66 +826,6 @@ async fn forge_reads_parity_denial_and_source_loss_over_real_http() -> TestResul
     assert_eq!(resolved.workspace_id, WORKSPACE_ID);
     assert_eq!(resolved.workspace_revision, WORKSPACE_REVISION);
     assert_eq!(resolved.locator, scope.locator);
-
-    // --- Parity: confined file family ---
-    let listing = fixture
-        .client
-        .file_list(
-            &bearer,
-            &heterarchy_orchestration_backend::wire::forge_reads::FileListQueryRequest {
-                scope: scope.clone(),
-                session_id: None,
-                activity_id: ACTIVITY_ID,
-                directory: None,
-                max_results: 64,
-                max_output_bytes: 4096,
-            },
-        )
-        .await;
-    // The static stub has no file.list result configured yet; the call must
-    // fail closed as Source unavailability rather than fabricate output.
-    assert!(
-        matches!(
-            &listing,
-            Err(ClientError::Rejected {
-                status: 503,
-                code: ServiceCode::ScopeUnavailable
-            })
-        ),
-        "unexpected file.list outcome: {listing:?}"
-    );
-
-    // Configure a scope-echoing file.list result from the captured request
-    // shape (the stub stores static results; this one embeds the exact echo).
-    let captured = fixture.stub.captured();
-    let file_request = captured
-        .iter()
-        .find(|(path, _)| path.ends_with("file.list"))
-        .map(|(_, body)| body.clone())
-        .ok_or("file.list request was not captured")?;
-    fixture
-        .stub
-        .set("file.list", file_list_result(&file_request));
-    let listing = fixture
-        .client
-        .file_list(
-            &bearer,
-            &heterarchy_orchestration_backend::wire::forge_reads::FileListQueryRequest {
-                scope: scope.clone(),
-                session_id: None,
-                activity_id: ACTIVITY_ID,
-                directory: None,
-                max_results: 64,
-                max_output_bytes: 4096,
-            },
-        )
-        .await?;
-    assert_eq!(listing.entries.len(), 1);
-    assert_eq!(listing.entries[0].display_path, "lib.rs");
-    assert_eq!(listing.activity_id, ACTIVITY_ID.to_string());
-    assert_eq!(listing.scope.workspace_id, WORKSPACE_ID);
-    assert_eq!(listing.scope.locator, scope.locator);
-    assert_eq!(listing.scanned_entries, 3);
 
     // --- Parity: goal family ---
     fixture

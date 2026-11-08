@@ -5,7 +5,6 @@
 //! outcome, so there is no unknown-outcome identity to recover.
 
 mod coordinator;
-mod file;
 mod goal_dag;
 mod leases;
 mod workspace;

@@ -107,7 +107,7 @@ impl ForgeCommandList {
 /// One bounded `diff.read` observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeDiffRead {
-    scope: crate::forge_source::forge_reads::file::ForgeSourceScope,
+    scope: super::ForgeSourceScope,
     diff_id: String,
     workspace_id: String,
     activity_id: String,
@@ -133,7 +133,7 @@ pub struct ForgeDiffRead {
 impl ForgeDiffRead {
     /// The exact source scope echoed by Forge.
     #[must_use]
-    pub const fn scope(&self) -> &crate::forge_source::forge_reads::file::ForgeSourceScope {
+    pub const fn scope(&self) -> &super::ForgeSourceScope {
         &self.scope
     }
 
@@ -876,7 +876,7 @@ pub fn diff_read_from_wire(readback: &Value) -> Result<ForgeDiffRead, ForgeSourc
         })
         .collect::<Result<Vec<_>, ForgeSourceError>>()?;
     Ok(ForgeDiffRead {
-        scope: super::file::source_scope_from_wire(readback.get("scope"))?,
+        scope: super::source_scope_from_wire(readback.get("scope"))?,
         diff_id: required_uuid_string(diff.get("diff_id"))?,
         workspace_id: required_uuid_string(diff.get("workspace_id"))?,
         activity_id: required_uuid_string(diff.get("activity_id"))?,
@@ -947,8 +947,8 @@ pub fn diff_read_from_wire(readback: &Value) -> Result<ForgeDiffRead, ForgeSourc
 /// # Errors
 /// Returns `Protocol` for a missing or non-canonical path token.
 fn scope_display(entry: &Value) -> Result<(String, bool), ForgeSourceError> {
-    let path = super::file::decode_path_token(&required_string(entry.get("path_base64"))?)?;
-    Ok(super::file::display_relative_path(&path))
+    let path = super::decode_path_token(&required_string(entry.get("path_base64"))?)?;
+    Ok(super::display_relative_path(&path))
 }
 
 /// Decode one Writer Lease projection row; `found: false` decodes to

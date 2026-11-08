@@ -49,15 +49,13 @@ pub mod workspace_chat;
 pub use forge_reads::{
     DagCurrentQueryRequest, DagCurrentQueryResponse, DagCurrentWire, DagEdgeWire, DagLifecycleWire,
     DagNodeWire, DagStatusWire, DiscoveryDispositionWire, DiscoveryKindWire, DiscoveryReasonWire,
-    DiscoverySignalWire, DiscoverySignalsWire, FileEntryKindWire, FileEntryWire,
-    FileListQueryRequest, FileListQueryResponse, FileReadSliceQueryRequest,
-    FileReadSliceQueryResponse, GoalGetQueryRequest, GoalGetQueryResponse, GoalListQueryRequest,
-    GoalListQueryResponse, GoalStatusKindWire, GoalStatusWire, GoalVerificationKindWire,
-    GoalVerificationWire, GoalWire, LocationListRequest, LocationListResponse, LocationRowWire,
-    LocationStateWire, SourceEolWire, SourceScopeWire, TextSearchMatchWire, TextSearchQueryRequest,
-    TextSearchQueryResponse, WorkspaceCatalogEntryWire, WorkspaceDiscoverRequest,
-    WorkspaceDiscoverResponse, WorkspaceDiscoveryEntryWire, WorkspaceListRequest,
-    WorkspaceListResponse, WorkspaceResolveRequest, WorkspaceResolveResponse,
+    DiscoverySignalWire, DiscoverySignalsWire, GoalGetQueryRequest, GoalGetQueryResponse,
+    GoalListQueryRequest, GoalListQueryResponse, GoalStatusKindWire, GoalStatusWire,
+    GoalVerificationKindWire, GoalVerificationWire, GoalWire, LocationListRequest,
+    LocationListResponse, LocationRowWire, LocationStateWire, SourceScopeWire,
+    WorkspaceCatalogEntryWire, WorkspaceDiscoverRequest, WorkspaceDiscoverResponse,
+    WorkspaceDiscoveryEntryWire, WorkspaceListRequest, WorkspaceListResponse,
+    WorkspaceResolveRequest, WorkspaceResolveResponse,
 };
 pub use operations_import::{
     ImportPhaseWire, ImportPrepareRequest, ImportProgressResponse, ImportProgressWire,

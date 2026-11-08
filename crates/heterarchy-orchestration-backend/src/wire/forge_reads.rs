@@ -5,17 +5,11 @@
 //! ownership, actor identity, or mutation grants.
 
 pub mod coordinator;
-pub mod file;
 pub mod goal_dag;
 pub mod leases;
 pub mod workspace;
 
 pub use coordinator::{CoordinatorBindingWire, CoordinatorGetRequest, CoordinatorGetResponse};
-pub use file::{
-    FileEntryKindWire, FileEntryWire, FileListQueryRequest, FileListQueryResponse,
-    FileReadSliceQueryRequest, FileReadSliceQueryResponse, SourceEolWire, TextSearchMatchWire,
-    TextSearchQueryRequest, TextSearchQueryResponse,
-};
 pub use goal_dag::{
     DagCurrentQueryRequest, DagCurrentQueryResponse, DagCurrentWire, DagEdgeWire, DagLifecycleWire,
     DagNodeWire, DagStatusWire, GoalGetQueryRequest, GoalGetQueryResponse, GoalListQueryRequest,
