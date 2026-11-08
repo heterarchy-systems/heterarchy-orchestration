@@ -1,6 +1,3 @@
-# Local Mac build cache: use the user-designated external 256 SSD for generated artifacts.
-[build]
-target-dir = "/Volumes/256.SSD/RustBuild/orchestration"
-
 [alias]
 xtask = "run --quiet --locked -p xtask --"
+
