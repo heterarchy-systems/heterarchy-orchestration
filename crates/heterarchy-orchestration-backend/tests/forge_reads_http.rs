@@ -388,18 +388,9 @@ async fn start_fixture_with_scopes(
         Some(authority),
         cancellation.clone(),
     ));
-    // Wait for the backend to accept connections.
+    // Wait for the backend to accept HTTP requests.
     let client = OrchestrationHttpClient::new(address, Duration::from_secs(5))?;
-    for _ in 0..100 {
-        if let Ok(Ok(_)) = tokio::time::timeout(
-            Duration::from_millis(200),
-            tokio::net::TcpStream::connect(address),
-        )
-        .await
-        {
-            break;
-        }
-    }
+    wait_for_backend(&client, &operator_bearer).await?;
 
     Ok(Fixture {
         client,
@@ -448,16 +439,28 @@ async fn restart_fixture_with_no_static_scopes(
     ));
     fixture.cancellation = cancellation;
     fixture.client = OrchestrationHttpClient::new(address, Duration::from_secs(5))?;
-    for _ in 0..100 {
-        if let Ok(Ok(_)) = tokio::time::timeout(
-            Duration::from_millis(200),
-            tokio::net::TcpStream::connect(address),
-        )
-        .await
-        {
-            break;
+    wait_for_backend(&fixture.client, &fixture.operator_bearer).await?;
+    Ok(())
+}
+
+async fn wait_for_backend(
+    client: &OrchestrationHttpClient,
+    bearer: &hyper::header::HeaderValue,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let nonce = Uuid::now_v7();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match client.session_open_readback(bearer, nonce).await {
+                Ok(None) => return Ok::<(), ClientError>(()),
+                Err(ClientError::Unavailable) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Ok(Some(_)) => return Err(ClientError::Protocol),
+                Err(error) => return Err(error),
+            }
         }
-    }
+    })
+    .await??;
     Ok(())
 }
 
