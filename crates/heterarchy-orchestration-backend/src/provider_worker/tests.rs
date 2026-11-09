@@ -19,9 +19,8 @@ use heterarchy_orchestration_auth::{
 };
 use heterarchy_orchestration_operations::{
     AgentRequestEffectScope, AgentRequestIndependence, AppendWorkspaceMessageCommand,
-    BrokerClusterConfig, ChatGptProjectId, EnqueueProviderMessageCommand, MessageChannel,
-    MessageContext, OperationalActor, OperationsCatalog, ProviderMessageTarget,
-    WorkspaceParticipationId, WorkspaceProjectConfigureCommand, WorkspaceProjectScope,
+    BrokerClusterConfig, EnqueueProviderMessageCommand, MessageChannel, MessageContext,
+    OperationalActor, OperationsCatalog, ProviderMessageTarget, WorkspaceParticipationId,
 };
 use heterarchy_orchestration_runtime::{
     OrchestrationRuntime, access::OperatorPolicy, provisioning::AgentRequestSubmit,
@@ -39,7 +38,6 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
-const TEST_PROJECT_ID: &str = "g-p-6ad231f7ad7c8191bfc1d5ff782c171f";
 const STAGED_SNAPSHOT_ENVIRONMENT: &str = "HETERARCHY_ORCHESTRATION_STAGED_SNAPSHOT_DIR";
 
 #[path = "../../../heterarchy-orchestration-runtime/tests/support/broker_cluster.rs"]
@@ -82,23 +80,6 @@ impl Fixture {
             .with_operator_policy(OperatorPolicy::new(vec![operator])?);
         let request_id = Uuid::now_v7();
         let workspace_id = Uuid::now_v7();
-        runtime.configure_workspace_project(
-            operator,
-            WorkspaceProjectConfigureCommand::new(
-                Uuid::now_v7(),
-                WorkspaceProjectScope::new(
-                    workspace_id,
-                    Uuid::now_v7(),
-                    1,
-                    1,
-                    "provider-worker-test-workspace".to_owned(),
-                )?,
-                None,
-                ChatGptProjectId::try_from(TEST_PROJECT_ID)?,
-                TimestampMillis::new(1)?,
-            )?,
-            &[],
-        )?;
         runtime.submit_agent_request(AgentRequestSubmit {
             workspace_id,
             activity_id: Uuid::now_v7(),
@@ -140,12 +121,11 @@ impl Fixture {
         &self,
         runtime: &OrchestrationRuntime,
     ) -> TestResult<(Uuid, ProviderMessageTarget)> {
-        let confirmed = runtime.provider_worker_confirm_provision_with_project(
+        let confirmed = runtime.provider_worker_confirm_provision(
             self.operator,
             self.operation_id,
             self.operation_revision,
             "conversation-test",
-            Some(TEST_PROJECT_ID),
             11,
         )?;
         let profile = confirmed.profile_id().ok_or("profile binding")?;
@@ -163,14 +143,13 @@ impl Fixture {
             rusqlite::params![workspace.into_uuid().as_bytes(), profile.into_uuid().as_bytes(), participation.into_uuid().as_bytes()],
         )?;
         drop(seed);
-        let target = ProviderMessageTarget::new_with_project_route(
+        let target = ProviderMessageTarget::new_with_provider_family(
             workspace,
             profile,
             participation,
             AgentProfileProviderFamily::ChatGpt,
             runtime_id,
             "conversation-test".to_owned(),
-            confirmed.project(),
         )?;
         let message_id = Uuid::now_v7();
         {
@@ -374,7 +353,6 @@ async fn official_worker_unknown_isolation_http_is_operator_only_and_recoverable
         provider_conversation_id: target.provider_conversation_id().to_owned(),
         provider_turn_id: "turn-after-isolation".to_owned(),
         body: "queued message prompt".to_owned(),
-        provider_project_id: Some(TEST_PROJECT_ID.to_owned()),
     };
     let delivered = client
         .provider_message_delivered(&fixture.operator_header, &delivery)

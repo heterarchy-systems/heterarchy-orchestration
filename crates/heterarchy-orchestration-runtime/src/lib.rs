@@ -27,47 +27,6 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
-mod workspace_project;
-
-#[cfg(test)]
-pub(crate) mod test_support {
-    use forge_domain::TimestampMillis;
-    use heterarchy_orchestration_operations::{
-        ChatGptProjectId, WorkspaceProjectConfigureCommand, WorkspaceProjectScope,
-    };
-    use uuid::Uuid;
-
-    use super::{OrchestrationRuntime, RuntimeError};
-
-    pub(crate) fn ensure_workspace_project_binding(
-        runtime: &OrchestrationRuntime,
-        workspace_id: Uuid,
-        configured_at_ms: i64,
-    ) -> Result<(), RuntimeError> {
-        let mut catalog = runtime.catalog()?;
-        if catalog.workspace_project_binding(workspace_id)?.is_none() {
-            catalog.configure_workspace_project(
-                WorkspaceProjectConfigureCommand::new(
-                    Uuid::now_v7(),
-                    WorkspaceProjectScope::new(
-                        workspace_id,
-                        Uuid::from_u128(0xFEEE),
-                        1,
-                        1,
-                        "runtime-test-workspace".to_owned(),
-                    )?,
-                    None,
-                    ChatGptProjectId::try_from("g-p-6ad231f7ad7c8191bfc1d5ff782c171f")?,
-                    TimestampMillis::new(configured_at_ms)
-                        .map_err(|_| RuntimeError::InvalidInput)?,
-                )?,
-                &[],
-            )?;
-        }
-        Ok(())
-    }
-}
-
 pub mod access;
 pub mod approval;
 pub mod chat;
@@ -84,7 +43,6 @@ pub mod mission_t2_checkpoint;
 pub mod node_assignment_admission;
 pub mod node_team;
 pub mod participation;
-pub mod profile_deletion;
 pub mod profiles;
 pub mod provider_chat;
 pub mod provider_worker;
@@ -783,7 +741,6 @@ impl RuntimeError {
 impl From<OperationsError> for RuntimeError {
     fn from(error: OperationsError) -> Self {
         match error {
-            OperationsError::ProfileDeletionEvidence(error) => profile_error_to_runtime(error),
             OperationsError::Bounds(_) => Self::InvalidInput,
             OperationsError::Conflict(_) => Self::Conflict,
             OperationsError::ResyncRequired(_) => Self::ResyncRequired,

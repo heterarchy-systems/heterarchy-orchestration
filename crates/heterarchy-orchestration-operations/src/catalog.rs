@@ -4,9 +4,8 @@ use crate::{
     OperationsError, activation, adoption, agent_provision, agent_request,
     agent_request_resolution, approval, binding_rejection, cursor, departure, effect_binding,
     effect_fact, election_subject, events, inbox, leadership, members, membership, node_team,
-    presence, profile_deletion, provider_deletion, registration, replacement_registration,
-    session_replacement, teams, wire, work_credit, work_credit_subject, workspace_participation,
-    workspace_project,
+    presence, registration, replacement_registration, session_replacement, teams, wire,
+    work_credit, work_credit_subject, workspace_participation,
 };
 use forge_domain::WorkspaceId;
 use forge_persistence::{
@@ -422,20 +421,14 @@ fn initialize_catalog(
             agent_provision::create_schema(&tx)?;
             agent_provision::create_failure_schema(&tx)?;
             agent_provision::create_uncertainty_retirement_schema(&tx)?;
-            agent_provision::create_project_route_schema(&tx)?;
-            workspace_project::create_schema(&tx)?;
-            workspace_project::create_enrollment_schema(&tx)?;
             agent_request::create_fulfillment_schema(&tx)?;
             teams::create_schema(&tx)?;
             operational_messages::create_schema(&tx)?;
-            operational_messages::create_project_route_schema(&tx)?;
             operational_messages::create_unknown_isolation_schema(&tx)?;
             crate::import_handoff::create_schema(&tx)?;
             crate::team_assignment::create_schema(&tx)?;
             node_team::create_schema(&tx)?;
             leadership::governance::create_schema(&tx)?;
-            profile_deletion::create_schema(&tx)?;
-            provider_deletion::create_schema(&tx)?;
             leadership::work_exchange::create_schema(&tx)?;
             crate::registration_profile::create_schema(&tx)?;
             leadership::work_roster::create_schema(&tx)?;
@@ -643,12 +636,6 @@ fn create_schema_upgrade(tx: &Transaction<'_>, version: i64) -> Result<(), Opera
     if (31..=36).contains(&version) {
         teams::migrate_v36_to_v37(tx)?;
     }
-    if version <= 37 {
-        profile_deletion::create_schema(tx)?;
-    }
-    if version <= 38 {
-        provider_deletion::create_schema(tx)?;
-    }
     if version <= 39 {
         leadership::work_exchange::create_schema(tx)?;
     }
@@ -671,14 +658,6 @@ fn upgrade_catalog_features(tx: &Transaction<'_>, version: i64) -> Result<(), Op
     upgrade_uncertainty_retirement_schema(tx, version)?;
     if (36..=47).contains(&version) {
         crate::team_assignment::migrate_v47_to_v48(tx)?;
-    }
-    if version <= 48 {
-        workspace_project::create_schema(tx)?;
-        agent_provision::create_project_route_schema(tx)?;
-        operational_messages::create_project_route_schema(tx)?;
-    }
-    if version <= 49 {
-        workspace_project::create_enrollment_schema(tx)?;
     }
     if version <= 50 {
         operational_messages::create_unknown_isolation_schema(tx)?;
@@ -1018,9 +997,7 @@ fn validate_schema_v37(c: &Connection) -> Result<(), OperationsError> {
 }
 
 fn schema_v38_objects() -> Vec<(&'static str, &'static str, String)> {
-    let mut objects = schema_v37_objects();
-    extend_owned(&mut objects, profile_deletion::schema_objects());
-    objects
+    schema_v37_objects()
 }
 
 fn validate_schema_v38(c: &Connection) -> Result<(), OperationsError> {
@@ -1028,9 +1005,7 @@ fn validate_schema_v38(c: &Connection) -> Result<(), OperationsError> {
 }
 
 fn schema_v39_objects() -> Vec<(&'static str, &'static str, String)> {
-    let mut objects = schema_v38_objects();
-    extend_owned(&mut objects, provider_deletion::schema_objects());
-    objects
+    schema_v38_objects()
 }
 
 fn validate_schema_v39(c: &Connection) -> Result<(), OperationsError> {
@@ -1323,17 +1298,7 @@ fn validate_schema_v48(c: &Connection) -> Result<(), OperationsError> {
 }
 
 fn schema_v49_objects() -> Vec<(&'static str, &'static str, String)> {
-    let mut objects = schema_v48_objects();
-    extend_owned(&mut objects, workspace_project::schema_objects());
-    extend_owned(
-        &mut objects,
-        agent_provision::project_route_schema_objects(),
-    );
-    extend_owned(
-        &mut objects,
-        operational_messages::project_route_schema_objects(),
-    );
-    objects
+    schema_v48_objects()
 }
 
 fn validate_schema_v49(c: &Connection) -> Result<(), OperationsError> {
@@ -1341,9 +1306,7 @@ fn validate_schema_v49(c: &Connection) -> Result<(), OperationsError> {
 }
 
 fn schema_v50_objects() -> Vec<(&'static str, &'static str, String)> {
-    let mut objects = schema_v49_objects();
-    extend_owned(&mut objects, workspace_project::enrollment_schema_objects());
-    objects
+    schema_v49_objects()
 }
 
 fn validate_schema_v50(c: &Connection) -> Result<(), OperationsError> {
@@ -2556,8 +2519,6 @@ pub(crate) fn restore_v34_shapes_for_legacy_fixture(
     connection.execute_batch("DROP TABLE IF EXISTS ops_approval_request_versions")?;
     leadership::work_roster::drop_schema_for_legacy_fixture(connection)?;
     connection.execute_batch("DROP TABLE IF EXISTS ops_registration_profile_scopes; DROP TABLE IF EXISTS ops_leadership_work_exchanges")?;
-    provider_deletion::drop_schema_for_legacy_fixture(connection)?;
-    connection.execute_batch("DROP TABLE IF EXISTS ops_agent_profile_deletion_barriers")?;
     restore_v35_operational_message_shapes_for_legacy_fixture(connection)?;
     connection.execute_batch("DROP TABLE IF EXISTS ops_team_create_roster")?;
     restore_fixture_table_shapes(connection, teams::schema_objects_v36())?;
@@ -2577,14 +2538,6 @@ pub(crate) fn drop_v49_project_schema_for_legacy_fixture(
     drop_v53_mission_schema_for_legacy_fixture(connection)?;
     crate::import_handoff::drop_schema_for_legacy_fixture(connection)?;
     drop_v51_unknown_isolation_schema_for_legacy_fixture(connection)?;
-    workspace_project::drop_enrollment_schema_for_legacy_fixture(connection)?;
-    connection.execute_batch(
-        "DROP TABLE IF EXISTS ops_provider_message_project_receipts;
-         DROP TABLE IF EXISTS ops_provider_message_project_routes;
-         DROP TABLE IF EXISTS ops_agent_provision_project_routes;
-         DROP TABLE IF EXISTS ops_workspace_chatgpt_project_receipts;
-         DROP TABLE IF EXISTS ops_workspace_chatgpt_project_bindings;",
-    )?;
     Ok(())
 }
 
@@ -3305,86 +3258,6 @@ mod tests {
                 .author(),
             operational_messages::MessageAuthor::Provider { .. }
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn v38_schema_remains_exact_and_migrates_additively_to_v42()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let root =
-            std::env::temp_dir().join(format!("operations-v38-provider-delete-{}", Uuid::now_v7()));
-        std::fs::create_dir(&root)?;
-        let path = root.join("operations.sqlite3");
-        let destination = Uuid::now_v7();
-        let old = Connection::open(&path)?;
-        for (_, _, sql) in schema_v38_objects() {
-            old.execute_batch(&sql)?;
-        }
-        old.execute(
-            "INSERT INTO ops_catalog_identity(singleton,destination_id) VALUES(1,?1)",
-            params![destination.as_bytes()],
-        )?;
-        old.pragma_update(None, "application_id", APPLICATION_ID)?;
-        old.pragma_update(None, "user_version", 38)?;
-        validate_schema_v38(&old)?;
-        drop(old);
-
-        let upgraded = OperationsCatalog::open(&path, destination)?;
-        let version: i64 = upgraded
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, VERSION);
-        validate_schema(&upgraded.connection)?;
-        drop(upgraded);
-        std::fs::remove_file(path)?;
-        std::fs::remove_dir(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn v37_schema_remains_exact_and_migrates_additively_to_v42()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let root =
-            std::env::temp_dir().join(format!("operations-v37-profile-delete-{}", Uuid::now_v7()));
-        std::fs::create_dir(&root)?;
-        let path = root.join("operations.sqlite3");
-        let destination = Uuid::now_v7();
-        let old = Connection::open(&path)?;
-        for (_, _, sql) in schema_v37_objects() {
-            old.execute_batch(&sql)?;
-        }
-        old.execute(
-            "INSERT INTO ops_catalog_identity(singleton,destination_id) VALUES(1,?1)",
-            params![destination.as_bytes()],
-        )?;
-        old.pragma_update(None, "application_id", APPLICATION_ID)?;
-        old.pragma_update(None, "user_version", 37)?;
-        validate_schema_v37(&old)?;
-        drop(old);
-
-        let upgraded = OperationsCatalog::open(&path, destination)?;
-        let version: i64 = upgraded
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, VERSION);
-        let barrier_table_exists: bool = upgraded.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
-             WHERE type='table' AND name='ops_agent_profile_deletion_barriers')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert!(barrier_table_exists);
-        let progress_table_exists: bool = upgraded.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema
-             WHERE type='table' AND name='ops_agent_profile_deletion_progress')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert!(progress_table_exists);
-        validate_schema(&upgraded.connection)?;
-        drop(upgraded);
-        std::fs::remove_file(path)?;
-        std::fs::remove_dir(root)?;
         Ok(())
     }
 

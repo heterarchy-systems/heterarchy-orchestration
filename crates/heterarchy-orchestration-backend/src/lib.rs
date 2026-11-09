@@ -40,7 +40,6 @@ pub mod member_list;
 mod membership;
 mod participation;
 mod profile_config;
-mod profile_deletion;
 mod profile_sessions;
 mod provider_worker;
 pub mod provisioning;
@@ -52,7 +51,6 @@ pub mod token_cli;
 pub mod wire;
 pub mod work_credit;
 mod workspace_chat;
-mod workspace_project;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -736,30 +734,6 @@ impl BackendState {
             })
     }
 
-    async fn workspace_candidate_proof(
-        &self,
-        scope: wire::WorkspaceQueryScope,
-    ) -> Result<forge_control::ResolvedWorkspaceScope, ApiError> {
-        let authority = self
-            .coordinator_authority
-            .clone()
-            .ok_or(ApiError::WorkspaceScopeUnavailable)?;
-        let permit = self
-            .forge_query_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| ApiError::Unavailable)?;
-        authority
-            .check_workspace_candidate(scope, permit)
-            .await
-            .map_err(|error| match error {
-                CoordinatorAuthorityError::Denied => ApiError::Runtime(RuntimeError::Forbidden),
-                CoordinatorAuthorityError::Stale => ApiError::Runtime(RuntimeError::Conflict),
-                CoordinatorAuthorityError::Unavailable => ApiError::WorkspaceScopeUnavailable,
-            })
-    }
-
     /// Authorize the same scoped operator and owned logical Session again at
     /// commit admission. Source and Broker waits retain no catalog guard.
     async fn run_scoped_operator_mutation<T, F>(
@@ -967,15 +941,6 @@ pub async fn serve_with_runtime(
     let destination_id = runtime.destination_id();
     let mut state = BackendState::new_shared(runtime, Arc::new(RealtimeHub::new()));
     state.coordinator_authority = coordinator_authority;
-    let enrollments = state
-        .catalog_job(OrchestrationRuntime::workspace_project_enrollments)
-        .await
-        .map_err(map_startup_catalog_error)?;
-    if let Some(authority) = &state.coordinator_authority {
-        authority
-            .hydrate_workspace_project_enrollments(&enrollments)
-            .map_err(|_| BackendError::WorkspaceProjectScopeProjection)?;
-    }
     let authorizer = auth::BearerAuthorizer::new(token_client);
     let router = router(state.clone(), authorizer.clone());
     let listener = TcpListener::bind(listen).await?;
@@ -1032,7 +997,6 @@ fn router(state: BackendState, authorizer: auth::BearerAuthorizer) -> Router {
         )
         .merge(profile_config::routes())
         .merge(profile_sessions::routes())
-        .merge(profile_deletion::routes())
         .merge(approval::routes())
         .merge(leadership::routes())
         .merge(provisioning::routes())
@@ -1055,7 +1019,6 @@ fn router(state: BackendState, authorizer: auth::BearerAuthorizer) -> Router {
         .merge(sessions::routes())
         .merge(work_credit::routes())
         .merge(workspace_chat::routes())
-        .merge(workspace_project::routes())
         .merge(forge_read_api::routes())
         .route_layer(axum::middleware::from_fn_with_state(
             ingress_limits::RequestAdmission::new(),
@@ -1478,30 +1441,12 @@ pub enum BackendError {
     InvalidAdmissionIssuer,
     #[error("Orchestration startup clock is unavailable")]
     StartupClock,
-    #[error("Orchestration Workspace Project enrollment catalog could not be loaded")]
-    WorkspaceProjectScopeCatalog,
-    #[error("Orchestration Workspace Project enrollment projection is invalid")]
-    WorkspaceProjectScopeProjection,
     #[error("Orchestration runtime bootstrap failed")]
     Runtime(#[from] RuntimeError),
     #[error("Orchestration listener failed")]
     Io(#[from] std::io::Error),
     #[error("Orchestration server failed")]
     Serve(std::io::Error),
-}
-
-fn map_startup_catalog_error(error: ApiError) -> BackendError {
-    match error {
-        ApiError::Runtime(error) => BackendError::Runtime(error),
-        ApiError::WorkspaceScopeUnavailable | ApiError::Unavailable => {
-            BackendError::WorkspaceProjectScopeCatalog
-        }
-        ApiError::InvalidIdentity
-        | ApiError::NotFound
-        | ApiError::Capacity
-        | ApiError::CoordinatorUnavailable
-        | ApiError::SourceBindingUnconfirmed => BackendError::WorkspaceProjectScopeCatalog,
-    }
 }
 
 #[cfg(test)]

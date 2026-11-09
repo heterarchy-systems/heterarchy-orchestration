@@ -621,7 +621,6 @@ mod tests {
         for path in [
             "/internal/v1/provider-worker/provision/dispatch",
             "/internal/v1/provider-worker/messages/dispatch",
-            "/internal/v1/agent-profile-provider-deletions/next",
         ] {
             let response = raw_request(address, &format!(
                 "POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {bearer}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"

@@ -1,6 +1,5 @@
 //! Native-compatible chat projections and checked destination conversion.
 
-use crate::wire::workspace_project::ProviderProjectReferenceWire;
 use crate::{
     RuntimeError,
     wire::node_chat::{
@@ -8,7 +7,7 @@ use crate::{
         ChatSnapshotWire, ChatTargetFenceWire, NodeChatTargetWire,
     },
 };
-use heterarchy_orchestration_operations::{ProviderMessageState, WorkspaceProjectReference};
+use heterarchy_orchestration_operations::ProviderMessageState;
 use heterarchy_orchestration_runtime::chat::{
     ChatEntry, ChatNodeTarget, ChatQuery, ChatReceipt, ChatSend, ChatSnapshot, ChatTargetFence,
 };
@@ -76,7 +75,6 @@ fn project_fence(value: &ChatTargetFence) -> ChatTargetFenceWire {
         runtime_session_id: value.runtime_session_id,
         runtime_revision: value.runtime_revision,
         provider_conversation_id: value.provider_conversation_id.clone(),
-        project: value.project.map(ProviderProjectReferenceWire::from),
         leadership_revision: value.leadership_revision,
         node_target: value.node_target.as_ref().map(|target| match *target {
             ChatNodeTarget::Agent {
@@ -102,12 +100,6 @@ fn project_fence(value: &ChatTargetFence) -> ChatTargetFenceWire {
 }
 
 pub(super) fn domain_fence(value: &ChatTargetFenceWire) -> Result<ChatTargetFence, RuntimeError> {
-    let project = value
-        .project
-        .clone()
-        .map(WorkspaceProjectReference::try_from)
-        .transpose()
-        .map_err(|_| RuntimeError::InvalidInput)?;
     if [
         value.operation_id,
         value.profile_id,
@@ -172,7 +164,6 @@ pub(super) fn domain_fence(value: &ChatTargetFenceWire) -> Result<ChatTargetFenc
         runtime_session_id: value.runtime_session_id,
         runtime_revision: value.runtime_revision,
         provider_conversation_id: value.provider_conversation_id.clone(),
-        project,
         leadership_revision: value.leadership_revision,
         node_target: Some(node_target),
     })

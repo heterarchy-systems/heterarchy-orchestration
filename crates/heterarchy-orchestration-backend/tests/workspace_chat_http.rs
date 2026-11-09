@@ -1028,7 +1028,6 @@ fn fence() -> WorkspaceChatTargetFenceWire {
         runtime_session_id: Uuid::from_u128(8),
         runtime_revision: 1,
         provider_conversation_id: "conversation-first".to_owned(),
-        project: None,
     }
 }
 

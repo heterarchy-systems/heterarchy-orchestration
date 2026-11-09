@@ -54,8 +54,6 @@ pub use node_team::{
 };
 mod operational_messages;
 mod presence;
-mod profile_deletion;
-mod provider_deletion;
 mod registration;
 mod registration_profile;
 mod replacement_registration;
@@ -107,12 +105,7 @@ pub use mission_evaluation::{
 };
 
 pub use workspace_chat_target::{WorkspaceChatTarget, WorkspaceChatTargetPage};
-pub use workspace_project::{
-    ChatGptProjectId, MAX_WORKSPACE_AUTHORITY_SCOPES, WorkspaceProjectBinding,
-    WorkspaceProjectBindingReceipt, WorkspaceProjectBindingRevision,
-    WorkspaceProjectConfigureCommand, WorkspaceProjectConfigureOutcome, WorkspaceProjectEnrollment,
-    WorkspaceProjectReference, WorkspaceProjectScope,
-};
+pub use workspace_project::{MAX_WORKSPACE_AUTHORITY_SCOPES, WorkspaceProjectScope};
 
 mod binding_observation;
 mod binding_rejection;
@@ -246,19 +239,6 @@ pub use operational_messages::{
     validate_chat_text,
 };
 pub use presence::{LogicalPresenceSnapshot, LogicalPresenceTarget, LogicalPresenceTouch};
-pub use profile_deletion::{AgentProfileDeletionBarrier, AgentProfileDeletionInFlightCounts};
-pub use provider_deletion::{
-    AgentProfileDeletionFreeze, AgentProfileDeletionProgress, AgentProfileDeletionProgressAdvance,
-    AgentProfileDeletionProgressDeferredReason, AgentProfileDeletionProgressPhase,
-    AgentProfileDeletionProviderMessageReference, AgentProfileDeletionProviderMessageReferencePage,
-    AgentProfileDeletionProvisionReference, AgentProfileDeletionProvisionReferencePage,
-    AgentProfileDeletionRuntimeReferenceSummary, AgentProfileProviderDeletionAction,
-    AgentProfileProviderDeletionDeferredReason, AgentProfileProviderDeletionDispatch,
-    AgentProfileProviderDeletionOperation, AgentProfileProviderDeletionPage,
-    AgentProfileProviderDeletionPrepareOutcome, AgentProfileProviderDeletionReceipt,
-    AgentProfileProviderDeletionReceiptOutcome, AgentProfileProviderDeletionState,
-    AgentProfileProviderDeletionSummary, MAX_AGENT_PROFILE_DELETION_PAGE_SIZE,
-};
 // Existing typed source witnesses used by public registration contracts.
 // Composition passes the original Forge receipt; no parallel witness type is
 // introduced and Runtime gains no Forge persistence/effect dependency.
@@ -301,8 +281,6 @@ pub use workspace_participation::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum OperationsError {
-    #[error("Sessions Profile deletion evidence failed")]
-    ProfileDeletionEvidence(#[source] heterarchy_orchestration_sessions::AgentProfileError),
     #[error(
         "operations catalog {destination_id} commit is unconfirmed; reopen the same catalog identity"
     )]
@@ -444,31 +422,6 @@ pub enum OperationsError {
         operation_id: uuid::Uuid,
         retirement_id: uuid::Uuid,
         destination_id: uuid::Uuid,
-        #[source]
-        source: rusqlite::Error,
-    },
-    #[error(
-        "Agent Profile deletion barrier {request_id} commit is unconfirmed; read back the same request identity"
-    )]
-    AgentProfileDeletionBarrierCommitUnconfirmed {
-        request_id: uuid::Uuid,
-        #[source]
-        source: rusqlite::Error,
-    },
-    #[error(
-        "Agent Profile deletion progress {request_id} commit is unconfirmed; read back the same request"
-    )]
-    AgentProfileDeletionProgressCommitUnconfirmed {
-        request_id: uuid::Uuid,
-        #[source]
-        source: rusqlite::Error,
-    },
-    #[error(
-        "Agent Profile provider deletion {operation_id} attempt commit is unconfirmed; read back the same operation"
-    )]
-    AgentProfileProviderDeletionCommitUnconfirmed {
-        operation_id: uuid::Uuid,
-        attempt_number: Option<u64>,
         #[source]
         source: rusqlite::Error,
     },

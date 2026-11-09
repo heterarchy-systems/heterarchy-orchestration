@@ -1,6 +1,5 @@
 //! Profile-direct Workspace conversations over the canonical Runtime owner.
 
-use crate::wire::workspace_project::ProviderProjectReferenceWire;
 use axum::{
     Extension, Json, Router,
     extract::{Path, State},
@@ -8,7 +7,7 @@ use axum::{
 };
 use forge_domain::{AuthenticatedPrincipal, TimestampMillis, WorkspaceId};
 use heterarchy_orchestration_operations::{
-    MessageAuthor, ProviderMessageSource, ProviderMessageState, WorkspaceProjectReference,
+    MessageAuthor, ProviderMessageSource, ProviderMessageState,
 };
 use heterarchy_orchestration_runtime::{
     chat::{ChatEntry, ChatError, ChatQuery, ChatSend, ChatSnapshot, ChatTargetFence},
@@ -230,19 +229,12 @@ fn project_fence(
         runtime_session_id: value.runtime_session_id,
         runtime_revision: value.runtime_revision,
         provider_conversation_id: value.provider_conversation_id.clone(),
-        project: value.project.map(ProviderProjectReferenceWire::from),
     }
 }
 
 fn domain_direct_fence(
     value: &WorkspaceChatTargetFenceWire,
 ) -> Result<ChatTargetFence, RuntimeError> {
-    let project = value
-        .project
-        .clone()
-        .map(WorkspaceProjectReference::try_from)
-        .transpose()
-        .map_err(|_| RuntimeError::InvalidInput)?;
     if [
         value.operation_id,
         value.profile_id,
@@ -267,7 +259,6 @@ fn domain_direct_fence(
         runtime_session_id: value.runtime_session_id,
         runtime_revision: value.runtime_revision,
         provider_conversation_id: value.provider_conversation_id.clone(),
-        project,
         leadership_revision: None,
         node_target: None,
     })

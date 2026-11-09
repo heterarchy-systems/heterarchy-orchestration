@@ -13,7 +13,7 @@ use heterarchy_orchestration_operations::{
     ProviderMessageDispatchAction, ProviderMessageOutbox, ProviderMessageState,
     ProviderMessageTarget, ProviderMessageUnknownIsolationCommand,
     ProviderMessageUnknownIsolationReason, ProviderMessageUnknownIsolationReceipt,
-    WorkspaceParticipationId, WorkspaceProjectReference,
+    WorkspaceParticipationId,
 };
 use heterarchy_orchestration_runtime::provider_chat::{
     ProviderIncomingCommand, ProviderIncomingRole,
@@ -190,9 +190,6 @@ async fn dispatch_provision(
                         effect_kind: effect_kind_name(fence),
                         provider_family: "chatgpt".to_owned(),
                         provider_conversation_id,
-                        project: fence.project().map(
-                            crate::wire::workspace_project::ProviderProjectReferenceWire::from,
-                        ),
                     },
                 }),
                 reconciled: None,
@@ -385,12 +382,11 @@ async fn confirm_provision(
     }
     let observed_at_ms = now_millis()?;
     mutate_provision(state, principal, body.operation_id, move |runtime| {
-        runtime.provider_worker_confirm_provision_with_project(
+        runtime.provider_worker_confirm_provision(
             principal,
             body.operation_id,
             body.expected_revision,
             &body.provider_conversation_id,
-            body.provider_project_id.as_deref(),
             observed_at_ms,
         )
     })
@@ -631,12 +627,11 @@ async fn delivered_message(
     }
     let now_ms = now_millis()?;
     mutate_message(state, principal, body.message_id, move |runtime| {
-        runtime.provider_worker_confirm_message_delivery_with_project(
+        runtime.provider_worker_confirm_message_delivery(
             principal,
             body.message_id,
             body.expected_revision,
             &body.provider_conversation_id,
-            body.provider_project_id.as_deref(),
             body.provider_turn_id,
             body.body,
             now_ms,
@@ -762,12 +757,7 @@ fn provision_action_wire(action: AgentProvisionDispatchAction) -> ProviderWorker
 fn provider_message_target_from_wire(
     target: ProviderMessageTargetWire,
 ) -> Result<ProviderMessageTarget, LaneError> {
-    let project = target
-        .project
-        .map(WorkspaceProjectReference::try_from)
-        .transpose()
-        .map_err(|_| LaneError::InvalidIdentity)?;
-    ProviderMessageTarget::new_with_project_route(
+    ProviderMessageTarget::new_with_provider_family(
         WorkspaceId::from_uuid(target.workspace_id),
         AgentProfileId::from_uuid(target.profile_id).map_err(|_| LaneError::InvalidIdentity)?,
         WorkspaceParticipationId::from_uuid(target.participation_id)
@@ -780,7 +770,6 @@ fn provider_message_target_from_wire(
         AgentProfileRuntimeSessionId::from_uuid(target.runtime_session_id)
             .map_err(|_| LaneError::InvalidIdentity)?,
         target.provider_conversation_id,
-        project,
     )
     .map_err(|_| LaneError::InvalidIdentity)
 }

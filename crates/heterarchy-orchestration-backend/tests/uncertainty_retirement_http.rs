@@ -107,7 +107,6 @@ fn operation(
             request.expected_revision
         },
         uncertainty_retirement: receipt,
-        project: None,
     }
 }
 
@@ -289,7 +288,6 @@ async fn retired_unknown_is_rejected_from_dispatch_and_in_flight_source_wrappers
                 effect_kind: operation.effect_kind.clone(),
                 provider_family: operation.provider_family.clone(),
                 provider_conversation_id: None,
-                project: None,
             },
         }),
         reconciled: None,

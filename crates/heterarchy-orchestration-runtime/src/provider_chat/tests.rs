@@ -17,7 +17,6 @@ use uuid::Uuid;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const OPERATOR: AuthenticatedPrincipal = AuthenticatedPrincipal::TrustedStdio;
-const TEST_PROJECT_ID: &str = "g-p-6ad231f7ad7c8191bfc1d5ff782c171f";
 
 struct Fixture {
     root: PathBuf,
@@ -33,7 +32,6 @@ impl Fixture {
         std::fs::create_dir_all(&root)?;
         let runtime = OrchestrationRuntime::open(&root)?;
         let workspace = WorkspaceId::from_uuid(Uuid::now_v7());
-        crate::test_support::ensure_workspace_project_binding(&runtime, workspace.into_uuid(), 1)?;
         let request_id = Uuid::now_v7();
         runtime.submit_agent_request(AgentRequestSubmit {
             workspace_id: workspace.into_uuid(),
@@ -55,12 +53,11 @@ impl Fixture {
         let action = runtime
             .provider_worker_next_provision(OPERATOR, 10)?
             .ok_or("fixture dispatch")?;
-        let operation = runtime.provider_worker_confirm_provision_with_project(
+        let operation = runtime.provider_worker_confirm_provision(
             OPERATOR,
             action.operation().operation_id(),
             action.operation().revision(),
             "conversation-test",
-            Some(TEST_PROJECT_ID),
             11,
         )?;
         let profile = operation.profile_id().ok_or("profile binding")?;
@@ -75,14 +72,13 @@ impl Fixture {
             "INSERT INTO ops_workspace_participations(workspace_id,agent_profile_id,participation_id,created_at_ms,revision) VALUES(?1,?2,?3,0,1)",
             params![workspace.into_uuid().as_bytes(),profile.into_uuid().as_bytes(),participation.into_uuid().as_bytes()])?;
         drop(seed);
-        let target = ProviderMessageTarget::new_with_project_route(
+        let target = ProviderMessageTarget::new_with_provider_family(
             workspace,
             profile,
             participation,
             AgentProfileProviderFamily::ChatGpt,
             runtime_id,
             "conversation-test".to_owned(),
-            Some(operation.project().ok_or("frozen Project route")?),
         )?;
         let message_id = Uuid::now_v7();
         {
@@ -213,9 +209,8 @@ fn delivered_user_turn_cannot_be_relabelled_as_assistant() -> TestResult {
         .runtime
         .provider_worker_message_readback(OPERATOR, fixture.message_id)?;
     let body = before.body.ok_or("frozen provider body")?;
-    let receipt = ProviderMessageDeliveryReceipt::new_with_project(
+    let receipt = ProviderMessageDeliveryReceipt::new(
         fixture.target.clone(),
-        Some(heterarchy_orchestration_operations::ChatGptProjectId::try_from(TEST_PROJECT_ID)?),
         "user-1".to_owned(),
         body.clone(),
     )?;

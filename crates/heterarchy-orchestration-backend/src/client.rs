@@ -46,7 +46,6 @@ mod node_chat;
 mod node_team;
 mod operations_import;
 mod participation;
-mod profile_deletion;
 mod profile_sessions;
 mod profiles;
 mod provider_worker;
@@ -66,7 +65,6 @@ mod temporary_dispatch_lifecycle;
 mod tests;
 mod work_credit;
 mod workspace_chat;
-mod workspace_project;
 
 const CLIENT_CONCURRENCY: usize = 4;
 const MAX_HEADERS: usize = 16;
@@ -135,14 +133,6 @@ pub enum ReadbackTarget {
     ReviewerParticipationMutation(
         Box<crate::wire::reviewer_participation::ReviewerParticipationMutationRequest>,
     ),
-    /// Recover the exact immutable Profile deletion intent without resuming it.
-    ProfileDeletionRequest { request_id: Uuid },
-    /// Observe current provider deletion selection; not original-request proof.
-    ProfileDeletionSelection,
-    /// Read the exact original provider fence and optional durable receipt.
-    ProfileDeletionProvider(
-        Box<crate::wire::profile_deletion::AgentProfileProviderDeletionFenceWire>,
-    ),
     /// Bounded current selection observation, never original-request proof or retry permission.
     ProviderProvisionDispatch,
     /// Bounded current pending/unknown outboxes, without request attribution or retry permission.
@@ -163,8 +153,6 @@ pub enum ReadbackTarget {
     ),
     /// Complete immutable Profile-direct message intent for pure recovery.
     WorkspaceChat(Box<crate::wire::workspace_chat::WorkspaceChatSendRequest>),
-    /// Recover one exact Workspace-to-Project configure receipt; never retry configuration.
-    WorkspaceProjectBinding(Box<crate::wire::workspace_project::WorkspaceProjectReadbackRequest>),
     /// Recover the immutable actor, body, context and target witness of this
     /// message. An absent receipt does not authorize a blind retry.
     NodeChat(Box<crate::wire::node_chat::NodeChatSendRequest>),

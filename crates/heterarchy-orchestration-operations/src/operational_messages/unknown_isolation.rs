@@ -6,10 +6,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
 use crate::catalog::signed;
-use crate::{
-    ChatGptProjectId, OperationsCatalog, OperationsError, WorkspaceParticipationId,
-    WorkspaceProjectBindingRevision, WorkspaceProjectReference, registration,
-};
+use crate::{OperationsCatalog, OperationsError, WorkspaceParticipationId, registration};
 
 use super::{
     ProviderMessageState, ProviderMessageTarget, catalog_commit_read, decode_counter,
@@ -28,13 +25,10 @@ CREATE TABLE ops_provider_message_unknown_isolations (
     expected_provider_family INTEGER NOT NULL CHECK(expected_provider_family=1),
     expected_runtime_session_id BLOB NOT NULL CHECK(length(expected_runtime_session_id)=16 AND expected_runtime_session_id!=zeroblob(16)),
     expected_provider_conversation_id TEXT NOT NULL CHECK(length(CAST(expected_provider_conversation_id AS BLOB)) BETWEEN 1 AND 512),
-    expected_project_id TEXT CHECK(expected_project_id IS NULL OR (length(CAST(expected_project_id AS BLOB))=36 AND substr(expected_project_id,1,4)='g-p-' AND substr(expected_project_id,5,32) NOT GLOB '*[^0-9a-f]*')),
-    expected_project_binding_revision INTEGER CHECK(expected_project_binding_revision IS NULL OR expected_project_binding_revision>=1),
     reason INTEGER NOT NULL CHECK(reason=0),
     operator_principal_kind INTEGER NOT NULL CHECK(operator_principal_kind IN(0,1,2)),
     operator_principal_id BLOB CHECK(operator_principal_id IS NULL OR (length(operator_principal_id)=16 AND operator_principal_id!=zeroblob(16))),
     acknowledged_at_ms INTEGER NOT NULL CHECK(acknowledged_at_ms>=0),
-    CHECK((expected_project_id IS NULL AND expected_project_binding_revision IS NULL) OR (expected_project_id IS NOT NULL AND expected_project_binding_revision IS NOT NULL)),
     CHECK((operator_principal_kind=0 AND operator_principal_id IS NULL) OR (operator_principal_kind IN(1,2) AND operator_principal_id IS NOT NULL))
 ) STRICT;
 ";
@@ -55,7 +49,7 @@ BEGIN
 END;
 ";
 
-const SELECT_RECEIPT: &str = "SELECT substr(request_id,1,17),substr(message_id,1,17),expected_revision,substr(expected_workspace_id,1,17),substr(expected_profile_id,1,17),substr(expected_participation_id,1,17),expected_provider_family,substr(expected_runtime_session_id,1,17),substr(CAST(expected_provider_conversation_id AS BLOB),1,513),expected_project_id,expected_project_binding_revision,reason,operator_principal_kind,substr(operator_principal_id,1,17),acknowledged_at_ms FROM ops_provider_message_unknown_isolations";
+const SELECT_RECEIPT: &str = "SELECT substr(request_id,1,17),substr(message_id,1,17),expected_revision,substr(expected_workspace_id,1,17),substr(expected_profile_id,1,17),substr(expected_participation_id,1,17),expected_provider_family,substr(expected_runtime_session_id,1,17),substr(CAST(expected_provider_conversation_id AS BLOB),1,513),reason,operator_principal_kind,substr(operator_principal_id,1,17),acknowledged_at_ms FROM ops_provider_message_unknown_isolations";
 
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
@@ -228,8 +222,6 @@ struct RawReceipt {
     expected_provider_family: i64,
     expected_runtime_session_id: Vec<u8>,
     expected_provider_conversation_id: Vec<u8>,
-    expected_project_id: Option<String>,
-    expected_project_binding_revision: Option<i64>,
     reason: i64,
     operator_principal_kind: i64,
     operator_principal_id: Option<Vec<u8>>,
@@ -287,15 +279,8 @@ impl OperationsCatalog {
 
         let (principal_kind, principal_id) = registration::encode_principal(command.principal);
         let target = &command.expected_target;
-        let (project_id, project_binding_revision) =
-            target.project().map_or((None, None), |project| {
-                (
-                    Some(project.project_id().to_string()),
-                    Some(project.binding_revision().as_i64()),
-                )
-            });
         transaction.execute(
-            "INSERT INTO ops_provider_message_unknown_isolations(request_id,message_id,expected_revision,expected_workspace_id,expected_profile_id,expected_participation_id,expected_provider_family,expected_runtime_session_id,expected_provider_conversation_id,expected_project_id,expected_project_binding_revision,reason,operator_principal_kind,operator_principal_id,acknowledged_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,0,?12,?13,?14)",
+            "INSERT INTO ops_provider_message_unknown_isolations(request_id,message_id,expected_revision,expected_workspace_id,expected_profile_id,expected_participation_id,expected_provider_family,expected_runtime_session_id,expected_provider_conversation_id,reason,operator_principal_kind,operator_principal_id,acknowledged_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11,?12)",
             params![
                 command.request_id.as_bytes(),
                 command.message_id.as_bytes(),
@@ -306,8 +291,6 @@ impl OperationsCatalog {
                 encode_provider_family(target.provider_family()),
                 target.runtime_session_id().into_uuid().as_bytes(),
                 target.provider_conversation_id(),
-                project_id,
-                project_binding_revision,
                 principal_kind,
                 principal_id.as_deref(),
                 command.acknowledged_at.get(),
@@ -426,29 +409,12 @@ fn decode_receipt(
         expected_provider_family: row.get(6)?,
         expected_runtime_session_id: row.get(7)?,
         expected_provider_conversation_id: row.get(8)?,
-        expected_project_id: row.get(9)?,
-        expected_project_binding_revision: row.get(10)?,
-        reason: row.get(11)?,
-        operator_principal_kind: row.get(12)?,
-        operator_principal_id: row.get(13)?,
-        acknowledged_at_ms: row.get(14)?,
+        reason: row.get(9)?,
+        operator_principal_kind: row.get(10)?,
+        operator_principal_id: row.get(11)?,
+        acknowledged_at_ms: row.get(12)?,
     };
-    let expected_project = match (
-        raw.expected_project_id,
-        raw.expected_project_binding_revision,
-    ) {
-        (None, None) => None,
-        (Some(project_id), Some(revision)) => Some(WorkspaceProjectReference::new(
-            ChatGptProjectId::try_from(project_id.as_str()).map_err(to_sqlite_error)?,
-            WorkspaceProjectBindingRevision::new(revision).map_err(to_sqlite_error)?,
-        )),
-        _ => {
-            return Err(to_sqlite_error(OperationsError::Corrupt(
-                "provider UNKNOWN isolation Project route",
-            )));
-        }
-    };
-    let expected_target = ProviderMessageTarget::new_with_project_route(
+    let expected_target = ProviderMessageTarget::new_with_provider_family(
         WorkspaceId::from_uuid(decode_uuid(
             raw.expected_workspace_id,
             "provider UNKNOWN isolation Workspace",
@@ -481,7 +447,6 @@ fn decode_receipt(
             raw.expected_provider_conversation_id,
             "provider UNKNOWN isolation conversation",
         )?,
-        expected_project,
     )
     .map_err(to_sqlite_error)?;
     let reason = match raw.reason {

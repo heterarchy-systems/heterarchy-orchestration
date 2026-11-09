@@ -12,9 +12,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    AgentRequestResolutionKind, AgentRequestResolutionSelection, ChatGptProjectId,
-    OperationsCatalog, OperationsError, WorkspaceProjectBindingRevision, WorkspaceProjectReference,
-    wire,
+    AgentRequestResolutionKind, AgentRequestResolutionSelection, OperationsCatalog,
+    OperationsError, wire,
 };
 
 mod uncertainty_retirement;
@@ -95,30 +94,6 @@ CREATE TABLE ops_agent_provision_failures (
     observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0),
     FOREIGN KEY(operation_id) REFERENCES ops_agent_provision_operations(operation_id)
 );
-";
-
-const AGENT_PROVISION_PROJECT_ROUTES_SQL: &str = r"
-CREATE TABLE ops_agent_provision_project_routes (
-    operation_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_agent_provision_operations(operation_id) CHECK(length(operation_id)=16 AND operation_id != zeroblob(16)),
-    project_id TEXT NOT NULL CHECK(length(CAST(project_id AS BLOB))=36 AND substr(project_id,1,4)='g-p-' AND substr(project_id,5,32) NOT GLOB '*[^0-9a-f]*'),
-    binding_revision INTEGER NOT NULL CHECK(binding_revision>=1)
-);
-";
-
-const AGENT_PROVISION_PROJECT_ROUTE_NO_UPDATE_TRIGGER: &str = r"
-CREATE TRIGGER ops_agent_provision_project_routes_no_update
-BEFORE UPDATE ON ops_agent_provision_project_routes
-BEGIN
-    SELECT RAISE(ABORT, 'Agent provision Project routes are immutable');
-END;
-";
-
-const AGENT_PROVISION_PROJECT_ROUTE_NO_DELETE_TRIGGER: &str = r"
-CREATE TRIGGER ops_agent_provision_project_routes_no_delete
-BEFORE DELETE ON ops_agent_provision_project_routes
-BEGIN
-    SELECT RAISE(ABORT, 'Agent provision Project routes are immutable');
-END;
 ";
 
 /// Provider-side effect selected by the durable resolver.
@@ -250,7 +225,6 @@ pub struct AgentProvisionDispatch {
     provider_family: AgentProvisionProviderFamily,
     profile_id: AgentProfileId,
     runtime_session_id: AgentProfileRuntimeSessionId,
-    project: Option<WorkspaceProjectReference>,
 }
 
 impl AgentProvisionDispatch {
@@ -288,11 +262,6 @@ impl AgentProvisionDispatch {
     pub const fn runtime_session_id(self) -> AgentProfileRuntimeSessionId {
         self.runtime_session_id
     }
-
-    #[must_use]
-    pub const fn project(self) -> Option<WorkspaceProjectReference> {
-        self.project
-    }
 }
 
 /// Durable operation that maps one resolver slot to at most one provider
@@ -310,7 +279,6 @@ pub struct AgentProvisionOperation {
     provider_conversation_id: Option<String>,
     reported_failure_code: Option<AgentProvisionFailureCode>,
     uncertainty_retirement: Option<AgentProvisionUncertaintyRetirement>,
-    project: Option<WorkspaceProjectReference>,
     prepared_at: TimestampMillis,
     updated_at: TimestampMillis,
     revision: u64,
@@ -378,12 +346,6 @@ impl AgentProvisionOperation {
     #[must_use]
     pub const fn uncertainty_retirement(&self) -> Option<&AgentProvisionUncertaintyRetirement> {
         self.uncertainty_retirement.as_ref()
-    }
-
-    /// Frozen Project route; legacy operations retain absent provenance.
-    #[must_use]
-    pub const fn project(&self) -> Option<WorkspaceProjectReference> {
-        self.project
     }
 
     #[must_use]
@@ -519,17 +481,6 @@ impl OperationsCatalog {
                 created: false,
             });
         }
-        if let Some(profile_id) = profile_id {
-            crate::profile_deletion::require_profile_admission_open(&tx, profile_id)?;
-        }
-        let workspace_id = operation_workspace_id(&tx, request_id)?;
-        let project = prepare_project_reference(
-            &tx,
-            workspace_id,
-            effect_kind,
-            profile_id,
-            runtime_session_id,
-        )?;
         let operation = insert_prepared_operation(
             &tx,
             PreparedProvisionOperationInsert {
@@ -540,7 +491,6 @@ impl OperationsCatalog {
                 profile_id,
                 runtime_session_id,
                 prepared_at,
-                project,
             },
         )?;
         commit_operation(tx, operation_id)?;
@@ -615,7 +565,6 @@ impl OperationsCatalog {
             observed_at,
             AgentProvisionState::Prepared,
         )?;
-        crate::profile_deletion::require_profile_admission_open(&tx, profile_id)?;
         let next_revision = next_revision(existing.revision)?;
         let changed = tx.execute(
             "UPDATE ops_agent_provision_operations SET profile_id=?1,runtime_session_id=?2,updated_at_ms=?3,revision=?4 WHERE operation_id=?5 AND revision=?6 AND state=1",
@@ -873,7 +822,6 @@ struct PreparedProvisionOperationInsert {
     profile_id: Option<AgentProfileId>,
     runtime_session_id: Option<AgentProfileRuntimeSessionId>,
     prepared_at: TimestampMillis,
-    project: Option<WorkspaceProjectReference>,
 }
 
 fn insert_prepared_operation(
@@ -896,16 +844,6 @@ fn insert_prepared_operation(
             insert.prepared_at.get(),
         ],
     )?;
-    if let Some(project) = insert.project {
-        transaction.execute(
-            "INSERT INTO ops_agent_provision_project_routes(operation_id,project_id,binding_revision) VALUES(?1,?2,?3)",
-            params![
-                insert.operation_id.as_bytes(),
-                project.project_id().to_string(),
-                project.binding_revision().as_i64(),
-            ],
-        )?;
-    }
     load_operation(transaction, insert.operation_id)?
         .ok_or(OperationsError::Corrupt("Agent provision insert"))
 }
@@ -961,13 +899,6 @@ pub(crate) fn create_uncertainty_retirement_schema(
     uncertainty_retirement::create_schema(connection)
 }
 
-pub(crate) fn create_project_route_schema(connection: &Connection) -> Result<(), OperationsError> {
-    connection.execute_batch(AGENT_PROVISION_PROJECT_ROUTES_SQL)?;
-    connection.execute_batch(AGENT_PROVISION_PROJECT_ROUTE_NO_UPDATE_TRIGGER)?;
-    connection.execute_batch(AGENT_PROVISION_PROJECT_ROUTE_NO_DELETE_TRIGGER)?;
-    Ok(())
-}
-
 pub(crate) fn migrate_v29_to_v30(
     connection: &rusqlite::Transaction<'_>,
 ) -> Result<(), OperationsError> {
@@ -995,7 +926,6 @@ pub(crate) fn migrate_v29_to_v30(
 pub(crate) fn drop_schema_for_legacy_fixture(
     connection: &Connection,
 ) -> Result<(), OperationsError> {
-    crate::workspace_project::drop_enrollment_schema_for_legacy_fixture(connection)?;
     crate::catalog::drop_v31_objects_for_legacy_fixture(connection)?;
     // The node-team bindings table only exists from v34 on; every legacy
     // fixture stamped below v34 must not retain it, or the exact-inventory
@@ -1028,26 +958,6 @@ pub(crate) fn failure_schema_objects() -> Vec<(&'static str, &'static str, &'sta
 pub(crate) fn uncertainty_retirement_schema_objects()
 -> Vec<(&'static str, &'static str, &'static str)> {
     uncertainty_retirement::schema_objects()
-}
-
-pub(crate) fn project_route_schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
-        (
-            "table",
-            "ops_agent_provision_project_routes",
-            AGENT_PROVISION_PROJECT_ROUTES_SQL,
-        ),
-        (
-            "trigger",
-            "ops_agent_provision_project_routes_no_update",
-            AGENT_PROVISION_PROJECT_ROUTE_NO_UPDATE_TRIGGER,
-        ),
-        (
-            "trigger",
-            "ops_agent_provision_project_routes_no_delete",
-            AGENT_PROVISION_PROJECT_ROUTE_NO_DELETE_TRIGGER,
-        ),
-    ]
 }
 
 pub(crate) fn schema_objects_v29() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -1230,7 +1140,6 @@ fn provider_dispatch(
         provider_family: operation.provider_family,
         profile_id,
         runtime_session_id,
-        project: operation.project,
     })
 }
 
@@ -1270,10 +1179,6 @@ fn oldest_bound_prepared_operation_id(
             "SELECT operation.operation_id FROM ops_agent_provision_operations AS operation
              WHERE operation.state=1 AND operation.profile_id IS NOT NULL
                AND operation.runtime_session_id IS NOT NULL
-               AND NOT EXISTS(
-                    SELECT 1 FROM ops_agent_profile_deletion_barriers AS barrier
-                     WHERE barrier.profile_id=operation.profile_id
-               )
              ORDER BY operation.prepared_at_ms ASC, operation.operation_id ASC
              LIMIT 1",
             [],
@@ -1311,27 +1216,6 @@ fn admit_prepared_operation(
     existing: &AgentProvisionOperation,
     observed_at: TimestampMillis,
 ) -> Result<AgentProvisionOperation, OperationsError> {
-    if matches!(
-        existing.effect_kind,
-        AgentProvisionEffectKind::ProvisionNew | AgentProvisionEffectKind::WakeNewRuntime
-    ) && existing.project.is_none()
-    {
-        return Err(OperationsError::Conflict(
-            "ChatGPT Project binding required before new provision effect",
-        ));
-    }
-    if matches!(
-        existing.effect_kind,
-        AgentProvisionEffectKind::WakeExistingRuntime | AgentProvisionEffectKind::ReuseReadyRuntime
-    ) && existing.project.is_none()
-    {
-        let workspace_id = operation_workspace_id(transaction, existing.request_id)?;
-        if crate::workspace_project::load_binding(transaction, workspace_id)?.is_some() {
-            return Err(OperationsError::Conflict(
-                "existing Runtime Project provenance is unknown",
-            ));
-        }
-    }
     let next_revision = next_revision(existing.revision)?;
     let changed = transaction.execute(
         "UPDATE ops_agent_provision_operations SET state=2,updated_at_ms=?1,revision=?2 WHERE operation_id=?3 AND revision=?4 AND state=1",
@@ -1363,134 +1247,15 @@ fn required_operation(
     ))
 }
 
-fn operation_workspace_id(
-    connection: &Connection,
-    request_id: Uuid,
-) -> Result<Uuid, OperationsError> {
-    let bytes = connection.query_row(
-        "SELECT substr(workspace_id,1,17) FROM ops_agent_requests WHERE request_id=?1",
-        params![request_id.as_bytes()],
-        |row| row.get::<_, Vec<u8>>(0),
-    )?;
-    let workspace_id = Uuid::from_bytes(wire::id(bytes)?);
-    if workspace_id.is_nil() {
-        return Err(OperationsError::Corrupt(
-            "Agent provision Workspace identity",
-        ));
-    }
-    Ok(workspace_id)
-}
-
-fn prepare_project_reference(
-    connection: &Connection,
-    workspace_id: Uuid,
-    effect_kind: AgentProvisionEffectKind,
-    profile_id: Option<AgentProfileId>,
-    runtime_session_id: Option<AgentProfileRuntimeSessionId>,
-) -> Result<Option<WorkspaceProjectReference>, OperationsError> {
-    let binding = crate::workspace_project::load_binding(connection, workspace_id)?;
-    match effect_kind {
-        AgentProvisionEffectKind::ProvisionNew | AgentProvisionEffectKind::WakeNewRuntime => {
-            binding
-                .map(|binding| Some(binding.project_reference()))
-                .ok_or(OperationsError::Conflict(
-                    "ChatGPT Project binding required for new provision",
-                ))
-        }
-        AgentProvisionEffectKind::WakeExistingRuntime
-        | AgentProvisionEffectKind::ReuseReadyRuntime => {
-            let profile_id = profile_id.ok_or(OperationsError::Corrupt(
-                "existing provision Project Profile target",
-            ))?;
-            let runtime_session_id = runtime_session_id.ok_or(OperationsError::Corrupt(
-                "existing provision Project Runtime target",
-            ))?;
-            let history = load_runtime_project_history(connection, profile_id, runtime_session_id)?;
-            match (binding, history.project, history.has_projectless_operation) {
-                (Some(binding), Some(project), false)
-                    if binding.project_id() == project.project_id() =>
-                {
-                    Ok(Some(project))
-                }
-                (Some(_), _, _) => Err(OperationsError::Conflict(
-                    "existing Runtime Project provenance is incompatible or unknown",
-                )),
-                (None, Some(project), false) => Ok(Some(project)),
-                (None, None, _) => Ok(None),
-                (None, Some(_), true) => Err(OperationsError::Conflict(
-                    "existing Runtime Project provenance is ambiguous",
-                )),
-            }
-        }
-    }
-}
-
-struct RuntimeProjectHistory {
-    project: Option<WorkspaceProjectReference>,
-    has_projectless_operation: bool,
-}
-
-fn load_runtime_project_history(
-    connection: &Connection,
-    profile_id: AgentProfileId,
-    runtime_session_id: AgentProfileRuntimeSessionId,
-) -> Result<RuntimeProjectHistory, OperationsError> {
-    let mut statement = connection.prepare(
-        "SELECT route.project_id,route.binding_revision
-           FROM ops_agent_provision_operations AS operation
-           LEFT JOIN ops_agent_provision_project_routes AS route
-             ON route.operation_id=operation.operation_id
-          WHERE operation.profile_id=?1
-            AND operation.runtime_session_id=?2
-            AND operation.state=5
-            AND operation.provider_conversation_id IS NOT NULL",
-    )?;
-    let mut rows = statement.query(params![
-        profile_id.into_uuid().as_bytes(),
-        runtime_session_id.into_uuid().as_bytes(),
-    ])?;
-    let mut history = RuntimeProjectHistory {
-        project: None,
-        has_projectless_operation: false,
-    };
-    while let Some(row) = rows.next()? {
-        let project_id = row.get::<_, Option<String>>(0)?;
-        let binding_revision = row.get::<_, Option<i64>>(1)?;
-        match (project_id, binding_revision) {
-            (None, None) => history.has_projectless_operation = true,
-            (Some(project_id), Some(binding_revision)) => {
-                let project_id = ChatGptProjectId::try_from(project_id.as_str())
-                    .map_err(|_| OperationsError::Corrupt("Agent provision Project route"))?;
-                let binding_revision = WorkspaceProjectBindingRevision::new(binding_revision)
-                    .map_err(|_| OperationsError::Corrupt("Agent provision Project revision"))?;
-                let project = WorkspaceProjectReference::new(project_id, binding_revision);
-                if history.project.is_some_and(|existing| existing != project) {
-                    return Err(OperationsError::Conflict(
-                        "existing Runtime has multiple Project provenances",
-                    ));
-                }
-                history.project = Some(project);
-            }
-            _ => {
-                return Err(OperationsError::Corrupt(
-                    "Agent provision Project route shape",
-                ));
-            }
-        }
-    }
-    Ok(history)
-}
-
 fn load_operation(
     connection: &Connection,
     operation_id: Uuid,
 ) -> Result<Option<AgentProvisionOperation>, OperationsError> {
     let raw = connection
         .query_row(
-            "SELECT substr(p.request_id,1,17),p.slot_ordinal,p.effect_kind,p.provider_family,substr(p.profile_id,1,17),substr(p.runtime_session_id,1,17),p.state,substr(p.provider_conversation_id,1,513),p.prepared_at_ms,p.updated_at_ms,p.revision,f.operation_revision,f.failure_code,f.observed_at_ms,route.project_id,route.binding_revision
+            "SELECT substr(p.request_id,1,17),p.slot_ordinal,p.effect_kind,p.provider_family,substr(p.profile_id,1,17),substr(p.runtime_session_id,1,17),p.state,substr(p.provider_conversation_id,1,513),p.prepared_at_ms,p.updated_at_ms,p.revision,f.operation_revision,f.failure_code,f.observed_at_ms
              FROM ops_agent_provision_operations AS p
              LEFT JOIN ops_agent_provision_failures AS f ON f.operation_id=p.operation_id
-             LEFT JOIN ops_agent_provision_project_routes AS route ON route.operation_id=p.operation_id
              WHERE p.operation_id=?1",
             params![operation_id.as_bytes()],
             |row| {
@@ -1509,8 +1274,6 @@ fn load_operation(
                     failure_operation_revision: row.get(11)?,
                     failure_code: row.get(12)?,
                     failure_observed_at: row.get(13)?,
-                    project_id: row.get(14)?,
-                    project_binding_revision: row.get(15)?,
                 })
             },
         )
@@ -1562,8 +1325,6 @@ struct RawAgentProvisionOperation {
     failure_operation_revision: Option<i64>,
     failure_code: Option<i64>,
     failure_observed_at: Option<i64>,
-    project_id: Option<String>,
-    project_binding_revision: Option<i64>,
 }
 
 fn decode_operation(
@@ -1590,7 +1351,6 @@ fn decode_operation(
         .map_err(|_| OperationsError::Corrupt("Agent provision updated time"))?;
     let revision = u64::try_from(raw.revision)
         .map_err(|_| OperationsError::Corrupt("Agent provision revision"))?;
-    let project = decode_project_route(raw.project_id, raw.project_binding_revision)?;
     if revision == 0 || updated_at < prepared_at {
         return Err(OperationsError::Corrupt("Agent provision row shape"));
     }
@@ -1608,7 +1368,6 @@ fn decode_operation(
         provider_conversation_id: raw.provider_conversation_id,
         reported_failure_code,
         uncertainty_retirement: None,
-        project,
         prepared_at,
         updated_at,
         revision,
@@ -1632,28 +1391,6 @@ fn decode_operation_target(
         })
         .transpose()?;
     Ok((profile_id, runtime_session_id))
-}
-
-fn decode_project_route(
-    project_id: Option<String>,
-    binding_revision: Option<i64>,
-) -> Result<Option<WorkspaceProjectReference>, OperationsError> {
-    match (project_id, binding_revision) {
-        (None, None) => Ok(None),
-        (Some(project_id), Some(binding_revision)) => {
-            let project_id = ChatGptProjectId::try_from(project_id.as_str())
-                .map_err(|_| OperationsError::Corrupt("Agent provision Project identity"))?;
-            let binding_revision = WorkspaceProjectBindingRevision::new(binding_revision)
-                .map_err(|_| OperationsError::Corrupt("Agent provision Project revision"))?;
-            Ok(Some(WorkspaceProjectReference::new(
-                project_id,
-                binding_revision,
-            )))
-        }
-        _ => Err(OperationsError::Corrupt(
-            "Agent provision Project route shape",
-        )),
-    }
 }
 
 fn validate_conversation_state(
@@ -1871,14 +1608,9 @@ mod tests {
     use super::*;
     use crate::{
         AgentRequestCommand, AgentRequestEffectScope, AgentRequestIndependence, AgentRequestIntent,
-        AgentRequestRequester, AgentRequestResolutionSelection, ChatGptProjectId,
-        CommitAgentRequestResolution, WorkspaceProjectConfigureCommand, WorkspaceProjectScope,
+        AgentRequestRequester, AgentRequestResolutionSelection, CommitAgentRequestResolution,
     };
     use forge_domain::{ActivityId, AgentInstanceId, AgentSessionId, WorkspaceId};
-    use heterarchy_orchestration_sessions::{
-        AgentProfileCatalog, AgentProfileCreationOrigin, AgentProfileDeletionCommand,
-        AgentProfileDeletionIntent, AgentProfileProviderFamily, CreateAgentProfile,
-    };
     use std::{error::Error, fs};
 
     fn seed_v27_provision_resolution(
@@ -1985,7 +1717,6 @@ mod tests {
         base_time_ms: i64,
     ) -> Result<Uuid, Box<dyn Error>> {
         let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0xE803));
-        ensure_test_project_binding(catalog, workspace_id.into_uuid(), base_time_ms)?;
         let request = AgentRequestCommand::new(
             request_id,
             AgentRequestRequester::new(
@@ -2022,31 +1753,6 @@ mod tests {
         Ok(prepared.operation().operation_id())
     }
 
-    fn ensure_test_project_binding(
-        catalog: &mut OperationsCatalog,
-        workspace_id: Uuid,
-        configured_at_ms: i64,
-    ) -> Result<(), Box<dyn Error>> {
-        if catalog.workspace_project_binding(workspace_id)?.is_none() {
-            let scope = WorkspaceProjectScope::new(
-                workspace_id,
-                Uuid::from_u128(0xE802),
-                1,
-                1,
-                "agent-provision-test-workspace".to_owned(),
-            )?;
-            let command = WorkspaceProjectConfigureCommand::new(
-                Uuid::now_v7(),
-                scope,
-                None,
-                ChatGptProjectId::try_from("g-p-6ad231f7ad7c8191bfc1d5ff782c171f")?,
-                TimestampMillis::new(configured_at_ms)?,
-            )?;
-            catalog.configure_workspace_project(command, &[])?;
-        }
-        Ok(())
-    }
-
     fn create_bound_provision_operation(
         catalog: &mut OperationsCatalog,
         request_id: Uuid,
@@ -2066,36 +1772,6 @@ mod tests {
             TimestampMillis::new(base_time_ms + 3)?,
         )?;
         Ok(operation_id)
-    }
-
-    fn begin_profile_deletion_intent(
-        profile_id: AgentProfileId,
-        path: &std::path::Path,
-        request_id: Uuid,
-        requested_at: i64,
-    ) -> Result<(AgentProfileCatalog, AgentProfileDeletionIntent), Box<dyn Error>> {
-        let mut profiles = AgentProfileCatalog::open(path)?;
-        let created = CreateAgentProfile::new(
-            profile_id,
-            Uuid::now_v7(),
-            "profile-delete-fixture".to_owned(),
-            "Profile deletion fixture".to_owned(),
-            AgentProfileProviderFamily::ChatGpt,
-            None,
-            None,
-            Vec::new(),
-            AgentProfileCreationOrigin::UserManual,
-            TimestampMillis::new(requested_at - 1)?,
-        )?;
-        let profile = profiles.create_profile(&created)?;
-        let command = AgentProfileDeletionCommand::new(
-            request_id,
-            profile_id,
-            profile.profile().revision(),
-            TimestampMillis::new(requested_at)?,
-        )?;
-        let intent = profiles.begin_profile_deletion(&command)?;
-        Ok((profiles, intent))
     }
 
     fn verify_global_admission_and_replay(
@@ -2163,127 +1839,6 @@ mod tests {
                 .is_some()
         );
         Ok(confirmed)
-    }
-
-    #[test]
-    fn profile_barrier_skips_prepared_work_and_rejects_late_binding_but_keeps_replay()
-    -> Result<(), Box<dyn Error>> {
-        let root =
-            std::env::temp_dir().join(format!("profile-delete-provision-{}", Uuid::now_v7()));
-        fs::create_dir(&root)?;
-        let ops_path = root.join("operations.sqlite3");
-        let profile_path = root.join("profiles.sqlite3");
-        let destination = Uuid::now_v7();
-        let mut catalog = OperationsCatalog::open(&ops_path, destination)?;
-        let profile_a = AgentProfileId::from_uuid(Uuid::from_u128(0xE901))?;
-        let runtime_a = AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xE902))?;
-        let request_a = Uuid::from_u128(0xE903);
-        let prepared_a =
-            create_bound_provision_operation(&mut catalog, request_a, profile_a, runtime_a, 100)?;
-        let late_request = Uuid::from_u128(0xE904);
-        let late_operation = prepare_new_provision_operation(&mut catalog, late_request, 200)?;
-        let profile_b = AgentProfileId::from_uuid(Uuid::from_u128(0xE905))?;
-        let runtime_b = AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xE906))?;
-        let operation_b = create_bound_provision_operation(
-            &mut catalog,
-            Uuid::from_u128(0xE907),
-            profile_b,
-            runtime_b,
-            300,
-        )?;
-        let (profiles, intent) =
-            begin_profile_deletion_intent(profile_a, &profile_path, Uuid::from_u128(0xE908), 500)?;
-        let barrier = catalog.begin_profile_deletion_barrier(&intent)?;
-        assert_eq!(catalog.begin_profile_deletion_barrier(&intent)?, barrier);
-        assert_eq!(catalog.profile_deletion_barrier(profile_a)?, Some(barrier));
-        assert_eq!(
-            catalog.profile_deletion_barrier_by_request(intent.request_id())?,
-            Some(barrier)
-        );
-
-        let replay =
-            catalog.prepare_agent_provision_operation(request_a, 0, TimestampMillis::new(501)?)?;
-        assert!(!replay.created());
-        assert_eq!(replay.operation().operation_id(), prepared_a);
-        assert!(
-            catalog
-                .bind_agent_provision_target(
-                    late_operation,
-                    1,
-                    profile_a,
-                    AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xE909))?,
-                    TimestampMillis::new(502)?,
-                )
-                .is_err()
-        );
-
-        let next = catalog
-            .next_agent_provision_dispatch(TimestampMillis::new(600)?)?
-            .ok_or("unrelated prepared provider work did not continue")?;
-        assert_eq!(next.operation().operation_id(), operation_b);
-        assert_eq!(
-            next.dispatch().map(AgentProvisionDispatch::action),
-            Some(AgentProvisionDispatchAction::Execute)
-        );
-        assert_eq!(
-            catalog
-                .agent_provision_operation(late_operation)?
-                .ok_or("late-bound operation missing")?
-                .state(),
-            AgentProvisionState::Prepared
-        );
-        drop(profiles);
-        drop(catalog);
-        fs::remove_file(profile_path)?;
-        fs::remove_file(ops_path)?;
-        fs::remove_dir(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn profile_barrier_preserves_inspection_of_admitted_provision_effect()
-    -> Result<(), Box<dyn Error>> {
-        let root = std::env::temp_dir().join(format!("profile-delete-inspect-{}", Uuid::now_v7()));
-        fs::create_dir(&root)?;
-        let ops_path = root.join("operations.sqlite3");
-        let profile_path = root.join("profiles.sqlite3");
-        let destination = Uuid::now_v7();
-        let mut catalog = OperationsCatalog::open(&ops_path, destination)?;
-        let profile_id = AgentProfileId::from_uuid(Uuid::from_u128(0xE910))?;
-        let operation_id = create_bound_provision_operation(
-            &mut catalog,
-            Uuid::from_u128(0xE911),
-            profile_id,
-            AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xE912))?,
-            100,
-        )?;
-        let executed = catalog
-            .next_agent_provision_dispatch(TimestampMillis::new(200)?)?
-            .ok_or("provision Execute missing")?;
-        assert_eq!(executed.operation().operation_id(), operation_id);
-        let (profiles, intent) =
-            begin_profile_deletion_intent(profile_id, &profile_path, Uuid::from_u128(0xE913), 300)?;
-        let _ = catalog.begin_profile_deletion_barrier(&intent)?;
-        let counts = catalog.profile_deletion_in_flight_counts(profile_id)?;
-        assert_eq!(counts.pending_provision_operations(), 1);
-        let inspected = catalog
-            .next_agent_provision_dispatch(TimestampMillis::new(301)?)?
-            .ok_or("pending provision Inspect missing")?;
-        assert_eq!(inspected.operation().operation_id(), operation_id);
-        assert_eq!(
-            inspected.dispatch().map(AgentProvisionDispatch::action),
-            Some(AgentProvisionDispatchAction::Inspect)
-        );
-        assert_eq!(
-            inspected.operation().state(),
-            AgentProvisionState::EffectPending
-        );
-        drop(profiles);
-        drop(catalog);
-        fs::remove_file(profile_path)?;
-        fs::remove_file(ops_path)?;
-        fs::remove_dir(root)?;
-        Ok(())
     }
 
     #[test]
@@ -2387,7 +1942,6 @@ mod tests {
         seed_v27_provision_resolution(&path, destination, request_id)?;
 
         let mut migrated = OperationsCatalog::open(&path, destination)?;
-        ensure_test_project_binding(&mut migrated, Uuid::from_u128(0xE803), 29)?;
         let prepared =
             migrated.prepare_agent_provision_operation(request_id, 0, TimestampMillis::new(30)?)?;
         assert!(prepared.created());
@@ -2417,8 +1971,7 @@ mod tests {
         )?;
         let confirmed =
             verify_global_admission_and_replay(&mut migrated, operation_id, second_operation_id)?;
-        let mut legacy_confirmed = confirmed.clone();
-        legacy_confirmed.project = None;
+        let legacy_confirmed = confirmed.clone();
         let second_pending = migrated
             .next_agent_provision_dispatch(TimestampMillis::new(10_070)?)?
             .ok_or("second provision dispatch missing after cooldown")?;

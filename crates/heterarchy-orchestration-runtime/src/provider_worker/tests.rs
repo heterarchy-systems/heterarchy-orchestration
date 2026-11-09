@@ -15,7 +15,6 @@ use super::{OrchestrationRuntime, RuntimeError};
 use crate::provisioning::AgentRequestSubmit;
 
 const OPERATOR: AuthenticatedPrincipal = AuthenticatedPrincipal::TrustedStdio;
-const TEST_PROJECT_ID: &str = "g-p-6ad231f7ad7c8191bfc1d5ff782c171f";
 
 struct ProvisionFixture {
     root: PathBuf,
@@ -28,11 +27,6 @@ impl ProvisionFixture {
         let root = std::env::temp_dir().join(format!("provider-worker-flow-{}", Uuid::now_v7()));
         std::fs::create_dir_all(&root)?;
         let runtime = OrchestrationRuntime::open(&root)?;
-        crate::test_support::ensure_workspace_project_binding(
-            &runtime,
-            Uuid::from_u128(0xA101),
-            1,
-        )?;
         let request_id = Uuid::from_u128(0xA105);
         runtime.submit_agent_request(AgentRequestSubmit {
             workspace_id: Uuid::from_u128(0xA101),
@@ -86,16 +80,13 @@ fn confirm_provision(
     conversation_id: &str,
     observed_at_ms: i64,
 ) -> Result<AgentProvisionOperation, RuntimeError> {
-    fixture
-        .runtime
-        .provider_worker_confirm_provision_with_project(
-            OPERATOR,
-            fixture.operation_id,
-            expected_revision,
-            conversation_id,
-            Some(TEST_PROJECT_ID),
-            observed_at_ms,
-        )
+    fixture.runtime.provider_worker_confirm_provision(
+        OPERATOR,
+        fixture.operation_id,
+        expected_revision,
+        conversation_id,
+        observed_at_ms,
+    )
 }
 
 fn runtime_session_snapshot(
@@ -233,28 +224,6 @@ fn assert_unknown_inspect_and_confirmation_replay(
     );
     assert_eq!(unknown_fence.operation_id(), fixture.operation_id);
     assert_eq!(unknown_fence.operation_revision(), unknown.revision());
-
-    let before_bad_confirmation = runtime_session_snapshot(&fixture.runtime, fixture.operation_id)?;
-    for observed_project in [None, Some("g-p-7ad231f7ad7c8191bfc1d5ff782c171f")] {
-        assert!(matches!(
-            fixture
-                .runtime
-                .provider_worker_confirm_provision_with_project(
-                    OPERATOR,
-                    fixture.operation_id,
-                    unknown_fence.operation_revision(),
-                    "conversation-exact",
-                    observed_project,
-                    14,
-                ),
-            Err(RuntimeError::Conflict)
-        ));
-        assert_eq!(
-            runtime_session_snapshot(&fixture.runtime, fixture.operation_id)?,
-            before_bad_confirmation,
-            "missing or mismatched Project evidence must not ready the Runtime"
-        );
-    }
 
     let confirmed = confirm_provision(
         fixture,

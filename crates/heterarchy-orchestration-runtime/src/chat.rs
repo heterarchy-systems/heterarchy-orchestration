@@ -15,7 +15,7 @@ use heterarchy_orchestration_operations::{
     AppendWorkspaceMessageCommand, LeadershipScope, MessageAuthor, MessageChannel, MessageContext,
     MessageId, MessageReadScope, NodeMessageRouteWitness, OperationalActor, OperationsCatalog,
     OperationsError, ProviderMessageState, ProviderMessageTarget, WorkspaceMessage,
-    WorkspaceProjectReference, validate_chat_text,
+    validate_chat_text,
 };
 use heterarchy_orchestration_sessions::{
     AgentProfileCatalog, AgentProfileError, AgentProfileId, AgentProfileLifecycleState,
@@ -122,7 +122,6 @@ mod auth_tests {
                 runtime_session_id: Uuid::from_u128(9),
                 runtime_revision: 1,
                 provider_conversation_id: "conversation".to_owned(),
-                project: None,
                 leadership_revision: None,
                 node_target: None,
             },
@@ -155,7 +154,6 @@ mod auth_tests {
             .open_session(Uuid::from_u128(11), principal, 1)?
             .session;
         let workspace = WorkspaceId::from_uuid(Uuid::from_u128(12));
-        crate::test_support::ensure_workspace_project_binding(&runtime, workspace.into_uuid(), 1)?;
         let activity_id = Uuid::from_u128(13);
         let request_id = Uuid::from_u128(14);
         runtime.submit_agent_request(AgentRequestSubmit {
@@ -178,12 +176,11 @@ mod auth_tests {
         let action = runtime
             .provider_worker_next_provision(principal, 7)?
             .ok_or("provider fixture dispatch")?;
-        let operation = runtime.provider_worker_confirm_provision_with_project(
+        let operation = runtime.provider_worker_confirm_provision(
             principal,
             action.operation().operation_id(),
             action.operation().revision(),
             "conversation-direct",
-            Some("g-p-6ad231f7ad7c8191bfc1d5ff782c171f"),
             8,
         )?;
         let operation_id = operation.operation_id();
@@ -270,13 +267,6 @@ mod auth_tests {
         let snapshot =
             runtime.read_chat(caller, principal, &query, None, TimestampMillis::new(11)?)?;
         let target_fence = snapshot.target.ok_or("direct target")?;
-        assert_eq!(
-            target_fence
-                .project
-                .map(|project| project.project_id().to_string())
-                .as_deref(),
-            Some("g-p-6ad231f7ad7c8191bfc1d5ff782c171f")
-        );
         let request = ChatSend {
             query,
             message_id: Uuid::from_u128(19),
@@ -294,12 +284,11 @@ mod auth_tests {
             .provider_worker_next_message(principal, 13)?
             .ok_or("direct provider dispatch")?;
         let frozen_body = dispatch.body.ok_or("direct provider body")?;
-        let delivered = runtime.provider_worker_confirm_message_delivery_with_project(
+        let delivered = runtime.provider_worker_confirm_message_delivery(
             principal,
             request.message_id,
             dispatch.outbox.revision(),
             "conversation-direct",
-            Some("g-p-6ad231f7ad7c8191bfc1d5ff782c171f"),
             "user-turn".to_owned(),
             frozen_body,
             14,
@@ -379,8 +368,6 @@ pub struct ChatTargetFence {
     pub runtime_revision: i64,
     /// Provider conversation identity.
     pub provider_conversation_id: String,
-    /// Frozen Workspace Project identity and binding revision, when present.
-    pub project: Option<WorkspaceProjectReference>,
     /// Current target leadership revision, when routing through a leader.
     pub leadership_revision: Option<i64>,
     /// Exact node recipient identity when this is a node conversation.
@@ -1283,14 +1270,13 @@ fn resolve_chat(
         {
             continue;
         }
-        let target = ProviderMessageTarget::new_with_project_route(
+        let target = ProviderMessageTarget::new_with_provider_family(
             workspace_id,
             profile_id,
             participation.participation_id(),
             AgentProfileProviderFamily::ChatGpt,
             runtime.id(),
             route.provider_conversation_id().to_owned(),
-            route.project(),
         )?;
         targets.push((
             ChatTargetFence {
@@ -1302,7 +1288,6 @@ fn resolve_chat(
                 runtime_session_id: runtime.id().into_uuid(),
                 runtime_revision: runtime.revision().get(),
                 provider_conversation_id: route.provider_conversation_id().to_owned(),
-                project: route.project(),
                 leadership_revision,
                 node_target: None,
             },
@@ -1352,7 +1337,6 @@ fn target_matches_fence(target: &ProviderMessageTarget, fence: &ChatTargetFence)
         && target.participation_id().into_uuid() == fence.participation_id
         && target.runtime_session_id().into_uuid() == fence.runtime_session_id
         && target.provider_conversation_id() == fence.provider_conversation_id
-        && target.project() == fence.project
 }
 
 fn channel_matches_query(

@@ -2,8 +2,7 @@ use super::*;
 use crate::{
     AgentProvisionDispatchAction, AgentRequestCommand, AgentRequestEffectScope,
     AgentRequestIndependence, AgentRequestIntent, AgentRequestRequester,
-    AgentRequestResolutionSelection, ChatGptProjectId, CommitAgentRequestResolution,
-    WorkspaceProjectConfigureCommand, WorkspaceProjectScope,
+    AgentRequestResolutionSelection, CommitAgentRequestResolution,
 };
 use forge_domain::{ActivityId, AgentInstanceId};
 use heterarchy_orchestration_sessions::{AgentProfileId, AgentProfileRuntimeSessionId};
@@ -43,27 +42,6 @@ fn prepare_bound_provision(
     request_id: Uuid,
     base_time_ms: i64,
 ) -> Result<AgentProvisionOperation, Box<dyn Error>> {
-    if catalog
-        .workspace_project_binding(workspace_id().into_uuid())?
-        .is_none()
-    {
-        catalog.configure_workspace_project(
-            WorkspaceProjectConfigureCommand::new(
-                Uuid::now_v7(),
-                WorkspaceProjectScope::new(
-                    workspace_id().into_uuid(),
-                    Uuid::from_u128(0xF005),
-                    1,
-                    1,
-                    "uncertainty-retirement-test-workspace".to_owned(),
-                )?,
-                None,
-                ChatGptProjectId::try_from("g-p-6ad231f7ad7c8191bfc1d5ff782c171f")?,
-                TimestampMillis::new(base_time_ms)?,
-            )?,
-            &[],
-        )?;
-    }
     let request = AgentRequestCommand::new(
         request_id,
         AgentRequestRequester::new(

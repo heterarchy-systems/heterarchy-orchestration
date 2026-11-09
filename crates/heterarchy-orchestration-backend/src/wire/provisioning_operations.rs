@@ -5,10 +5,7 @@ use heterarchy_orchestration_operations::AgentProvisionUncertaintyRetirement;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
-use super::{
-    deserialize_optional_non_null, leadership::WorkspaceQueryScope,
-    workspace_project::ProviderProjectReferenceWire,
-};
+use super::leadership::WorkspaceQueryScope;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -92,12 +89,6 @@ pub struct ProvisionOperationWire {
     pub revision: u64,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub uncertainty_retirement: Option<ProvisionOperationUncertaintyRetirementWire>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_non_null"
-    )]
-    pub project: Option<ProviderProjectReferenceWire>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

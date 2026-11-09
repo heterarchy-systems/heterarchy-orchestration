@@ -10,10 +10,7 @@ use heterarchy_orchestration_sessions::{AgentProfileId, AgentProfileRuntimeSessi
 use rusqlite::{Transaction, params};
 use uuid::Uuid;
 
-use crate::{
-    ChatGptProjectId, OperationsCatalog, OperationsError, WorkspaceProjectBindingRevision,
-    WorkspaceProjectReference, wire,
-};
+use crate::{OperationsCatalog, OperationsError, wire};
 
 const MAX_CHAT_TARGETS: usize = 8;
 const CONFIRMED_PROVISION_STATE: i64 = 5;
@@ -33,7 +30,6 @@ pub struct WorkspaceChatTarget {
     participation_id: crate::WorkspaceParticipationId,
     runtime_session_id: AgentProfileRuntimeSessionId,
     conversation: String,
-    project: Option<WorkspaceProjectReference>,
 }
 
 impl WorkspaceChatTarget {
@@ -65,11 +61,6 @@ impl WorkspaceChatTarget {
     #[must_use]
     pub fn provider_conversation_id(&self) -> &str {
         &self.conversation
-    }
-
-    #[must_use]
-    pub const fn project(&self) -> Option<WorkspaceProjectReference> {
-        self.project
     }
 }
 
@@ -168,15 +159,11 @@ const WORKSPACE_CHAT_TARGETS_SQL: &str = "WITH confirmed AS (
                 p.profile_id,
                 wp.participation_id,
                 p.runtime_session_id,
-                p.provider_conversation_id,
-                route.project_id,
-                route.binding_revision
+                p.provider_conversation_id
          FROM ops_agent_provision_operations AS p
          JOIN ops_agent_requests AS r
            ON r.request_id=p.request_id
           AND r.workspace_id=?3
-         LEFT JOIN ops_agent_provision_project_routes AS route
-           ON route.operation_id=p.operation_id
          JOIN ops_workspace_participations AS wp
            ON wp.workspace_id=r.workspace_id
           AND wp.agent_profile_id=p.profile_id
@@ -281,23 +268,6 @@ fn decode_workspace_chat_target(
     let participation_id = row.get::<_, Vec<u8>>(3)?;
     let runtime_session_id = row.get::<_, Vec<u8>>(4)?;
     let provider_conversation_id = row.get::<_, String>(5)?;
-    let project_id = row.get::<_, Option<String>>(6)?;
-    let binding_revision = row.get::<_, Option<i64>>(7)?;
-    let project = match (project_id, binding_revision) {
-        (None, None) => None,
-        (Some(project_id), Some(binding_revision)) => {
-            let project_id = ChatGptProjectId::try_from(project_id.as_str())
-                .map_err(|_| OperationsError::Corrupt("workspace chat Project identity"))?;
-            let binding_revision = WorkspaceProjectBindingRevision::new(binding_revision)
-                .map_err(|_| OperationsError::Corrupt("workspace chat Project revision"))?;
-            Some(WorkspaceProjectReference::new(project_id, binding_revision))
-        }
-        _ => {
-            return Err(OperationsError::Corrupt(
-                "workspace chat Project route shape",
-            ));
-        }
-    };
     decode_workspace_chat_target_values(
         operation_id,
         activity_id,
@@ -305,7 +275,6 @@ fn decode_workspace_chat_target(
         participation_id,
         runtime_session_id,
         provider_conversation_id,
-        project,
     )
 }
 
@@ -316,7 +285,6 @@ fn decode_workspace_chat_target_values(
     participation_id: Vec<u8>,
     runtime_session_id: Vec<u8>,
     provider_conversation_id: String,
-    project: Option<WorkspaceProjectReference>,
 ) -> Result<WorkspaceChatTarget, OperationsError> {
     if provider_conversation_id.is_empty()
         || provider_conversation_id.len() > MAX_PROVIDER_CONVERSATION_ID_BYTES
@@ -338,7 +306,6 @@ fn decode_workspace_chat_target_values(
         )?))
         .map_err(|_| OperationsError::Corrupt("workspace chat Runtime Session identity"))?,
         conversation: provider_conversation_id,
-        project,
     })
 }
 

@@ -8,7 +8,7 @@ use forge_domain::{AuthenticatedPrincipal, TimestampMillis};
 use heterarchy_orchestration_operations::{
     AgentProvisionDispatch, AgentProvisionDispatchAction, AgentProvisionDispatchOutcome,
     AgentProvisionEffectKind, AgentProvisionFailureCode, AgentProvisionOperation,
-    AgentProvisionState, ChatGptProjectId,
+    AgentProvisionState,
 };
 use heterarchy_orchestration_sessions::{
     AgentProfileLifecycleState, AgentProfileProviderFamily, AgentProfileRuntimeSessionState,
@@ -235,40 +235,10 @@ impl OrchestrationRuntime {
         provider_conversation_id: &str,
         observed_at_ms: i64,
     ) -> Result<AgentProvisionOperation, RuntimeError> {
-        self.provider_worker_confirm_provision_with_project(
-            principal,
-            operation_id,
-            expected_revision,
-            provider_conversation_id,
-            None,
-            observed_at_ms,
-        )
-    }
-
-    /// Confirm an observed provider conversation and its actual visible Project.
-    /// Bound operations require an exact match to their frozen Project route;
-    /// legacy operations retain the absent field contract.
-    ///
-    /// # Errors
-    /// Rejects non-operator callers, changed targets, missing/mismatched Project
-    /// evidence, stale fences, invalid transitions, or catalog failures.
-    pub fn provider_worker_confirm_provision_with_project(
-        &self,
-        principal: AuthenticatedPrincipal,
-        operation_id: Uuid,
-        expected_revision: u64,
-        provider_conversation_id: &str,
-        provider_project_id: Option<&str>,
-        observed_at_ms: i64,
-    ) -> Result<AgentProvisionOperation, RuntimeError> {
         self.require_operator(principal)?;
         if operation_id.is_nil() || expected_revision == 0 {
             return Err(RuntimeError::InvalidInput);
         }
-        let provider_project_id = provider_project_id
-            .map(ChatGptProjectId::try_from)
-            .transpose()
-            .map_err(|_| RuntimeError::InvalidInput)?;
         let observed_at = timestamp(observed_at_ms)?;
 
         let operation = self
@@ -277,11 +247,6 @@ impl OrchestrationRuntime {
             .ok_or(RuntimeError::NotFound)?;
         if operation.uncertainty_retirement().is_some() {
             return Err(RuntimeError::Conflict);
-        }
-        match (operation.project(), provider_project_id) {
-            (None, None) => {}
-            (Some(expected), Some(actual)) if expected.project_id() == actual => {}
-            _ => return Err(RuntimeError::Conflict),
         }
         if operation.state() == AgentProvisionState::Confirmed {
             if operation.provider_conversation_id() == Some(provider_conversation_id) {
@@ -377,11 +342,7 @@ impl OrchestrationRuntime {
         let runtime = profiles
             .runtime_session(dispatch.runtime_session_id())?
             .ok_or(RuntimeError::NotFound)?;
-        if profile.lifecycle_state() != AgentProfileLifecycleState::Active
-            || catalog
-                .profile_deletion_barrier(dispatch.profile_id())?
-                .is_some()
-        {
+        if profile.lifecycle_state() != AgentProfileLifecycleState::Active {
             return Ok(false);
         }
         Ok(match dispatch.effect_kind() {

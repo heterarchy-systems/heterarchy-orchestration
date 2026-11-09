@@ -31,7 +31,6 @@ pub mod team_permanent_transfer;
 pub mod teams;
 pub mod temporary_dispatch;
 pub mod temporary_dispatch_lifecycle;
-pub mod workspace_project;
 pub use teams::{
     TeamCreatorWire, TeamGetQueryRequest, TeamGetQueryResponse, TeamListQueryRequest,
     TeamListQueryResponse, TeamMemberWire, TeamMutationWire, TeamWire,
@@ -39,7 +38,6 @@ pub use teams::{
 pub mod agent_request_admission;
 pub mod agent_requests;
 pub mod forge_reads;
-pub mod profile_deletion;
 pub mod profiles;
 pub mod provider_worker;
 pub mod provisioning_operations;
@@ -85,18 +83,6 @@ pub use approval::{
     ApprovalRequestGetResponse, ApprovalRequestWire, ApprovalSubmitRequest, ApprovalSubmitResponse,
     ListQueryResponse, PolicyQueryResponse, SetResponse,
 };
-
-/// Deserialize an optional field whose omission is legacy-compatible but whose
-/// explicit JSON `null` would be an invalid newly-admitted shape.
-pub(crate) fn deserialize_optional_non_null<'de, D, T>(
-    deserializer: D,
-) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    T::deserialize(deserializer).map(Some)
-}
 
 pub use crate::profile_sessions::{ProfileSessionBindRequest, ProfileSessionBindResponse};
 

@@ -26,7 +26,6 @@ use uuid::Uuid;
 use crate::BackendState;
 use crate::RealtimeEventKind;
 use crate::app_support::{LaneError, now_millis};
-use crate::wire::workspace_project::ProviderProjectReferenceWire;
 
 /// Provisioning routes; merge before the router takes its state.
 pub(crate) fn routes() -> Router<BackendState> {
@@ -477,8 +476,6 @@ struct ProvisionOperationWire {
     created: bool,
     revision: u64,
     changed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    project: Option<ProviderProjectReferenceWire>,
 }
 
 impl ProvisionOperationWire {
@@ -494,7 +491,6 @@ impl ProvisionOperationWire {
             created: operation.created,
             revision: operation.revision,
             changed: operation.changed,
-            project: operation.project.map(ProviderProjectReferenceWire::from),
         }
     }
 }

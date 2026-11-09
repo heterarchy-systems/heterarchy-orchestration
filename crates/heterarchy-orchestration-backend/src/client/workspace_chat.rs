@@ -8,7 +8,6 @@ use crate::wire::workspace_chat::{
     WorkspaceChatRecoverResponse, WorkspaceChatSendRequest, WorkspaceChatSendResponse,
     WorkspaceChatSnapshotWire, WorkspaceChatTargetFenceWire,
 };
-use crate::wire::workspace_project::valid_provider_project_reference;
 
 use super::membership::validate_scope;
 use super::{ClientError, OrchestrationHttpClient, ReadbackTarget, require_identity};
@@ -161,10 +160,6 @@ fn validate_fence(
         || fence.runtime_revision <= 0
         || fence.profile_name.trim().is_empty()
         || fence.provider_conversation_id.trim().is_empty()
-        || fence
-            .project
-            .as_ref()
-            .is_some_and(|project| !valid_provider_project_reference(project))
     {
         return Err(ClientError::InvalidRequest);
     }

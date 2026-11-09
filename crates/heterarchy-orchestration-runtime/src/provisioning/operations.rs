@@ -9,7 +9,7 @@ use heterarchy_orchestration_operations::{
     AgentProvisionEffectKind, AgentProvisionFailureCode, AgentProvisionOperation,
     AgentProvisionProviderFamily, AgentProvisionUncertaintyRetirement,
     AgentProvisionUncertaintyRetirementCommand, AgentProvisionUncertaintyRetirementTarget,
-    OperationsError, WorkspaceProjectReference,
+    OperationsError,
 };
 use uuid::Uuid;
 
@@ -33,7 +33,6 @@ pub struct ProvisionOperationFullSummary {
     pub updated_at_ms: i64,
     pub revision: u64,
     pub uncertainty_retirement: Option<AgentProvisionUncertaintyRetirement>,
-    pub project: Option<WorkspaceProjectReference>,
 }
 
 /// Cancellation result retaining whether this call committed a state change.
@@ -228,7 +227,6 @@ pub(super) fn full_summary(operation: &AgentProvisionOperation) -> ProvisionOper
         updated_at_ms: operation.updated_at().get(),
         revision: operation.revision(),
         uncertainty_retirement: operation.uncertainty_retirement().cloned(),
-        project: operation.project(),
     }
 }
 
@@ -265,7 +263,6 @@ mod tests {
         std::fs::create_dir_all(&root)?;
         let runtime = OrchestrationRuntime::open(&root)?;
         let workspace_id = Uuid::from_u128(0xA101);
-        crate::test_support::ensure_workspace_project_binding(&runtime, workspace_id, 1)?;
         let request_id = Uuid::from_u128(0xA105);
         runtime.submit_agent_request(AgentRequestSubmit {
             workspace_id,
@@ -373,7 +370,6 @@ mod tests {
                 .session
                 .session_id;
             let workspace_id = Uuid::from_u128(0xB004);
-            crate::test_support::ensure_workspace_project_binding(&runtime, workspace_id, 2)?;
             let request_id = Uuid::from_u128(0xB008);
             runtime.submit_agent_request(AgentRequestSubmit {
                 workspace_id,

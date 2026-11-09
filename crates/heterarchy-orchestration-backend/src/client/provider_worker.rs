@@ -23,7 +23,6 @@ use crate::wire::provider_worker::{
     ProviderProvisionDispatchWire, ProviderProvisionFailure, ProviderProvisionQueryResponse,
     ProviderProvisionSelectionObservation, ProviderProvisionTargetWire, ProviderWorkerActionWire,
 };
-use crate::wire::workspace_project::{valid_provider_project_id, valid_provider_project_reference};
 
 use super::provisioning_operations::valid_operation;
 use super::{ClientError, OrchestrationHttpClient, ReadbackTarget, require_identity};
@@ -36,7 +35,6 @@ const MAX_PROVIDER_MESSAGE_PAGE_SIZE: u32 = 32;
 struct ProvisionMutationIntent<'a> {
     operation_id: Uuid,
     expected_revision: u64,
-    provider_project_id: Option<&'a str>,
     outcome: ProvisionMutationOutcome<'a>,
 }
 
@@ -148,7 +146,6 @@ impl OrchestrationHttpClient {
             ProvisionMutationIntent {
                 operation_id: request.operation_id,
                 expected_revision: request.expected_revision,
-                provider_project_id: None,
                 outcome: ProvisionMutationOutcome::Unknown,
             },
         )
@@ -182,7 +179,6 @@ impl OrchestrationHttpClient {
             ProvisionMutationIntent {
                 operation_id: request.operation_id,
                 expected_revision: request.expected_revision,
-                provider_project_id: None,
                 outcome: ProvisionMutationOutcome::Failed(request.failure_code.as_deref()),
             },
         )
@@ -202,10 +198,6 @@ impl OrchestrationHttpClient {
         if request.operation_id.is_nil()
             || request.expected_revision == 0
             || !valid_provider_id(&request.provider_conversation_id)
-            || request
-                .provider_project_id
-                .as_deref()
-                .is_some_and(|id| !valid_provider_project_id(id))
         {
             return Err(ClientError::InvalidRequest);
         }
@@ -217,7 +209,6 @@ impl OrchestrationHttpClient {
             ProvisionMutationIntent {
                 operation_id: request.operation_id,
                 expected_revision: request.expected_revision,
-                provider_project_id: request.provider_project_id.as_deref(),
                 outcome: ProvisionMutationOutcome::Confirmed(&request.provider_conversation_id),
             },
         )
@@ -513,10 +504,6 @@ impl OrchestrationHttpClient {
         if request.message_id.is_nil()
             || request.expected_revision == 0
             || !valid_provider_id(&request.provider_conversation_id)
-            || request
-                .provider_project_id
-                .as_deref()
-                .is_some_and(|id| !valid_provider_project_id(id))
             || !valid_provider_id(&request.provider_turn_id)
             || !valid_message_body(&request.body)
         {
@@ -539,18 +526,8 @@ impl OrchestrationHttpClient {
             || response.message.revision < request.expected_revision
             || response.message.state != ChatProviderStateWire::Delivered
             || response.message.target.provider_conversation_id != request.provider_conversation_id
-            || response
-                .message
-                .target
-                .project
-                .as_ref()
-                .map(|project| project.project_id.as_str())
-                != request.provider_project_id.as_deref()
             || !response.message.receipt.as_ref().is_some_and(|receipt| {
-                receipt.provider_turn_id == request.provider_turn_id
-                    && receipt.body == request.body
-                    && receipt.provider_project_id.as_deref()
-                        == request.provider_project_id.as_deref()
+                receipt.provider_turn_id == request.provider_turn_id && receipt.body == request.body
             })
         {
             return Err(ClientError::UnknownOutcome { readback });
@@ -729,14 +706,7 @@ fn valid_provision_dispatch(dispatch: &ProviderProvisionDispatchWire) -> bool {
         && operation.runtime_session_id == Some(dispatch.target.runtime_session_id)
         && operation.effect_kind == dispatch.target.effect_kind
         && operation.provider_family == dispatch.target.provider_family
-        && operation.project == dispatch.target.project
         && valid_provider_provision_target(&dispatch.target)
-        && (dispatch.action != ProviderWorkerActionWire::Execute
-            || !matches!(
-                operation.effect_kind.as_str(),
-                "provision_new" | "wake_new_runtime"
-            )
-            || operation.project.is_some())
         && operation
             .provider_conversation_id
             .as_deref()
@@ -753,10 +723,6 @@ fn valid_provider_provision_target(target: &ProviderProvisionTargetWire) -> bool
             "wake_existing_runtime" | "wake_new_runtime" | "provision_new" | "reuse_ready_runtime"
         )
         && target.provider_family == "chatgpt"
-        && target
-            .project
-            .as_ref()
-            .is_none_or(valid_provider_project_reference)
         && target
             .provider_conversation_id
             .as_deref()
@@ -817,12 +783,6 @@ fn valid_provision_mutation(
         ProvisionMutationOutcome::Confirmed(conversation_id) => {
             response.operation.state == "confirmed"
                 && response.operation.provider_conversation_id.as_deref() == Some(conversation_id)
-                && response
-                    .operation
-                    .project
-                    .as_ref()
-                    .map(|project| project.project_id.as_str())
-                    == intent.provider_project_id
         }
     }
 }
@@ -963,13 +923,7 @@ fn valid_provider_message_outbox(message: &ProviderMessageOutboxWire) -> bool {
     let target = &message.target;
     let valid_receipt = match (message.state, message.receipt.as_ref()) {
         (ChatProviderStateWire::Delivered, Some(receipt)) => {
-            valid_provider_id(&receipt.provider_turn_id)
-                && valid_message_body(&receipt.body)
-                && receipt.provider_project_id.as_deref()
-                    == target
-                        .project
-                        .as_ref()
-                        .map(|project| project.project_id.as_str())
+            valid_provider_id(&receipt.provider_turn_id) && valid_message_body(&receipt.body)
         }
         (ChatProviderStateWire::Delivered, None) | (_, Some(_)) => false,
         (_, None) => true,
@@ -980,10 +934,6 @@ fn valid_provider_message_outbox(message: &ProviderMessageOutboxWire) -> bool {
         && !target.participation_id.is_nil()
         && !target.runtime_session_id.is_nil()
         && valid_provider_id(&target.provider_conversation_id)
-        && target
-            .project
-            .as_ref()
-            .is_none_or(valid_provider_project_reference)
         && message.queued_at_ms >= 0
         && message.last_dispatch_at_ms >= 0
         && message.updated_at_ms >= message.queued_at_ms
@@ -1016,10 +966,6 @@ fn valid_provider_message_target(target: &ProviderMessageTargetWire) -> bool {
         && !target.participation_id.is_nil()
         && !target.runtime_session_id.is_nil()
         && valid_provider_id(&target.provider_conversation_id)
-        && target
-            .project
-            .as_ref()
-            .is_none_or(valid_provider_project_reference)
 }
 
 fn valid_provider_id(value: &str) -> bool {
@@ -1079,7 +1025,6 @@ mod tests {
             updated_at_ms: 2,
             revision: 7,
             uncertainty_retirement: None,
-            project: None,
         }
     }
 
@@ -1093,7 +1038,6 @@ mod tests {
                 provider_family: crate::wire::provider_worker::ProviderWorkerFamilyWire::ChatGpt,
                 runtime_session_id: id(4),
                 provider_conversation_id: "conversation-1".to_owned(),
-                project: None,
             },
             state,
             queued_at_ms: 10,
@@ -1435,7 +1379,6 @@ mod tests {
             Some(crate::wire::provider_worker::ProviderDeliveryReceiptWire {
                 provider_turn_id: "turn".to_owned(),
                 body: "reply".to_owned(),
-                provider_project_id: None,
             });
         assert!(!valid_provider_message_outbox(&pending_with_receipt));
 

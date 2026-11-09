@@ -17,8 +17,7 @@ use std::fmt::Write as _;
 use uuid::Uuid;
 
 use crate::{
-    ChatGptProjectId, OperationalActor, OperationsCatalog, OperationsError,
-    WorkspaceParticipationId, WorkspaceProjectReference,
+    OperationalActor, OperationsCatalog, OperationsError, WorkspaceParticipationId,
     operational_actor::{ResolvedOperationalActor, resolve_actor},
 };
 
@@ -271,53 +270,6 @@ CREATE TABLE ops_provider_message_outbox (
 ";
 
 const OUTBOX_TARGET_INDEX: &str = "CREATE INDEX ops_provider_message_outbox_queue_idx ON ops_provider_message_outbox(state,last_dispatch_at_ms,queued_at_ms,message_id)";
-
-const PROVIDER_MESSAGE_PROJECT_ROUTES_SQL: &str = r"
-CREATE TABLE ops_provider_message_project_routes (
-    message_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_provider_message_outbox(message_id) CHECK(length(message_id)=16 AND message_id != zeroblob(16)),
-    project_id TEXT NOT NULL CHECK(length(CAST(project_id AS BLOB))=36 AND substr(project_id,1,4)='g-p-' AND substr(project_id,5,32) NOT GLOB '*[^0-9a-f]*'),
-    binding_revision INTEGER NOT NULL CHECK(binding_revision>=1)
-);
-";
-
-const PROVIDER_MESSAGE_PROJECT_RECEIPTS_SQL: &str = r"
-CREATE TABLE ops_provider_message_project_receipts (
-    message_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_provider_message_project_routes(message_id) CHECK(length(message_id)=16 AND message_id != zeroblob(16)),
-    provider_project_id TEXT NOT NULL CHECK(length(CAST(provider_project_id AS BLOB))=36 AND substr(provider_project_id,1,4)='g-p-' AND substr(provider_project_id,5,32) NOT GLOB '*[^0-9a-f]*')
-);
-";
-
-const PROJECT_ROUTE_NO_UPDATE_TRIGGER: &str = r"
-CREATE TRIGGER ops_provider_message_project_routes_no_update
-BEFORE UPDATE ON ops_provider_message_project_routes
-BEGIN
-    SELECT RAISE(ABORT, 'provider message Project routes are immutable');
-END;
-";
-
-const PROJECT_ROUTE_NO_DELETE_TRIGGER: &str = r"
-CREATE TRIGGER ops_provider_message_project_routes_no_delete
-BEFORE DELETE ON ops_provider_message_project_routes
-BEGIN
-    SELECT RAISE(ABORT, 'provider message Project routes are immutable');
-END;
-";
-
-const PROJECT_RECEIPT_NO_UPDATE_TRIGGER: &str = r"
-CREATE TRIGGER ops_provider_message_project_receipts_no_update
-BEFORE UPDATE ON ops_provider_message_project_receipts
-BEGIN
-    SELECT RAISE(ABORT, 'provider message Project receipts are immutable');
-END;
-";
-
-const PROJECT_RECEIPT_NO_DELETE_TRIGGER: &str = r"
-CREATE TRIGGER ops_provider_message_project_receipts_no_delete
-BEFORE DELETE ON ops_provider_message_project_receipts
-BEGIN
-    SELECT RAISE(ABORT, 'provider message Project receipts are immutable');
-END;
-";
 
 /// The public conversation channel.  Team/review channels are intentionally
 /// outside this bounded packet and can reuse the private channel primitives.
@@ -607,7 +559,6 @@ pub struct ProviderMessageTarget {
     provider_family: AgentProfileProviderFamily,
     runtime_session_id: AgentProfileRuntimeSessionId,
     provider_conversation_id: String,
-    project: Option<WorkspaceProjectReference>,
 }
 
 impl ProviderMessageTarget {
@@ -645,31 +596,6 @@ impl ProviderMessageTarget {
         runtime_session_id: AgentProfileRuntimeSessionId,
         provider_conversation_id: String,
     ) -> Result<Self, OperationsError> {
-        Self::new_with_project_route(
-            workspace_id,
-            profile_id,
-            participation_id,
-            provider_family,
-            runtime_session_id,
-            provider_conversation_id,
-            None,
-        )
-    }
-
-    /// Construct a target with its immutable Project route when the originating
-    /// provision operation was bound to a Workspace Project.
-    ///
-    /// # Errors
-    /// Rejects a nil Workspace or an empty/oversized provider conversation ID.
-    pub fn new_with_project_route(
-        workspace_id: WorkspaceId,
-        profile_id: AgentProfileId,
-        participation_id: WorkspaceParticipationId,
-        provider_family: AgentProfileProviderFamily,
-        runtime_session_id: AgentProfileRuntimeSessionId,
-        provider_conversation_id: String,
-        project: Option<WorkspaceProjectReference>,
-    ) -> Result<Self, OperationsError> {
         validate_workspace_id(workspace_id)?;
         validate_provider_id(&provider_conversation_id, "provider conversation identity")?;
         Ok(Self {
@@ -679,7 +605,6 @@ impl ProviderMessageTarget {
             provider_family,
             runtime_session_id,
             provider_conversation_id,
-            project,
         })
     }
 
@@ -711,11 +636,6 @@ impl ProviderMessageTarget {
     #[must_use]
     pub fn provider_conversation_id(&self) -> &str {
         &self.provider_conversation_id
-    }
-
-    #[must_use]
-    pub const fn project(&self) -> Option<WorkspaceProjectReference> {
-        self.project
     }
 }
 
@@ -888,7 +808,6 @@ pub struct ProviderMessageDeliveryReceipt {
     target: ProviderMessageTarget,
     provider_turn_id: String,
     body: String,
-    provider_project_id: Option<ChatGptProjectId>,
 }
 
 impl ProviderMessageDeliveryReceipt {
@@ -902,33 +821,12 @@ impl ProviderMessageDeliveryReceipt {
         provider_turn_id: String,
         body: String,
     ) -> Result<Self, OperationsError> {
-        Self::new_with_project(target, None, provider_turn_id, body)
-    }
-
-    /// Construct one receipt with the actual visible provider Project identity.
-    /// Bound routes require an exact match; legacy targets require omission.
-    ///
-    /// # Errors
-    /// Rejects missing/mismatched Project evidence, empty/oversized provider
-    /// turn IDs, and bodies outside the public message bound.
-    pub fn new_with_project(
-        target: ProviderMessageTarget,
-        provider_project_id: Option<ChatGptProjectId>,
-        provider_turn_id: String,
-        body: String,
-    ) -> Result<Self, OperationsError> {
-        match (target.project, provider_project_id) {
-            (None, None) => {}
-            (Some(expected), Some(actual)) if expected.project_id() == actual => {}
-            _ => return Err(OperationsError::Conflict("provider Project confirmation")),
-        }
         validate_provider_id(&provider_turn_id, "provider turn identity")?;
         validate_body(&body)?;
         Ok(Self {
             target,
             provider_turn_id,
             body,
-            provider_project_id,
         })
     }
 
@@ -945,11 +843,6 @@ impl ProviderMessageDeliveryReceipt {
     #[must_use]
     pub fn body(&self) -> &str {
         &self.body
-    }
-
-    #[must_use]
-    pub const fn provider_project_id(&self) -> Option<ChatGptProjectId> {
-        self.provider_project_id
     }
 }
 
@@ -1677,11 +1570,6 @@ impl OperationsCatalog {
             "provider receipt message missing",
         ))?;
         ensure_target(&existing.target, receipt.target())?;
-        match (existing.target.project, receipt.provider_project_id) {
-            (None, None) => {}
-            (Some(expected), Some(actual)) if expected.project_id() == actual => {}
-            _ => return Err(OperationsError::Conflict("provider Project receipt")),
-        }
         require_verified_workspace(&transaction, existing.target.workspace_id, self.destination)?;
         validate_recipient(&transaction, &existing.target)?;
         let message = load_message(&transaction, message_id)?
@@ -1718,12 +1606,6 @@ impl OperationsCatalog {
         )?;
         if changed != 1 {
             return Err(OperationsError::Conflict("provider receipt CAS"));
-        }
-        if let Some(provider_project_id) = receipt.provider_project_id {
-            transaction.execute(
-                "INSERT INTO ops_provider_message_project_receipts(message_id,provider_project_id) VALUES(?1,?2)",
-                params![message_id.as_bytes(), provider_project_id.to_string()],
-            )?;
         }
         let outbox = load_outbox(&transaction, message_id)?
             .ok_or(OperationsError::Corrupt("provider receipt readback"))?;
@@ -2090,7 +1972,6 @@ fn enqueue_provider_message_in_transaction(
             created: false,
         });
     }
-    crate::profile_deletion::require_profile_admission_open(transaction, target.profile_id)?;
     if message.context.node_id().is_some() != node_route_witness.is_some() {
         return Err(OperationsError::Conflict(
             "fresh node message requires exact route witness",
@@ -2131,16 +2012,6 @@ fn enqueue_provider_message_in_transaction(
             encoded_node_route,
         ],
     )?;
-    if let Some(project) = target.project {
-        transaction.execute(
-            "INSERT INTO ops_provider_message_project_routes(message_id,project_id,binding_revision) VALUES(?1,?2,?3)",
-            params![
-                message_id.as_bytes(),
-                project.project_id().to_string(),
-                project.binding_revision().as_i64(),
-            ],
-        )?;
-    }
     let outbox = load_outbox(transaction, message_id)?
         .ok_or(OperationsError::Corrupt("provider message queue insert"))?;
     Ok(ProviderMessageQueueOutcome {
@@ -2163,48 +2034,6 @@ pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)
     ];
     objects.extend(governance::schema_objects());
     objects
-}
-
-pub(crate) fn create_project_route_schema(connection: &Connection) -> Result<(), OperationsError> {
-    for (_, _, sql) in project_route_schema_objects() {
-        connection.execute_batch(sql)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn project_route_schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
-        (
-            "table",
-            "ops_provider_message_project_routes",
-            PROVIDER_MESSAGE_PROJECT_ROUTES_SQL,
-        ),
-        (
-            "table",
-            "ops_provider_message_project_receipts",
-            PROVIDER_MESSAGE_PROJECT_RECEIPTS_SQL,
-        ),
-        (
-            "trigger",
-            "ops_provider_message_project_routes_no_update",
-            PROJECT_ROUTE_NO_UPDATE_TRIGGER,
-        ),
-        (
-            "trigger",
-            "ops_provider_message_project_routes_no_delete",
-            PROJECT_ROUTE_NO_DELETE_TRIGGER,
-        ),
-        (
-            "trigger",
-            "ops_provider_message_project_receipts_no_update",
-            PROJECT_RECEIPT_NO_UPDATE_TRIGGER,
-        ),
-        (
-            "trigger",
-            "ops_provider_message_project_receipts_no_delete",
-            PROJECT_RECEIPT_NO_DELETE_TRIGGER,
-        ),
-    ]
 }
 
 /// Exact message, outbox and governance schema at catalog versions 32 through 35.
@@ -3263,9 +3092,6 @@ struct RawProviderMessageOutbox {
     provider_turn_id: Option<Vec<u8>>,
     provider_body: Option<Vec<u8>>,
     node_route_witness: Option<Vec<u8>>,
-    project_id: Option<String>,
-    project_binding_revision: Option<i64>,
-    provider_project_id: Option<String>,
 }
 
 fn decode_outbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderMessageOutbox> {
@@ -3285,9 +3111,6 @@ fn decode_outbox_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderMessag
         provider_turn_id: row.get(12)?,
         provider_body: row.get(13)?,
         node_route_witness: row.get(14)?,
-        project_id: row.get(15)?,
-        project_binding_revision: row.get(16)?,
-        provider_project_id: row.get(17)?,
     };
     decode_provider_message_outbox(&raw)
 }
@@ -3308,7 +3131,7 @@ fn decode_provider_message_outbox(
         )));
     }
     let revision = decode_counter(raw.revision, "provider revision")?;
-    let receipt = decode_provider_message_receipt(raw, &target, state)?;
+    let receipt = decode_provider_message_receipt(raw, &target)?;
     let node_route_witness = raw
         .node_route_witness
         .as_deref()
@@ -3352,10 +3175,6 @@ fn decode_provider_message_target(
     )?;
     validate_provider_id(&provider_conversation_id, "provider conversation identity")
         .map_err(to_sqlite_error)?;
-    let project = decode_provider_message_project_route(
-        raw.project_id.clone(),
-        raw.project_binding_revision,
-    )?;
     Ok(ProviderMessageTarget {
         workspace_id,
         profile_id,
@@ -3363,43 +3182,13 @@ fn decode_provider_message_target(
         provider_family,
         runtime_session_id,
         provider_conversation_id,
-        project,
     })
-}
-
-fn decode_provider_message_project_route(
-    project_id: Option<String>,
-    binding_revision: Option<i64>,
-) -> rusqlite::Result<Option<WorkspaceProjectReference>> {
-    match (project_id, binding_revision) {
-        (None, None) => Ok(None),
-        (Some(project_id), Some(binding_revision)) => {
-            let project_id =
-                ChatGptProjectId::try_from(project_id.as_str()).map_err(to_sqlite_error)?;
-            let binding_revision = crate::WorkspaceProjectBindingRevision::new(binding_revision)
-                .map_err(to_sqlite_error)?;
-            Ok(Some(WorkspaceProjectReference::new(
-                project_id,
-                binding_revision,
-            )))
-        }
-        _ => Err(to_sqlite_error(OperationsError::Corrupt(
-            "provider message Project route shape",
-        ))),
-    }
 }
 
 fn decode_provider_message_receipt(
     raw: &RawProviderMessageOutbox,
     target: &ProviderMessageTarget,
-    state: ProviderMessageState,
 ) -> rusqlite::Result<Option<ProviderMessageDeliveryReceipt>> {
-    let provider_project_id = raw
-        .provider_project_id
-        .as_deref()
-        .map(|value| ChatGptProjectId::try_from(value).map_err(to_sqlite_error))
-        .transpose()?;
-    validate_provider_project_receipt(state, target.project, provider_project_id)?;
     let provider_turn_id = raw
         .provider_turn_id
         .clone()
@@ -3419,32 +3208,9 @@ fn decode_provider_message_receipt(
             target: target.clone(),
             provider_turn_id,
             body,
-            provider_project_id,
         })),
         _ => Err(to_sqlite_error(OperationsError::Corrupt(
             "provider receipt shape",
-        ))),
-    }
-}
-
-fn validate_provider_project_receipt(
-    state: ProviderMessageState,
-    project: Option<WorkspaceProjectReference>,
-    provider_project_id: Option<ChatGptProjectId>,
-) -> rusqlite::Result<()> {
-    match (state, project, provider_project_id) {
-        (ProviderMessageState::Delivered, Some(expected), Some(actual))
-            if expected.project_id() == actual =>
-        {
-            Ok(())
-        }
-        (ProviderMessageState::Delivered, None, None) => Ok(()),
-        (ProviderMessageState::Delivered, _, _) => Err(to_sqlite_error(OperationsError::Corrupt(
-            "provider delivered Project receipt shape",
-        ))),
-        (_, _, None) => Ok(()),
-        _ => Err(to_sqlite_error(OperationsError::Corrupt(
-            "provider non-delivered Project receipt shape",
         ))),
     }
 }
@@ -3462,7 +3228,7 @@ fn load_outbox(
 ) -> Result<Option<ProviderMessageOutbox>, OperationsError> {
     Ok(connection
         .query_row(
-            "SELECT substr(outbox.message_id,1,17),substr(outbox.workspace_id,1,17),substr(outbox.recipient_profile_id,1,17),substr(outbox.recipient_participation_id,1,17),outbox.provider_family,substr(outbox.runtime_session_id,1,17),substr(CAST(outbox.provider_conversation_id AS BLOB),1,513),outbox.state,outbox.queued_at_ms,outbox.last_dispatch_at_ms,outbox.updated_at_ms,outbox.revision,substr(CAST(outbox.provider_turn_id AS BLOB),1,513),substr(CAST(outbox.provider_body AS BLOB),1,16385),substr(outbox.node_route_witness,1,2049),route.project_id,route.binding_revision,project_receipt.provider_project_id FROM ops_provider_message_outbox AS outbox LEFT JOIN ops_provider_message_project_routes AS route ON route.message_id=outbox.message_id LEFT JOIN ops_provider_message_project_receipts AS project_receipt ON project_receipt.message_id=outbox.message_id WHERE outbox.message_id=?1",
+            "SELECT substr(outbox.message_id,1,17),substr(outbox.workspace_id,1,17),substr(outbox.recipient_profile_id,1,17),substr(outbox.recipient_participation_id,1,17),outbox.provider_family,substr(outbox.runtime_session_id,1,17),substr(CAST(outbox.provider_conversation_id AS BLOB),1,513),outbox.state,outbox.queued_at_ms,outbox.last_dispatch_at_ms,outbox.updated_at_ms,outbox.revision,substr(CAST(outbox.provider_turn_id AS BLOB),1,513),substr(CAST(outbox.provider_body AS BLOB),1,16385),substr(outbox.node_route_witness,1,2049) FROM ops_provider_message_outbox AS outbox WHERE outbox.message_id=?1",
             params![message_id.as_bytes()],
             decode_outbox_row,
         )
@@ -3487,13 +3253,6 @@ fn eligible_outbox_message(
                     )
                 )
                 AND (?1 IS NULL OR candidate.message_id=?1)
-                AND (
-                    candidate.state!=1
-                    OR NOT EXISTS(
-                        SELECT 1 FROM ops_agent_profile_deletion_barriers AS barrier
-                         WHERE barrier.profile_id=candidate.recipient_profile_id
-                    )
-                )
                 AND (
                     candidate.state IN(2,5)
                     OR (
@@ -3621,11 +3380,7 @@ mod tests {
     use std::fs;
 
     use forge_domain::{AuthenticatedPrincipal, DirectTokenId, TimestampMillis, WorkspaceId};
-    use heterarchy_orchestration_sessions::{
-        AgentProfileCatalog, AgentProfileCreationOrigin, AgentProfileDeletionCommand,
-        AgentProfileDeletionIntent, AgentProfileId, AgentProfileProviderFamily,
-        AgentProfileRuntimeSessionId, CreateAgentProfile,
-    };
+    use heterarchy_orchestration_sessions::{AgentProfileId, AgentProfileRuntimeSessionId};
     use rusqlite::params;
 
     use super::*;
@@ -3712,36 +3467,6 @@ mod tests {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
-    }
-
-    fn begin_profile_deletion_intent(
-        profile_id: AgentProfileId,
-        path: &std::path::Path,
-        request_id: Uuid,
-        requested_at: i64,
-    ) -> Result<(AgentProfileCatalog, AgentProfileDeletionIntent), Box<dyn Error>> {
-        let mut profiles = AgentProfileCatalog::open(path)?;
-        let created = CreateAgentProfile::new(
-            profile_id,
-            Uuid::now_v7(),
-            "profile-delete-fixture".to_owned(),
-            "Profile deletion fixture".to_owned(),
-            AgentProfileProviderFamily::ChatGpt,
-            None,
-            None,
-            Vec::new(),
-            AgentProfileCreationOrigin::UserManual,
-            time(requested_at - 1)?,
-        )?;
-        let profile = profiles.create_profile(&created)?;
-        let command = AgentProfileDeletionCommand::new(
-            request_id,
-            profile_id,
-            profile.profile().revision(),
-            time(requested_at)?,
-        )?;
-        let intent = profiles.begin_profile_deletion(&command)?;
-        Ok((profiles, intent))
     }
 
     fn seed_node_recipient(
@@ -4305,89 +4030,6 @@ mod tests {
             .catalog
             .connection
             .execute_batch("ROLLBACK TO corrupt_node_route; RELEASE corrupt_node_route")?;
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn project_route_and_actual_confirmation_survive_outbox_readback() -> Result<(), Box<dyn Error>>
-    {
-        let mut fixture = fixture()?;
-        let project_id = ChatGptProjectId::try_from("g-p-6ad231f7ad7c8191bfc1d5ff782c171f")?;
-        let binding_revision = crate::WorkspaceProjectBindingRevision::new(3)?;
-        let target = ProviderMessageTarget::new_with_project_route(
-            fixture.workspace,
-            fixture.profile_id,
-            fixture.participation_id,
-            AgentProfileProviderFamily::ChatGpt,
-            fixture.runtime_session_id,
-            "conversation-1".to_owned(),
-            Some(WorkspaceProjectReference::new(project_id, binding_revision)),
-        )?;
-        let message_id = Uuid::from_u128(0xC1A0);
-        let queued = append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            message_id,
-            "project-routed question",
-            MessageContext::default(),
-            target.clone(),
-            10,
-        )?;
-        assert_eq!(queued.outbox().target().project(), target.project());
-
-        let dispatch = fixture
-            .catalog
-            .next_provider_message_dispatch(time(11)?)?
-            .ok_or("project message Execute permit")?;
-        let wrong_project = ChatGptProjectId::try_from("g-p-7ad231f7ad7c8191bfc1d5ff782c171f")?;
-        let message = fixture
-            .catalog
-            .workspace_message(message_id)?
-            .ok_or("project source message")?;
-        let body = provider_message_text(&message)?;
-        assert!(
-            ProviderMessageDeliveryReceipt::new_with_project(
-                target.clone(),
-                Some(wrong_project),
-                "turn-1".to_owned(),
-                body.clone(),
-            )
-            .is_err()
-        );
-        assert!(
-            ProviderMessageDeliveryReceipt::new_with_project(
-                target.clone(),
-                None,
-                "turn-1".to_owned(),
-                body.clone(),
-            )
-            .is_err()
-        );
-        let receipt = ProviderMessageDeliveryReceipt::new_with_project(
-            target,
-            Some(project_id),
-            "turn-1".to_owned(),
-            body,
-        )?;
-        let delivered = fixture.catalog.confirm_provider_message_delivery(
-            message_id,
-            dispatch.outbox().revision(),
-            &receipt,
-            time(12)?,
-        )?;
-        assert_eq!(delivered.state(), ProviderMessageState::Delivered);
-        let readback = fixture
-            .catalog
-            .provider_message_outbox(message_id)?
-            .ok_or("project outbox readback")?;
-        assert_eq!(readback.target().project(), receipt.target().project());
-        assert_eq!(
-            readback
-                .receipt()
-                .map(super::ProviderMessageDeliveryReceipt::provider_project_id),
-            Some(Some(project_id))
-        );
         fixture.cleanup()?;
         Ok(())
     }
@@ -5412,112 +5054,6 @@ mod tests {
         assert_eq!(after.revision(), 3);
         drop(upgraded);
         fs::remove_file(path)?;
-        Ok(())
-    }
-
-    #[test]
-    fn profile_barrier_blocks_new_messages_but_keeps_replay_inspect_and_other_profiles_moving()
-    -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let profile_path =
-            std::env::temp_dir().join(format!("operational-messages-profile-{}", Uuid::now_v7()));
-        let a_message = Uuid::from_u128(0xC801);
-        let target_a = fixture.target()?;
-        let _queued_a = append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            a_message,
-            "profile A",
-            MessageContext::default(),
-            target_a.clone(),
-            10,
-        )?;
-        let admitted_a = fixture
-            .catalog
-            .provider_message_dispatch(a_message, time(11)?)?
-            .ok_or("Profile A Execute missing")?;
-        let (profiles, intent) = begin_profile_deletion_intent(
-            fixture.profile_id,
-            &profile_path,
-            Uuid::from_u128(0xC802),
-            20,
-        )?;
-        let _ = fixture.catalog.begin_profile_deletion_barrier(&intent)?;
-
-        let replay = fixture
-            .catalog
-            .enqueue_provider_message(EnqueueProviderMessageCommand {
-                message_id: a_message,
-                target: target_a.clone(),
-                queued_at: time(10)?,
-                node_route_witness: None,
-            })?;
-        assert!(!replay.created());
-        assert_eq!(replay.outbox(), admitted_a.outbox());
-        let inspect_a = fixture
-            .catalog
-            .provider_message_dispatch(a_message, time(21)?)?
-            .ok_or("admitted Profile A effect was not inspectable")?;
-        assert_eq!(
-            inspect_a.dispatch().action(),
-            ProviderMessageDispatchAction::Inspect
-        );
-
-        let blocked_message = Uuid::from_u128(0xC803);
-        assert!(
-            append_and_enqueue(
-                &mut fixture.catalog,
-                fixture.workspace,
-                blocked_message,
-                "must remain unappended",
-                MessageContext::default(),
-                target_a,
-                22,
-            )
-            .is_err()
-        );
-        assert!(
-            fixture
-                .catalog
-                .workspace_message(blocked_message)?
-                .is_none()
-        );
-
-        let (profile_b, participation_b, runtime_b) = insert_recipient(&fixture)?;
-        let target_b = ProviderMessageTarget::new(
-            fixture.workspace,
-            profile_b,
-            participation_b,
-            runtime_b,
-            "conversation-b".to_owned(),
-        )?;
-        let b_message = Uuid::from_u128(0xC804);
-        append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            b_message,
-            "Profile B",
-            MessageContext::default(),
-            target_b,
-            23,
-        )?;
-        let next = fixture
-            .catalog
-            .next_provider_message_dispatch(time(24)?)?
-            .ok_or("unrelated Profile B provider message did not continue")?;
-        assert_eq!(next.outbox().message_id(), b_message);
-        assert_eq!(
-            next.dispatch().action(),
-            ProviderMessageDispatchAction::Execute
-        );
-        let counts = fixture
-            .catalog
-            .profile_deletion_in_flight_counts(fixture.profile_id)?;
-        assert_eq!(counts.pending_provider_messages(), 1);
-
-        drop(profiles);
-        fs::remove_file(profile_path)?;
-        fixture.cleanup()?;
         Ok(())
     }
 

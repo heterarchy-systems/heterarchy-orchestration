@@ -10,7 +10,6 @@ use crate::wire::provisioning_operations::{
     ProvisionOperationQueryResponse, ProvisionOperationUncertaintyRetirementRequest,
     ProvisionOperationUncertaintyRetirementResponse, ProvisionOperationWire,
 };
-use crate::wire::workspace_project::valid_provider_project_reference;
 
 use super::{ClientError, OrchestrationHttpClient, ReadbackTarget, require_identity};
 
@@ -221,10 +220,6 @@ pub(super) fn valid_operation(operation: &ProvisionOperationWire) -> bool {
         && operation.updated_at_ms >= operation.prepared_at_ms
         && operation.revision > 0
         && valid_uncertainty_retirement(operation)
-        && operation
-            .project
-            .as_ref()
-            .is_none_or(valid_provider_project_reference)
 }
 
 fn valid_uncertainty_retirement(operation: &ProvisionOperationWire) -> bool {
@@ -399,7 +394,6 @@ mod tests {
             updated_at_ms: 10,
             revision,
             uncertainty_retirement: None,
-            project: None,
         }
     }
 

@@ -19,7 +19,6 @@ use crate::wire::provisioning_operations::{
     ProvisionOperationUncertaintyRetirementResponse, ProvisionOperationUncertaintyRetirementWire,
     ProvisionOperationWire,
 };
-use crate::wire::workspace_project::ProviderProjectReferenceWire;
 use crate::{BackendState, RealtimeEventKind, ScopedMutationAuthority};
 
 pub(super) fn routes() -> Router<BackendState> {
@@ -208,6 +207,5 @@ pub(super) fn operation_wire(value: &ProvisionOperationFullSummary) -> Provision
             .uncertainty_retirement
             .as_ref()
             .map(ProvisionOperationUncertaintyRetirementWire::from),
-        project: value.project.map(ProviderProjectReferenceWire::from),
     }
 }

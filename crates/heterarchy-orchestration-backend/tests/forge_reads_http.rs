@@ -15,23 +15,14 @@ use std::time::Duration;
 use forge_control::WorkspaceLocator;
 use forge_domain::{LocationId, LocationRevision};
 use heterarchy_orchestration_auth::{
-    McpTokenCatalog, McpTokenClient, McpTokenIssueRequest, McpTokenLabel, McpTokenService,
-    McpTokenWorker,
+    McpTokenCatalog, McpTokenIssueRequest, McpTokenLabel, McpTokenService, McpTokenWorker,
 };
 use heterarchy_orchestration_backend::client::{ClientError, OrchestrationHttpClient, ServiceCode};
 use heterarchy_orchestration_backend::{
-    forge_source_config, serve_with_runtime,
-    wire::{
-        WorkspaceQueryScope,
-        workspace_project::{
-            WorkspaceProjectBindingReceiptWire, WorkspaceProjectConfigureRequest,
-            WorkspaceProjectQueryRequest, WorkspaceProjectReadbackRequest,
-        },
-    },
+    forge_source_config, serve_with_runtime, wire::WorkspaceQueryScope,
 };
 use heterarchy_orchestration_runtime::{OrchestrationRuntime, access::OperatorPolicy};
 use serde_json::{Value, json};
-use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -256,8 +247,6 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
 
 struct Fixture {
     client: OrchestrationHttpClient,
-    token_client: McpTokenClient,
-    operator_principal: forge_domain::AuthenticatedPrincipal,
     /// Keeps the auth workers alive for the whole fixture lifetime; their
     /// concrete types are intentionally erased.
     #[expect(dead_code)]
@@ -266,10 +255,11 @@ struct Fixture {
     stub_task: tokio::task::JoinHandle<()>,
     operator_bearer: hyper::header::HeaderValue,
     foreign_bearer: hyper::header::HeaderValue,
-    forge_address: SocketAddr,
     server: tokio::task::JoinHandle<Result<(), heterarchy_orchestration_backend::BackendError>>,
     cancellation: CancellationToken,
+    #[expect(dead_code)]
     broker_cluster: broker_cluster::Cluster,
+    #[expect(dead_code)]
     dir: tempfile_guard::TempDir,
 }
 
@@ -391,53 +381,16 @@ async fn start_fixture_with_scopes(
 
     Ok(Fixture {
         client,
-        token_client,
-        operator_principal,
         keepalive: workers,
         stub,
         stub_task,
         operator_bearer,
         foreign_bearer,
-        forge_address,
         server,
         cancellation,
         broker_cluster,
         dir,
     })
-}
-
-async fn restart_fixture_with_no_static_scopes(
-    fixture: &mut Fixture,
-    scope: WorkspaceQueryScope,
-) -> Result<(), Box<dyn std::error::Error>> {
-    fixture.cancellation.cancel();
-    let _ = (&mut fixture.server).await;
-    fixture.stub.set(
-        "workspace.resolve",
-        json!({"workspace_id": scope.workspace_id, "workspace_revision": scope.workspace_revision}),
-    );
-    let authority = write_source_config_with_scopes(&fixture.dir.0, fixture.forge_address, &[])?;
-    let runtime_root = fixture.dir.0.join("runtime");
-    let runtime = OrchestrationRuntime::open_with_broker_cluster(
-        runtime_root.as_path(),
-        fixture.broker_cluster.orchestration_config()?,
-    )?
-    .with_operator_policy(OperatorPolicy::new(vec![fixture.operator_principal])?);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    drop(listener);
-    let cancellation = CancellationToken::new();
-    fixture.server = tokio::spawn(serve_with_runtime(
-        std::sync::Arc::new(runtime),
-        address,
-        fixture.token_client.clone(),
-        Some(authority),
-        cancellation.clone(),
-    ));
-    fixture.cancellation = cancellation;
-    fixture.client = OrchestrationHttpClient::new(address, Duration::from_secs(5))?;
-    wait_for_backend(&fixture.client, &fixture.operator_bearer).await?;
-    Ok(())
 }
 
 async fn wait_for_backend(
@@ -1305,316 +1258,6 @@ async fn forge_reads_parity_denial_and_source_loss_over_real_http() -> TestResul
         "unexpected global source-loss outcome: {global_lost:?}"
     );
 
-    fixture.cancellation.cancel();
-    let _ = fixture.server.await;
-    Ok(())
-}
-
-async fn configure_project_binding_at_scope(
-    fixture: &Fixture,
-    scope: WorkspaceQueryScope,
-) -> TestResult<(
-    WorkspaceProjectConfigureRequest,
-    WorkspaceProjectBindingReceiptWire,
-)> {
-    let query = WorkspaceProjectQueryRequest {
-        scope: scope.clone(),
-    };
-    assert!(
-        fixture
-            .client
-            .workspace_project_binding(&fixture.operator_bearer, &query)
-            .await?
-            .binding
-            .is_none()
-    );
-    assert!(matches!(
-        fixture
-            .client
-            .workspace_project_binding(&fixture.foreign_bearer, &query)
-            .await,
-        Err(ClientError::Rejected {
-            status: 403,
-            code: ServiceCode::Forbidden
-        })
-    ));
-
-    let request = WorkspaceProjectConfigureRequest {
-        request_id: Uuid::from_u128(0xA80B),
-        scope: scope.clone(),
-        expected_revision: None,
-        project_id: "g-p-6ad231f7ad7c8191bfc1d5ff782c171f".to_owned(),
-    };
-    let configured = fixture
-        .client
-        .configure_workspace_project(&fixture.operator_bearer, &request)
-        .await?;
-    assert_eq!(configured.current_binding.revision, "1");
-    assert_eq!(configured.receipt.project_id, request.project_id);
-    assert!(configured.work_authorized);
-    assert!(!configured.replayed);
-    let replay = fixture
-        .client
-        .configure_workspace_project(&fixture.operator_bearer, &request)
-        .await?;
-    assert!(replay.replayed);
-    assert!(replay.work_authorized);
-    assert_eq!(replay.receipt, configured.receipt);
-    Ok((request, configured.receipt))
-}
-
-async fn verify_original_receipt_after_scope_update(
-    fixture: &mut Fixture,
-    request: &WorkspaceProjectConfigureRequest,
-    receipt: &WorkspaceProjectBindingReceiptWire,
-    original_scope: WorkspaceQueryScope,
-    current_scope: WorkspaceQueryScope,
-    captured_before: usize,
-) -> TestResult {
-    restart_fixture_with_no_static_scopes(fixture, current_scope.clone()).await?;
-    let readback = fixture
-        .client
-        .workspace_project_binding_readback(
-            &fixture.operator_bearer,
-            &WorkspaceProjectReadbackRequest {
-                request_id: request.request_id,
-                scope: original_scope,
-            },
-        )
-        .await?;
-    assert!(!readback.retry_authorized);
-    assert_eq!(readback.receipt.as_ref(), Some(receipt));
-
-    let proof = fixture
-        .stub
-        .captured()
-        .into_iter()
-        .rev()
-        .find(|(path, _)| path.ends_with("/workspace.resolve"))
-        .ok_or("current Workspace proof missing")?;
-    assert_eq!(
-        proof.1["payload"]["expected_revision"],
-        current_scope.location_revision
-    );
-    assert_eq!(proof.1["payload"]["relative_root"], "demo-ws-v2");
-
-    let mut foreign_scope = current_scope.clone();
-    foreign_scope.workspace_id = Uuid::from_u128(0xA80C);
-    let foreign_readback = fixture
-        .client
-        .workspace_project_binding_readback(
-            &fixture.operator_bearer,
-            &WorkspaceProjectReadbackRequest {
-                request_id: request.request_id,
-                scope: foreign_scope.clone(),
-            },
-        )
-        .await;
-    assert!(matches!(
-        foreign_readback,
-        Err(ClientError::Rejected {
-            status: 409,
-            code: ServiceCode::Conflict
-        })
-    ));
-    assert!(matches!(
-        fixture
-            .client
-            .workspace_project_binding(
-                &fixture.operator_bearer,
-                &WorkspaceProjectQueryRequest {
-                    scope: foreign_scope,
-                },
-            )
-            .await,
-        Err(ClientError::Rejected {
-            status: 409,
-            code: ServiceCode::Conflict
-        })
-    ));
-    assert_eq!(fixture.stub.captured().len(), captured_before + 7);
-    Ok(())
-}
-
-#[tokio::test]
-async fn workspace_project_binding_is_session_free_operator_scoped_and_readback_only() -> TestResult
-{
-    let mut fixture = start_fixture().await?;
-    let original_scope = request_scope()?;
-    assert!(
-        fixture
-            .client
-            .workspace_project_binding(
-                &fixture.operator_bearer,
-                &WorkspaceProjectQueryRequest {
-                    scope: original_scope.clone(),
-                },
-            )
-            .await?
-            .work_authorized
-    );
-    let captured_before = fixture.stub.captured().len();
-    let (request, receipt) =
-        configure_project_binding_at_scope(&fixture, original_scope.clone()).await?;
-    let changed_locator = WorkspaceLocator::new(
-        LocationId::from_uuid(LOCATION_ID),
-        LocationRevision::new(6)?,
-        std::path::Path::new("demo-ws-v2"),
-    )?;
-    let current_scope = WorkspaceQueryScope {
-        workspace_id: original_scope.workspace_id,
-        workspace_revision: 9,
-        location_id: LOCATION_ID,
-        location_revision: 6,
-        locator: changed_locator.encode(),
-    };
-    fixture.stub.set(
-        "workspace.resolve",
-        json!({"workspace_id": current_scope.workspace_id, "workspace_revision": current_scope.workspace_revision}),
-    );
-    let current_request = WorkspaceProjectConfigureRequest {
-        request_id: Uuid::from_u128(0xA80D),
-        scope: current_scope.clone(),
-        expected_revision: Some("1".to_owned()),
-        project_id: "g-p-7ad231f7ad7c8191bfc1d5ff782c171f".to_owned(),
-    };
-    let current_binding = fixture
-        .client
-        .configure_workspace_project(&fixture.operator_bearer, &current_request)
-        .await?;
-    assert_eq!(current_binding.current_binding.revision, "2");
-    assert!(current_binding.work_authorized);
-    verify_original_receipt_after_scope_update(
-        &mut fixture,
-        &request,
-        &receipt,
-        original_scope,
-        current_scope,
-        captured_before,
-    )
-    .await?;
-
-    fixture.stub_task.abort();
-    fixture.cancellation.cancel();
-    let _ = fixture.server.await;
-    Ok(())
-}
-
-#[tokio::test]
-#[allow(clippy::too_many_lines)]
-async fn workspace_project_query_is_read_only_and_dynamic_enrollment_reloads() -> TestResult {
-    let mut fixture = start_fixture_with_scopes(Vec::new()).await?;
-    let scope = request_scope()?;
-    let query = WorkspaceProjectQueryRequest {
-        scope: scope.clone(),
-    };
-    let un_enrolled = fixture
-        .client
-        .workspace_project_binding(&fixture.operator_bearer, &query)
-        .await?;
-    assert!(un_enrolled.binding.is_none());
-    assert!(!un_enrolled.work_authorized);
-    assert!(
-        !fixture
-            .client
-            .workspace_project_binding(&fixture.operator_bearer, &query)
-            .await?
-            .work_authorized
-    );
-
-    let source_requests = fixture.stub.captured().len();
-    assert!(matches!(
-        fixture
-            .client
-            .workspace_project_binding(&fixture.foreign_bearer, &query)
-            .await,
-        Err(ClientError::Rejected {
-            status: 403,
-            code: ServiceCode::Forbidden
-        })
-    ));
-    assert!(matches!(
-        fixture
-            .client
-            .configure_workspace_project(
-                &fixture.foreign_bearer,
-                &WorkspaceProjectConfigureRequest {
-                    request_id: Uuid::from_u128(0xA80E),
-                    scope: scope.clone(),
-                    expected_revision: None,
-                    project_id: "g-p-6ad231f7ad7c8191bfc1d5ff782c171f".to_owned(),
-                },
-            )
-            .await,
-        Err(ClientError::Rejected {
-            status: 403,
-            code: ServiceCode::Forbidden
-        })
-    ));
-    assert_eq!(fixture.stub.captured().len(), source_requests);
-
-    let mut stale_scope = scope.clone();
-    stale_scope.workspace_revision += 1;
-    assert!(matches!(
-        fixture
-            .client
-            .configure_workspace_project(
-                &fixture.operator_bearer,
-                &WorkspaceProjectConfigureRequest {
-                    request_id: Uuid::from_u128(0xA80F),
-                    scope: stale_scope,
-                    expected_revision: None,
-                    project_id: "g-p-6ad231f7ad7c8191bfc1d5ff782c171f".to_owned(),
-                },
-            )
-            .await,
-        Err(ClientError::Rejected {
-            status: 409,
-            code: ServiceCode::Conflict
-        })
-    ));
-    let after_stale = fixture
-        .client
-        .workspace_project_binding(&fixture.operator_bearer, &query)
-        .await?;
-    assert!(after_stale.binding.is_none());
-    assert!(!after_stale.work_authorized);
-
-    let (request, receipt) = configure_project_binding_at_scope(&fixture, scope.clone()).await?;
-    assert!(
-        fixture
-            .client
-            .workspace_project_binding(&fixture.operator_bearer, &query)
-            .await?
-            .work_authorized
-    );
-    restart_fixture_with_no_static_scopes(&mut fixture, scope.clone()).await?;
-    let restarted = fixture
-        .client
-        .workspace_project_binding(&fixture.operator_bearer, &query)
-        .await?;
-    assert!(restarted.work_authorized);
-    assert_eq!(
-        restarted
-            .binding
-            .as_ref()
-            .map(|binding| binding.revision.as_str()),
-        Some("1")
-    );
-    let readback = fixture
-        .client
-        .workspace_project_binding_readback(
-            &fixture.operator_bearer,
-            &WorkspaceProjectReadbackRequest {
-                request_id: request.request_id,
-                scope,
-            },
-        )
-        .await?;
-    assert!(!readback.retry_authorized);
-    assert_eq!(readback.receipt.as_ref(), Some(&receipt));
-
-    fixture.stub_task.abort();
     fixture.cancellation.cancel();
     let _ = fixture.server.await;
     Ok(())

@@ -4,9 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use super::{
-    WorkspaceQueryScope, deserialize_optional_non_null,
+    WorkspaceQueryScope,
     node_chat::{ChatEntryWire, ChatReceiptWire},
-    workspace_project::ProviderProjectReferenceWire,
 };
 
 /// Exact Profile-direct query. Node and leadership selectors are absent.
@@ -43,12 +42,6 @@ pub struct WorkspaceChatTargetFenceWire {
     pub runtime_session_id: Uuid,
     pub runtime_revision: i64,
     pub provider_conversation_id: String,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_optional_non_null"
-    )]
-    pub project: Option<ProviderProjectReferenceWire>,
 }
 
 /// Immutable direct message intent.

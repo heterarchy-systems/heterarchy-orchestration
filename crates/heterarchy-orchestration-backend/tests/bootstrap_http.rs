@@ -56,9 +56,7 @@ use heterarchy_orchestration_auth::{
     McpTokenCatalog, McpTokenIssueRequest, McpTokenLabel, McpTokenRuntime, McpTokenService,
     McpTokenWorker,
 };
-use heterarchy_orchestration_backend::client::{
-    ClientError, OrchestrationHttpClient, ReadbackTarget,
-};
+use heterarchy_orchestration_backend::client::{ClientError, OrchestrationHttpClient};
 use heterarchy_orchestration_backend::forge_commands::ForgeCommandHttpClient;
 use heterarchy_orchestration_backend::forge_source::ForgeSourceHttpClient;
 use heterarchy_orchestration_backend::internal_session::{
@@ -96,9 +94,6 @@ use heterarchy_orchestration_backend::wire::team_commands::{
     TeamCreateV2Request, TeamMutationReaderV2Wire, TeamMutationV2Response, TeamRosterMemberRequest,
 };
 use heterarchy_orchestration_backend::wire::teams::{TeamGetQueryRequest, TeamListQueryRequest};
-use heterarchy_orchestration_backend::wire::workspace_project::{
-    WorkspaceProjectConfigureRequest, WorkspaceProjectQueryRequest, WorkspaceProjectReadbackRequest,
-};
 use heterarchy_orchestration_backend::wire::{
     AgentProfileCreateRequest, AgentSessionOpenRequest, ProfileSessionBindRequest,
     WorkspaceQueryScope,
@@ -630,7 +625,6 @@ async fn register_and_admit_operator_member(
     )
     .await?;
     assert!(leadership_revision > 0);
-    configure_fixture_workspace_project(flow.client, flow.bearer, flow.scope).await?;
     assert_durable_agent_request(
         flow.client,
         flow.bearer,
@@ -646,93 +640,6 @@ async fn register_and_admit_operator_member(
         profile_id,
         revision: session.revision,
     })
-}
-
-/// Supply the required provider route in this isolated fixture before admission
-/// prepares a new `RuntimeSession`; this does not dispatch provider work.
-async fn configure_fixture_workspace_project(
-    client: &OrchestrationHttpClient,
-    bearer: &HeaderValue,
-    scope: &WorkspaceQueryScope,
-) -> TestResult {
-    const PROJECT_ID: &str = "g-p-6ad231f7ad7c8191bfc1d5ff782c171f";
-
-    let query = WorkspaceProjectQueryRequest {
-        scope: scope.clone(),
-    };
-    let before = client.workspace_project_binding(bearer, &query).await?;
-    assert!(
-        before.binding.is_none(),
-        "isolated bootstrap Workspace unexpectedly already has a Project binding"
-    );
-
-    let request = WorkspaceProjectConfigureRequest {
-        request_id: Uuid::now_v7(),
-        scope: scope.clone(),
-        expected_revision: None,
-        project_id: PROJECT_ID.to_owned(),
-    };
-    let readback_request = WorkspaceProjectReadbackRequest {
-        request_id: request.request_id,
-        scope: request.scope.clone(),
-    };
-    let response_receipt = match client.configure_workspace_project(bearer, &request).await {
-        Ok(response) => {
-            assert!(!response.replayed);
-            assert!(response.work_authorized);
-            assert_eq!(response.current_binding.project_id, request.project_id);
-            Some(response.receipt)
-        }
-        Err(
-            error @ (ClientError::ReadbackRequired { .. } | ClientError::UnknownOutcome { .. }),
-        ) => {
-            let readback_matches = match &error {
-                ClientError::ReadbackRequired {
-                    readback: ReadbackTarget::WorkspaceProjectBinding(original),
-                }
-                | ClientError::UnknownOutcome {
-                    readback: ReadbackTarget::WorkspaceProjectBinding(original),
-                } => original.as_ref() == &readback_request,
-                _ => false,
-            };
-            if !readback_matches {
-                return Err(format!(
-                    "Workspace Project configure has a foreign readback target: {error:?}"
-                )
-                .into());
-            }
-            None
-        }
-        Err(error) => {
-            return Err(format!("Workspace Project configure failed: {error:?}").into());
-        }
-    };
-
-    let readback = client
-        .workspace_project_binding_readback(bearer, &readback_request)
-        .await?;
-    let receipt = readback
-        .receipt
-        .ok_or("exact Workspace Project configure receipt missing")?;
-    assert_eq!(receipt.request_id, request.request_id);
-    assert_eq!(receipt.scope, request.scope);
-    assert_eq!(receipt.expected_revision, request.expected_revision);
-    assert_eq!(receipt.project_id, request.project_id);
-    assert_eq!(receipt.binding.workspace_id, request.scope.workspace_id);
-    assert_eq!(receipt.binding.project_id, request.project_id);
-    assert_eq!(receipt.binding.revision, "1");
-    if let Some(response_receipt) = response_receipt {
-        assert_eq!(receipt, response_receipt);
-    }
-
-    let current = client.workspace_project_binding(bearer, &query).await?;
-    let binding = current
-        .binding
-        .ok_or("configured Workspace Project binding is not current")?;
-    assert!(current.work_authorized);
-    assert_eq!(binding.project_id, request.project_id);
-    assert_eq!(binding.revision, receipt.binding.revision);
-    Ok(())
 }
 
 async fn assert_team_flow_and_rebind_second_session(
