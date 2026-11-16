@@ -5,23 +5,24 @@
 //! mutable catalog or rebuilding Orchestration domain decisions in transport
 //! code.
 
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use forge_domain::{TimestampMillis, WorkspaceId};
 use heterarchy_orchestration_operations::{
     AdmissionIssuerConfig, AgentRequestRecord, AgentRequestState, ApprovalPolicyView,
-    BrokerClusterConfig, BrokerOwnerAuthority, BrokerOwnerAuthorityError, BrokerOwnerObservation,
-    BrokerOwnerRecoveryApproval, BrokerOwnerRecoveryError, ConfigureAdmissionIssuerCommand,
-    OperationsCatalog, OperationsError, TeamRecord, TeamState,
+    BrokerClusterConfig, BrokerClusterProbe, BrokerOwnerAuthority, BrokerOwnerAuthorityError,
+    BrokerOwnerObservation, BrokerOwnerRecoveryApproval, BrokerOwnerRecoveryError,
+    ConfigureAdmissionIssuerCommand, OperationsCatalog, OperationsError, TeamRecord, TeamState,
     TrustedLegacyBindingRejectionDeployment,
 };
 use heterarchy_orchestration_sessions::{
     AgentProfile, AgentProfileCatalog, AgentProfileCreationOrigin, AgentProfileError,
     AgentProfileId, AgentProfileLifecycleState, AgentProfileProviderFamily, AgentProfileRevision,
-    CreateAgentProfile,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore};
@@ -29,9 +30,11 @@ use uuid::Uuid;
 
 pub mod access;
 pub mod approval;
+pub mod autonomy_loop;
 pub mod chat;
 pub mod coordination;
 pub mod departure;
+pub mod execution_supervisor;
 pub mod imports;
 pub mod leadership;
 pub mod member_list;
@@ -44,12 +47,11 @@ pub mod node_assignment_admission;
 pub mod node_team;
 pub mod participation;
 pub mod profiles;
-pub mod provider_chat;
-pub mod provider_worker;
 pub mod provisioning;
 pub mod reviewer_participation;
 pub mod reviewer_qualification_rule;
 pub mod sessions;
+pub mod swarm_dispatcher;
 pub mod team_expansion;
 pub mod team_permanent_transfer;
 pub mod teams;
@@ -57,10 +59,26 @@ pub mod temporary_dispatch;
 pub mod temporary_dispatch_lifecycle;
 pub mod work_credit;
 
+pub use autonomy_loop::ExecutionPreferenceSummary;
+pub use swarm_dispatcher::{
+    AutonomyOutboxApplyReport, AutonomyOutboxBridge, AutonomyOutboxFactKind,
+    AutonomySettlementOutboxFact, DAG_SETTLED_KIND, DEFAULT_MAX_MEMBER_TURNS,
+    DEFAULT_MAX_PING_PONG_STREAK, DEFAULT_MAX_STALL_NUDGES, DEFAULT_QUOTA_EXIT_CODE,
+    DEFAULT_STALL_GRACE_MS, DEFAULT_SWARM_SUPERVISION_SLOTS, MAX_SPAWNING_PARENT_SLOTS,
+    MIN_LEAF_HEADROOM_SLOTS, SWARM_SETTLED_KIND, SwarmBootRecoveryReport, SwarmBottleneckReason,
+    SwarmDispatchError, SwarmDispatchTurnRequest, SwarmDispatchedTurnOutcome,
+    SwarmExitClassification, SwarmExitPolicy, SwarmLivelockReason, SwarmModelSwitchOutcome,
+    SwarmModelSwitchTarget, SwarmMonitorActionReport, SwarmMonitorDiagnosis,
+    SwarmRuntimeDispatcher, SwarmSettledFact, SwarmSettledProjectionReceipt, SwarmStallMonitor,
+    SwarmStallMonitorPolicy, SwarmTurnDisposition, SwitchSwarmMemberModelCommand,
+    member_requires_parent_spawner_slot,
+};
+
 const OPERATIONS_CATALOG_FILE_NAME: &str = "agent-operations.sqlite3";
 const PROFILE_CATALOG_FILE_NAME: &str = "agent-profiles.sqlite3";
 const DESTINATION_FILE_NAME: &str = "agent-operations-destination";
 const BROKER_OWNER_FILE_NAME: &str = "broker-command-session.json";
+const BROKER_CONFIG_FILE_NAME: &str = "broker-config.json";
 const DESTINATION_BYTES: usize = 16;
 
 /// A shared catalog capability that also retains the data-root owner lease.
@@ -99,9 +117,10 @@ impl<T> CatalogHandle<T> {
 pub struct OrchestrationRuntime {
     data_root: PathBuf,
     destination_id: Uuid,
+    process_instance_id: Uuid,
     operations: Arc<Mutex<OperationsCatalog>>,
     profiles: Arc<Mutex<AgentProfileCatalog>>,
-    broker_cluster: BrokerClusterConfig,
+    broker_cluster: RwLock<BrokerClusterConfig>,
     broker_owner: AsyncMutex<BrokerOwnerAuthority>,
     governance_tick: Arc<Semaphore>,
     // Held from before catalog initialization until this runtime is dropped.
@@ -193,6 +212,7 @@ pub struct AgentProfileSummary {
     pub preferred_model: Option<String>,
     pub preferred_reasoning: Option<String>,
     pub base_capabilities: Vec<String>,
+    pub execution_preference: Option<ExecutionPreferenceSummary>,
     pub lifecycle_state: &'static str,
     pub creation_origin: &'static str,
     pub created_at_ms: i64,
@@ -208,7 +228,10 @@ impl OrchestrationRuntime {
     /// Rejects relative, missing, symlinked, corrupt or otherwise unavailable
     /// roots and catalog identities.
     pub fn open(data_root: &Path) -> Result<Self, RuntimeError> {
-        Self::open_with_broker_cluster(data_root, BrokerClusterConfig::default())
+        validate_data_root(data_root)?;
+        let broker_cluster =
+            load_persisted_broker_cluster(data_root)?.unwrap_or_else(BrokerClusterConfig::default);
+        Self::open_with_broker_cluster(data_root, broker_cluster)
     }
 
     /// Open the canonical Orchestration durable state with one explicit Broker
@@ -224,6 +247,7 @@ impl OrchestrationRuntime {
         validate_data_root(data_root)?;
         let owner_lock = acquire_owner_lock(data_root)?;
         let destination_id = read_or_create_destination(&data_root.join(DESTINATION_FILE_NAME))?;
+        let process_instance_id = Uuid::now_v7();
         let operations = OperationsCatalog::open(
             &data_root.join(OPERATIONS_CATALOG_FILE_NAME),
             destination_id,
@@ -233,16 +257,17 @@ impl OrchestrationRuntime {
         let broker_owner = BrokerOwnerAuthority::new_with_cluster(
             data_root.join(BROKER_OWNER_FILE_NAME),
             destination_id,
-            Uuid::now_v7(),
+            process_instance_id,
             broker_cluster,
         )
         .map_err(RuntimeError::BrokerOwner)?;
         Ok(Self {
             data_root: data_root.to_path_buf(),
             destination_id,
+            process_instance_id,
             operations: Arc::new(Mutex::new(operations)),
             profiles: Arc::new(Mutex::new(profiles)),
-            broker_cluster,
+            broker_cluster: RwLock::new(broker_cluster),
             broker_owner: AsyncMutex::new(broker_owner),
             governance_tick: Arc::new(Semaphore::new(1)),
             owner_lock: Arc::new(Mutex::new(owner_lock)),
@@ -305,8 +330,50 @@ impl OrchestrationRuntime {
         }
     }
 
-    pub const fn broker_cluster_config(&self) -> BrokerClusterConfig {
-        self.broker_cluster
+    pub fn broker_cluster_config(&self) -> BrokerClusterConfig {
+        *self
+            .broker_cluster
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Persist and apply a new Broker routing configuration (single-node or
+    /// three-node cluster) at runtime, then return an observational probe.
+    ///
+    /// # Errors
+    /// Rejects invalid Broker addresses or I/O failures while persisting the
+    /// configuration.
+    pub async fn reconfigure_broker_cluster(
+        &self,
+        broker_cluster: BrokerClusterConfig,
+    ) -> Result<BrokerClusterProbe, RuntimeError> {
+        let mut owner_guard = self.broker_owner.lock().await;
+        let next_owner = BrokerOwnerAuthority::new_with_cluster(
+            self.data_root.join(BROKER_OWNER_FILE_NAME),
+            self.destination_id,
+            self.process_instance_id,
+            broker_cluster,
+        )
+        .map_err(RuntimeError::BrokerOwner)?;
+        persist_broker_cluster(&self.data_root, broker_cluster)?;
+        *owner_guard = next_owner;
+        *self
+            .broker_cluster
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = broker_cluster;
+        drop(owner_guard);
+        self.probe_broker_cluster().await
+    }
+
+    /// Perform an observational health probe of the currently configured Broker.
+    ///
+    /// # Errors
+    /// Returns [`RuntimeError::CatalogOwnerPoisoned`] if the blocking task panics.
+    pub async fn probe_broker_cluster(&self) -> Result<BrokerClusterProbe, RuntimeError> {
+        let cluster = self.broker_cluster_config();
+        tokio::task::spawn_blocking(move || cluster.probe())
+            .await
+            .map_err(|_| RuntimeError::CatalogOwnerPoisoned)
     }
 
     #[must_use]
@@ -488,32 +555,7 @@ impl OrchestrationRuntime {
         &self,
         command: AgentProfileCreateCommand,
     ) -> Result<AgentProfileCreateSummary, RuntimeError> {
-        let profile_id =
-            AgentProfileId::from_uuid(Uuid::now_v7()).map_err(profile_error_to_runtime)?;
-        let created_at = TimestampMillis::new(command.created_at_ms)
-            .map_err(AgentProfileError::from)
-            .map_err(profile_error_to_runtime)?;
-        let create = CreateAgentProfile::new(
-            profile_id,
-            command.request_id,
-            command.stable_name,
-            command.display_name,
-            AgentProfileProviderFamily::ChatGpt,
-            command.preferred_model,
-            command.preferred_reasoning,
-            command.base_capabilities,
-            AgentProfileCreationOrigin::UserManual,
-            created_at,
-        )
-        .map_err(profile_error_to_runtime)?;
-        let mut catalog = self.profile_catalog_guard()?;
-        let outcome = catalog
-            .create_profile(&create)
-            .map_err(profile_error_to_runtime)?;
-        Ok(AgentProfileCreateSummary {
-            profile: agent_profile_summary(outcome.profile()),
-            created: outcome.created(),
-        })
+        self.create_agent_profile_with_execution_preference(command, None)
     }
 
     /// Retire one Agent Profile from fresh admission.
@@ -654,11 +696,15 @@ fn agent_profile_summary(profile: &AgentProfile) -> AgentProfileSummary {
         stable_name: profile.stable_name().to_owned(),
         display_name: profile.display_name().to_owned(),
         provider_family: match profile.provider_family() {
+            AgentProfileProviderFamily::Unbound => "unbound",
             AgentProfileProviderFamily::ChatGpt => "chatgpt",
         },
         preferred_model: profile.preferred_model().map(str::to_owned),
         preferred_reasoning: profile.preferred_reasoning().map(str::to_owned),
         base_capabilities: profile.base_capabilities().to_vec(),
+        execution_preference: profile
+            .execution_preference()
+            .map(ExecutionPreferenceSummary::from_domain),
         lifecycle_state: match profile.lifecycle_state() {
             AgentProfileLifecycleState::Active => "active",
             AgentProfileLifecycleState::Disabled => "disabled",
@@ -708,6 +754,9 @@ pub enum RuntimeError {
     InvalidInput,
     #[error("Orchestration operation is forbidden for this principal")]
     Forbidden,
+    /// The external provider execution path was retired; no effect was attempted.
+    #[error("provider execution is retired")]
+    ProviderRetired,
     #[error("Orchestration logical session catalog failed")]
     SessionCatalog(#[source] heterarchy_orchestration_sessions::AgentSessionCatalogError),
     #[error("Orchestration state conflict")]
@@ -744,6 +793,7 @@ impl From<OperationsError> for RuntimeError {
             OperationsError::Bounds(_) => Self::InvalidInput,
             OperationsError::Conflict(_) => Self::Conflict,
             OperationsError::ResyncRequired(_) => Self::ResyncRequired,
+            OperationsError::ProviderRetired => Self::ProviderRetired,
             other => Self::persistence(other),
         }
     }
@@ -890,6 +940,75 @@ fn write_destination_once(path: &Path, destination: Uuid) -> Result<(), RuntimeE
     }
 }
 
+fn load_persisted_broker_cluster(
+    data_root: &Path,
+) -> Result<Option<BrokerClusterConfig>, RuntimeError> {
+    let path = data_root.join(BROKER_CONFIG_FILE_NAME);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(RuntimeError::Io(error)),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(RuntimeError::InvalidInput);
+    }
+    let text = std::fs::read_to_string(&path).map_err(RuntimeError::Io)?;
+    let mut pairs = Vec::with_capacity(3);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let (broker_raw, ops_raw) = trimmed.split_once('@').ok_or(RuntimeError::InvalidInput)?;
+        let broker_addr = broker_raw
+            .trim()
+            .parse::<SocketAddr>()
+            .map_err(|_| RuntimeError::InvalidInput)?;
+        let ops_addr = ops_raw
+            .trim()
+            .parse::<SocketAddr>()
+            .map_err(|_| RuntimeError::InvalidInput)?;
+        pairs.push((broker_addr, ops_addr));
+    }
+    let pairs: [(SocketAddr, SocketAddr); 3] =
+        pairs.try_into().map_err(|_| RuntimeError::InvalidInput)?;
+    let cluster = BrokerClusterConfig::from_node_pairs(pairs)
+        .map_err(|_| RuntimeError::BrokerOwner(BrokerOwnerAuthorityError::InvalidConfiguration))?;
+    Ok(Some(cluster))
+}
+
+fn persist_broker_cluster(
+    data_root: &Path,
+    broker_cluster: BrokerClusterConfig,
+) -> Result<(), RuntimeError> {
+    let path = data_root.join(BROKER_CONFIG_FILE_NAME);
+    let temp_path = data_root.join(format!(
+        ".{BROKER_CONFIG_FILE_NAME}.{}.tmp",
+        Uuid::now_v7().as_simple()
+    ));
+    let mut encoded = String::from("# heterarchy-orchestration broker-config v1\n");
+    for node in &broker_cluster.nodes {
+        writeln!(
+            &mut encoded,
+            "{}@{}",
+            node.broker_address, node.operations_address
+        )
+        .map_err(|_| RuntimeError::InvalidInput)?;
+    }
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(RuntimeError::Io)?;
+        file.write_all(encoded.as_bytes())
+            .map_err(RuntimeError::Io)?;
+        file.sync_all().map_err(RuntimeError::Io)?;
+    }
+    std::fs::rename(&temp_path, &path).map_err(RuntimeError::Io)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,6 +1037,32 @@ mod tests {
         let reopened = OrchestrationRuntime::open(&root)?;
         reopened.probe()?;
         drop(reopened);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_node_broker_config_reconfigures_and_persists_across_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("orchestration-broker-reconfig-{}", Uuid::now_v7()));
+        std::fs::create_dir(&root)?;
+        let runtime = OrchestrationRuntime::open(&root)?;
+        assert!(!runtime.broker_cluster_config().is_single_node());
+
+        let single_addr: SocketAddr = "127.0.0.1:18899".parse()?;
+        let single_config = BrokerClusterConfig::from_broker_address(single_addr)?;
+        assert!(single_config.is_single_node());
+
+        let _probe = runtime.reconfigure_broker_cluster(single_config).await?;
+        assert_eq!(runtime.broker_cluster_config(), single_config);
+        drop(runtime);
+
+        let reopened = OrchestrationRuntime::open(&root)?;
+        assert_eq!(reopened.broker_cluster_config(), single_config);
+        assert!(reopened.broker_cluster_config().is_single_node());
+        drop(reopened);
+
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

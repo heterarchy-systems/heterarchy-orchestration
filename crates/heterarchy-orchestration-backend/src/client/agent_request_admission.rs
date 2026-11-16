@@ -1,4 +1,4 @@
-//! Bounded client for complete `AgentRequest` admission and immutable readback.
+//! Bounded client for exact historical `AgentRequest` admission readback.
 
 use hyper::Method;
 use hyper::header::HeaderValue;
@@ -8,12 +8,12 @@ use crate::wire::agent_request_admission::{
     AdmissionRequestStateWire, AdmissionResolutionKindWire, AdmissionResolutionSlotWire,
     AdmissionResolutionWire, AgentRequestAdmissionReceiptWire,
     AgentRequestAdmissionRecoverResponse, AgentRequestAdmissionRequest,
-    AgentRequestAdmissionResponse, AgentRequestAdmissionSnapshotWire,
+    AgentRequestAdmissionSnapshotWire,
 };
 use crate::wire::leadership::WorkspaceQueryScope;
 use crate::wire::provisioning_operations::ProvisionOperationWire;
 
-use super::{ClientError, OrchestrationHttpClient, ReadbackTarget, require_identity};
+use super::{ClientError, OrchestrationHttpClient, require_identity};
 
 const MAX_LOCATOR_BYTES: usize = 4_096;
 const MAX_OBJECTIVE_BYTES: usize = 4_096;
@@ -22,40 +22,7 @@ const MAX_REASON_BYTES: usize = 2_048;
 const MAX_REQUESTED_SLOTS: u8 = 4;
 
 impl OrchestrationHttpClient {
-    /// Run complete scoped admission using the caller's original credential.
-    ///
-    /// The mutation is never retried automatically. Any uncertain or malformed
-    /// successful reply carries the full immutable request for exact readback.
-    ///
-    /// # Errors
-    /// Rejects invalid request values, returns typed service rejection, or
-    /// retains exact request identity when the durable outcome is uncertain.
-    pub async fn admit_agent_request(
-        &self,
-        authorization: &HeaderValue,
-        request: &AgentRequestAdmissionRequest,
-    ) -> Result<AgentRequestAdmissionResponse, ClientError> {
-        validate_request(request)?;
-        let readback = ReadbackTarget::AgentRequestAdmission(Box::new(request.clone()));
-        let response: AgentRequestAdmissionResponse = self
-            .call(
-                authorization,
-                Method::POST,
-                format!(
-                    "/internal/v1/workspaces/{}/agent-requests/admit",
-                    request.scope.workspace_id
-                ),
-                Some(request),
-                Some(readback.clone()),
-            )
-            .await?;
-        if !valid_admission_response(&response, request) {
-            return Err(ClientError::UnknownOutcome { readback });
-        }
-        Ok(response)
-    }
-
-    /// Read partial or complete evidence for the exact immutable request.
+    /// Read the exact immutable request and its stored resolution/operation history.
     ///
     /// Recovery is read-only and never grants permission to retry admission or
     /// release a provider effect.
@@ -120,24 +87,6 @@ fn validate_scope(scope: &WorkspaceQueryScope) -> Result<(), ClientError> {
         return Err(ClientError::InvalidRequest);
     }
     Ok(())
-}
-
-fn valid_admission_response(
-    response: &AgentRequestAdmissionResponse,
-    request: &AgentRequestAdmissionRequest,
-) -> bool {
-    &response.request == request
-        && valid_receipt(
-            &response.receipt,
-            request.request_id,
-            request.scope.workspace_id,
-            request.activity_id,
-            request.count,
-        )
-        && matches!(
-            response.receipt.state,
-            AdmissionRequestStateWire::ResolutionReserved | AdmissionRequestStateWire::Fulfilled
-        )
 }
 
 fn valid_recovery_response(
@@ -361,9 +310,6 @@ mod tests {
         AdmissionEffectScopeWire, AdmissionIndependenceWire, AdmissionResolutionKindWire,
         AgentRequestAdmissionRequest,
     };
-    use hyper::header::HeaderValue;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     fn scope() -> WorkspaceQueryScope {
         WorkspaceQueryScope {
             workspace_id: Uuid::from_u128(1),
@@ -404,26 +350,6 @@ mod tests {
             created: false,
             revision,
         }
-    }
-
-    #[test]
-    fn successful_admission_requires_exact_echo_and_a_committed_stage() {
-        let request = request();
-        let reserved = AgentRequestAdmissionResponse {
-            request: request.clone(),
-            receipt: receipt(AdmissionRequestStateWire::ResolutionReserved, 2),
-        };
-        assert!(valid_admission_response(&reserved, &request));
-
-        let pending = AgentRequestAdmissionResponse {
-            request: request.clone(),
-            receipt: receipt(AdmissionRequestStateWire::ResolutionPending, 1),
-        };
-        assert!(!valid_admission_response(&pending, &request));
-
-        let mut changed_echo = reserved;
-        changed_echo.request.reason.push('!');
-        assert!(!valid_admission_response(&changed_echo, &request));
     }
 
     #[test]
@@ -500,47 +426,5 @@ mod tests {
             &resolution,
             request.request_id
         ));
-    }
-
-    #[tokio::test]
-    async fn malformed_admission_reply_keeps_exact_readback_and_original_authorization()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let client = OrchestrationHttpClient::new(
-            listener.local_addr()?,
-            std::time::Duration::from_secs(1),
-        )?;
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await?;
-            let mut request_bytes = [0_u8; 8_192];
-            let count = socket.read(&mut request_bytes).await?;
-            let request_text =
-                String::from_utf8_lossy(&request_bytes[..count]).to_ascii_lowercase();
-            let body = b"{}";
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            socket.write_all(headers.as_bytes()).await?;
-            socket.write_all(body).await?;
-            Ok::<_, std::io::Error>(request_text)
-        });
-        let request = request();
-        let result = client
-            .admit_agent_request(
-                &HeaderValue::from_static("Bearer original-caller"),
-                &request,
-            )
-            .await;
-        assert_eq!(
-            result,
-            Err(ClientError::UnknownOutcome {
-                readback: ReadbackTarget::AgentRequestAdmission(Box::new(request.clone()))
-            })
-        );
-        let received = server.await??;
-        assert!(received.contains("post /internal/v1/workspaces/00000000-0000-0000-0000-000000000001/agent-requests/admit http/1.1"));
-        assert!(received.contains("authorization: bearer original-caller"));
-        Ok(())
     }
 }

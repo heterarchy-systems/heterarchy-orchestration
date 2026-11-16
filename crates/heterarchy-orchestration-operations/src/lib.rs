@@ -8,12 +8,16 @@ mod agent_request;
 mod agent_request_resolution;
 mod approval;
 mod approval_versions;
+pub mod assignment_execution_snapshot;
 mod broker_cluster;
 mod broker_fence;
 mod broker_owner;
 mod catalog;
 mod coordination;
 mod cursor;
+mod dag_settlement {
+    pub(crate) mod sql;
+}
 mod departure;
 mod departure_observation;
 mod effect_binding;
@@ -31,8 +35,10 @@ mod mission_evaluation;
 pub mod mission_evidence;
 mod node_team;
 mod operational_actor;
+pub mod reviewer_assignment;
 pub mod reviewer_participation;
 pub mod reviewer_qualification_rule;
+pub mod swarm;
 pub mod team_expansion;
 pub use team_expansion::{
     LegacySlotRecoveryCommand, LegacySlotRecoveryIntent, LegacySlotRecoveryReceipt,
@@ -58,6 +64,8 @@ mod registration;
 mod registration_profile;
 mod replacement_registration;
 mod session_replacement;
+mod sqlite_codecs;
+pub(crate) mod static_sql;
 mod team_assignment;
 mod team_create_source;
 mod team_permanent_transfer;
@@ -68,6 +76,7 @@ mod work_credit_subject;
 mod workspace_chat_target;
 mod workspace_participation;
 mod workspace_project;
+pub mod workspace_scope_registry;
 
 pub use team_permanent_transfer::{
     ActorSnapshot, TeamPermanentTransferBindingOrigin, TeamPermanentTransferConsentCommand,
@@ -142,6 +151,13 @@ pub use approval::{
     MAX_APPROVAL_POLICY_JSON_BYTES, MAX_REQUEST_TTL_MS, MIN_ADMISSION_TTL_MS, MIN_REQUEST_TTL_MS,
     SetApprovalPolicyCommand, SubmitApprovalCommand,
 };
+pub use assignment_execution_snapshot::{
+    AssignmentExecutionSnapshot, AssignmentExecutionSnapshotParts, ExecutionAttemptKey,
+    ExecutionPermissions, ExecutionTimeouts, ForgeWorktreeRef, LaunchLedgerRecord,
+    LaunchLedgerState, LaunchUnknownReason, LeaseRef, MAX_EXECUTION_TIMEOUT_MS,
+    MAX_PROCESS_OWNERSHIP_FIELD_BYTES, MAX_WORKTREE_PATH_BYTES, McpGrant, ProcessOwnershipIdentity,
+    SnapshotValidationError,
+};
 pub use binding_observation::{
     BindingActivationObservation, BindingRejectionObservation, BindingReservationObservation,
 };
@@ -152,7 +168,8 @@ pub use binding_rejection::{
     ResolveBindingRejectionAttempt, TrustedLegacyBindingRejectionDeployment,
 };
 pub use broker_cluster::{
-    BrokerClusterConfig, BrokerClusterNodeProbe, BrokerClusterProbe, DEFAULT_BROKER_CLUSTER_TIMEOUT,
+    BrokerClusterConfig, BrokerClusterNodeProbe, BrokerClusterProbe, BrokerClusterProbeError,
+    DEFAULT_BROKER_CLUSTER_TIMEOUT,
 };
 pub use broker_fence::{
     BrokerAuthorityFence, BrokerFenceConfig, DEFAULT_FENCE_TIMEOUT, LeadershipFenceError,
@@ -161,7 +178,7 @@ pub use broker_owner::{
     BrokerOwnerAuthority, BrokerOwnerAuthorityError, BrokerOwnerLease, BrokerOwnerObservation,
     BrokerOwnerRecoveryApproval, BrokerOwnerRecoveryError,
 };
-pub use catalog::{ImportPhase, ImportProgress, OperationsCatalog};
+pub use catalog::{ImportPhase, ImportProgress, OPERATIONS_SCHEMA_VERSION, OperationsCatalog};
 pub use coordination::{
     LogicalActivityJoinedEvent, LogicalActivityParticipant, LogicalActivitySnapshot,
 };
@@ -176,8 +193,10 @@ pub use effect_binding::{
 pub use effect_fact::{
     AssignmentOfferProjectionRow, AssignmentOfferedFact, AssignmentReviewProjectionRow,
     AssignmentReviewedFact, AssignmentSubmitProjectionRow, AssignmentSubmittedFact,
-    ChangeSetProjectionRow, ChangeSetTerminalFact, EffectFactConsumerProgress, EffectFactInput,
-    ExecutionTerminalFact, ExecutionTerminalProjectionRow,
+    ChangeSetProjectionRow, ChangeSetTerminalFact, DagSettledFact, DagSettledProjectionRow,
+    DagSettlementGovernanceLink, EffectFactConsumerProgress, EffectFactInput,
+    ExecutionTerminalFact, ExecutionTerminalProjectionRow, NodeLifecycleAuthority,
+    WorkspaceDagSettlementAuthority,
 };
 pub use election_subject::ElectionSubjectCutoverReceipt;
 pub use events::{InboxReceiptRecord, PresenceRecord};
@@ -239,6 +258,35 @@ pub use operational_messages::{
     validate_chat_text,
 };
 pub use presence::{LogicalPresenceSnapshot, LogicalPresenceTarget, LogicalPresenceTouch};
+pub use reviewer_assignment::{
+    ExecutionAuthorIdentity, MAX_REVIEW_VERDICT_RATIONALE_BYTES, MAX_REVIEWER_CANDIDATE_POOL,
+    RecordedReviewVerdict, ReviewVerdictCommand, ReviewVerdictOutcome, ReviewerAssignmentCommand,
+    ReviewerAssignmentError, ReviewerAssignmentRecord, ReviewerCandidateIdentity,
+    WorkCorrelationKey,
+};
+pub use swarm::{
+    AddSwarmMemberCommand, BreakSwarmLivelockCommand, BreakSwarmLivelockOutcome,
+    ClaimSwarmWakeupCommand, CompleteSwarmTurnCommand, CreateSwarmChannelCommand,
+    CreateSwarmRunCommand, CreateSwarmVerificationPanelCommand, FailOrSuspendSwarmTurnCommand,
+    KillSwarmMemberCommand, MAX_SNAPSHOT_COALESCED_BYTES, MAX_SNAPSHOT_COALESCED_MESSAGES,
+    MAX_SWARM_BOARD_PAGE_SIZE, MAX_SWARM_CHANNEL_NAME_BYTES, MAX_SWARM_CHANNEL_PURPOSE_BYTES,
+    MAX_SWARM_CHANNELS_PER_RUN, MAX_SWARM_MEMBERS_PER_RUN, MAX_SWARM_ROSTER_NAME_BYTES,
+    MAX_SWARM_SPAWN_DEPTH, MAX_SWARM_TITLE_BYTES, MAX_SWARM_TOTAL_TURNS,
+    MAX_SWARM_VERDICT_RATIONALE_BYTES, MAX_SWARM_VERIFIER_QUORUM, PostSwarmMessageCommand,
+    ReadSwarmBoardQuery, RecordSwarmConvergenceCommand, RecordSwarmStallNudgeCommand,
+    RecordSwarmVerdictCommand, SWARM_MAIN_CHANNEL_NAME, SettleStandaloneSwarmCommand,
+    SubscribeSwarmChannelCommand, SwarmBoardMessage, SwarmBoardPage, SwarmChannelRecord,
+    SwarmCommitOid, SwarmConvergenceGateOutcome, SwarmDoorbellReason, SwarmDoorbellRecord,
+    SwarmError, SwarmMemberIdentity, SwarmMemberRecord, SwarmMemberState, SwarmMessageAuthor,
+    SwarmPanelSeatKind, SwarmPanelSeatRecord, SwarmPostMessageOutcome, SwarmRoleKind, SwarmRunMode,
+    SwarmRunRecord, SwarmRunSnapshot, SwarmRunState, SwarmStallNudgeOutcome,
+    SwarmTurnFailureDisposition, SwarmTurnOutput, SwarmVerdictRecord, SwarmVerificationPanelRecord,
+    SwarmWakeupBatch, SwarmWorkspaceMode, SwitchSwarmMemberProfileCommand,
+};
+pub use workspace_scope_registry::{
+    RegisteredWorkspaceScopeRecord, ScopeRegistrationCommand, ScopeResolutionError,
+    ScopeUnregisterCommand,
+};
 // Existing typed source witnesses used by public registration contracts.
 // Composition passes the original Forge receipt; no parallel witness type is
 // introduced and Runtime gains no Forge persistence/effect dependency.
@@ -448,6 +496,8 @@ pub enum OperationsError {
     Corrupt(&'static str),
     #[error("operations request conflicts: {0}")]
     Conflict(&'static str),
+    #[error("ChatGPT provider operations are retired")]
+    ProviderRetired,
     #[error("operations projection requires source resynchronization: {0}")]
     ResyncRequired(&'static str),
     #[error("operations bound exceeded: {0}")]

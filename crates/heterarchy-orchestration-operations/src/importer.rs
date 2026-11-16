@@ -13,6 +13,30 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+const ABORT_DELETE_WORKSPACE_TABLES_SQL: [crate::static_sql::StaticSql; 7] = [
+    crate::static_sql::StaticSql::dml("DELETE FROM ops_inbox WHERE workspace_id=?1"),
+    crate::static_sql::StaticSql::dml("DELETE FROM ops_presence WHERE workspace_id=?1"),
+    crate::static_sql::StaticSql::dml("DELETE FROM ops_events WHERE workspace_id=?1"),
+    crate::static_sql::StaticSql::dml(
+        "DELETE FROM ops_activity_coordinators WHERE workspace_id=?1",
+    ),
+    crate::static_sql::StaticSql::dml(
+        "DELETE FROM ops_import_effect_references WHERE workspace_id=?1",
+    ),
+    crate::static_sql::StaticSql::dml("DELETE FROM ops_members WHERE workspace_id=?1"),
+    crate::static_sql::StaticSql::dml("DELETE FROM ops_scopes WHERE workspace_id=?1"),
+];
+
+const VERIFY_COUNT_WORKSPACE_TABLES_SQL: [crate::static_sql::StaticSql; 5] = [
+    crate::static_sql::StaticSql::dml("SELECT COUNT(*) FROM ops_members WHERE workspace_id=?1"),
+    crate::static_sql::StaticSql::dml("SELECT COUNT(*) FROM ops_presence WHERE workspace_id=?1"),
+    crate::static_sql::StaticSql::dml("SELECT COUNT(*) FROM ops_events WHERE workspace_id=?1"),
+    crate::static_sql::StaticSql::dml("SELECT COUNT(*) FROM ops_inbox WHERE workspace_id=?1"),
+    crate::static_sql::StaticSql::dml(
+        "SELECT COUNT(*) FROM ops_activity_coordinators WHERE workspace_id=?1",
+    ),
+];
+
 impl OperationsCatalog {
     /// Import one bounded source page. Source read finishes before destination writes begin.
     ///
@@ -415,17 +439,9 @@ impl OperationsCatalog {
         if membership_committed {
             return Err(OperationsError::Conflict("membership handoff committed"));
         }
-        for table in [
-            "ops_inbox",
-            "ops_presence",
-            "ops_events",
-            "ops_activity_coordinators",
-            "ops_import_effect_references",
-            "ops_members",
-            "ops_scopes",
-        ] {
+        for delete_sql in ABORT_DELETE_WORKSPACE_TABLES_SQL {
             tx.execute(
-                &format!("DELETE FROM {table} WHERE workspace_id=?1"),
+                delete_sql.as_str(),
                 params![p.workspace.into_uuid().as_bytes()],
             )?;
         }
@@ -701,19 +717,10 @@ pub(crate) fn verify_verified_import_counts(
     {
         return Err(OperationsError::Corrupt("page ledger totals"));
     }
-    for (kind, table) in [
-        "ops_members",
-        "ops_presence",
-        "ops_events",
-        "ops_inbox",
-        "ops_activity_coordinators",
-    ]
-    .iter()
-    .enumerate()
-    {
+    for (kind, count_sql) in VERIFY_COUNT_WORKSPACE_TABLES_SQL.iter().enumerate() {
         let expected:i64=c.query_row("SELECT COALESCE(SUM(record_count),0) FROM ops_import_pages WHERE migration_id=?1 AND table_kind=?2",params![p.migration.as_bytes(),i64::try_from(kind).map_err(|_|OperationsError::Bounds("table kind"))?],|r|r.get(0))?;
         let actual: i64 = c.query_row(
-            &format!("SELECT COUNT(*) FROM {table} WHERE workspace_id=?1"),
+            count_sql.as_str(),
             params![p.workspace.into_uuid().as_bytes()],
             |r| r.get(0),
         )?;

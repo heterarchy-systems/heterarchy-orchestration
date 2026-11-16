@@ -23,6 +23,7 @@ use std::path::PathBuf;
 mod catalog;
 mod identity_mapping;
 mod profile_catalog;
+mod static_sql;
 pub use catalog::{
     AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION, AgentSessionCatalog,
     AgentSessionCatalogError, HomeAcceptanceOperationsAdmission,
@@ -44,9 +45,10 @@ pub use profile_catalog::{
     AgentProfileProviderFamily, AgentProfileRevision, AgentProfileRuntimeSession,
     AgentProfileRuntimeSessionCreateOutcome, AgentProfileRuntimeSessionHistory,
     AgentProfileRuntimeSessionId, AgentProfileRuntimeSessionPage,
-    AgentProfileRuntimeSessionRevision, AgentProfileRuntimeSessionState, CreateAgentProfile,
-    CreateAgentProfileRuntimeSession, ProfileConfiguration, ProfileMutation,
-    ProfileMutationCommand, ProfileMutationKind, ProfileMutationReceipt,
+    AgentProfileRuntimeSessionRevision, AgentProfileRuntimeSessionState, CliEngine,
+    CreateAgentProfile, CreateAgentProfileRuntimeSession, ExecutionPreference,
+    ProfileConfiguration, ProfileMutation, ProfileMutationCommand, ProfileMutationKind,
+    ProfileMutationReceipt, RolePromptDigest,
 };
 pub use profile_catalog::{
     AgentProfileLogicalSessionHistory, MAX_AGENT_PROFILE_LOGICAL_SESSION_LINKS,

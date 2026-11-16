@@ -228,6 +228,12 @@ fn runtime_classification(error: &RuntimeError) -> (StatusCode, &'static str, &'
             "The requested Orchestration resource was not found.",
             false,
         ),
+        RuntimeError::ProviderRetired => (
+            StatusCode::GONE,
+            "PROVIDER_RETIRED",
+            "Provider-backed effects have been retired.",
+            false,
+        ),
         RuntimeError::Conflict => (
             StatusCode::CONFLICT,
             LaneError::CONFLICT,
@@ -287,25 +293,24 @@ fn chat_classification(
     match error {
         ChatError::Identity
         | ChatError::BodyLimit
-        | ChatError::AdmissionRejected(OperationsError::Bounds(_)) => {
+        | ChatError::Operations(OperationsError::Bounds(_)) => {
             runtime_classification(&RuntimeError::InvalidInput)
         }
-        ChatError::TargetChanged
-        | ChatError::ReplayConflict
-        | ChatError::AdmissionRejected(OperationsError::Conflict(_)) => {
-            runtime_classification(&RuntimeError::Conflict)
-        }
+        ChatError::ReplayConflict => runtime_classification(&RuntimeError::Conflict),
         ChatError::Runtime(error) => runtime_classification(error),
+        ChatError::Operations(OperationsError::ProviderRetired) => (
+            StatusCode::GONE,
+            "PROVIDER_RETIRED",
+            "Provider-backed effects have been retired.",
+            false,
+        ),
         ChatError::Operations(error) if operations_commit_unconfirmed(error) => (
             StatusCode::CONFLICT,
             LaneError::COMMITTED_BUT_UNCONFIRMED,
             "Read the exact immutable message intent before resuming.",
             false,
         ),
-        ChatError::AdmissionRejected(_)
-        | ChatError::Operations(_)
-        | ChatError::Profile(_)
-        | ChatError::CatalogLock => persistence_unavailable(),
+        ChatError::Operations(_) | ChatError::CatalogLock => persistence_unavailable(),
     }
 }
 
@@ -378,18 +383,16 @@ mod tests {
     use http_body_util::BodyExt;
 
     #[test]
-    fn chat_lookup_failure_is_not_definite_append_rejection() {
+    fn chat_history_lookup_failure_remains_unavailable() {
         use heterarchy_orchestration_runtime::chat::ChatError;
         let lookup = RuntimeError::Chat(Box::new(ChatError::Operations(
             OperationsError::Conflict("receipt lookup"),
         )));
-        let admission = RuntimeError::Chat(Box::new(ChatError::AdmissionRejected(
-            OperationsError::Conflict("append"),
-        )));
         let (status, body) = runtime_error_response(&lookup);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body.code, "ORCHESTRATION_UNAVAILABLE");
-        let (status, body) = runtime_error_response(&admission);
+        let (status, body) =
+            runtime_error_response(&RuntimeError::Chat(Box::new(ChatError::ReplayConflict)));
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.code, "ORCHESTRATION_CONFLICT");
         assert!(!body.retryable);
@@ -539,5 +542,13 @@ mod tests {
             assert_eq!(value["retryable"], false);
         }
         Ok(())
+    }
+
+    #[test]
+    fn provider_retirement_has_a_stable_gone_classification() {
+        let (status, body) = runtime_error_response(&RuntimeError::ProviderRetired);
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(body.code, "PROVIDER_RETIRED");
+        assert!(!body.retryable);
     }
 }

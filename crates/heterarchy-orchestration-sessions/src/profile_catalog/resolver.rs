@@ -8,43 +8,21 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use uuid::Uuid;
 
 use super::{
-    AgentProfileCatalog, AgentProfileError, AgentProfileId, AgentProfileLifecycleState,
-    AgentProfileRevision, AgentProfileRuntimeSessionId, AgentProfileRuntimeSessionState,
-    decode_uuid, load_profile, load_runtime_session, normalize_sql, validate_schema_sql,
-    validate_text,
+    AgentProfileCatalog, AgentProfileError, AgentProfileId, AgentProfileRevision,
+    AgentProfileRuntimeSessionId, decode_uuid, normalize_sql, validate_schema_sql, validate_text,
+};
+
+mod sql;
+
+use sql::{
+    ACTIVE_CLAIM_FOR_PROFILE_SQL, ACTIVE_RESOLUTION_CLAIM_INDEX_SQL, CLAIM_BY_ID_SQL,
+    CLAIM_BY_REQUEST_SLOT_SQL, RESOLUTION_CLAIMS_SQL, RESOLVER_CANDIDATES_SQL,
+    SELECT_INDEX_SCHEMA_SQL,
 };
 
 /// Maximum compatible Profiles returned in one resolver read. The caller must
 /// fail closed when `truncated` is true instead of assuming this is a complete set.
 pub const MAX_AGENT_PROFILE_RESOLVER_CANDIDATES: usize = 128;
-
-const RESOLUTION_CLAIMS_SQL: &str = r"
-CREATE TABLE agent_profile_resolution_claims (
-    claim_id BLOB PRIMARY KEY NOT NULL CHECK(length(claim_id) = 16 AND claim_id != zeroblob(16)),
-    agent_request_id BLOB NOT NULL CHECK(length(agent_request_id) = 16 AND agent_request_id != zeroblob(16)),
-    slot_ordinal INTEGER NOT NULL CHECK(slot_ordinal BETWEEN 0 AND 3),
-    claim_kind INTEGER NOT NULL CHECK(claim_kind BETWEEN 1 AND 4),
-    profile_id BLOB NOT NULL CHECK(length(profile_id) = 16 AND profile_id != zeroblob(16)),
-    profile_revision INTEGER NOT NULL CHECK(profile_revision > 0),
-    runtime_session_id BLOB CHECK(runtime_session_id IS NULL OR (length(runtime_session_id) = 16 AND runtime_session_id != zeroblob(16))),
-    runtime_session_revision INTEGER CHECK(runtime_session_revision IS NULL OR runtime_session_revision > 0),
-    claimed_at_ms INTEGER NOT NULL CHECK(claimed_at_ms >= 0),
-    released_at_ms INTEGER CHECK(released_at_ms IS NULL OR released_at_ms >= claimed_at_ms),
-    state INTEGER NOT NULL CHECK(state IN (1,2)),
-    revision INTEGER NOT NULL CHECK(revision > 0),
-    UNIQUE(agent_request_id, slot_ordinal),
-    FOREIGN KEY(profile_id) REFERENCES agent_profiles(profile_id),
-    FOREIGN KEY(runtime_session_id) REFERENCES agent_profile_runtime_sessions(runtime_session_id),
-    CHECK((state = 1 AND released_at_ms IS NULL) OR (state = 2 AND released_at_ms IS NOT NULL)),
-    CHECK((claim_kind IN (2,3) AND runtime_session_id IS NOT NULL AND runtime_session_revision IS NOT NULL) OR (claim_kind IN (1,4) AND runtime_session_id IS NULL AND runtime_session_revision IS NULL))
-);
-";
-
-const ACTIVE_RESOLUTION_CLAIM_INDEX_SQL: &str = r"
-CREATE UNIQUE INDEX agent_profile_resolution_claims_active_profile_idx
-ON agent_profile_resolution_claims(profile_id)
-WHERE state = 1;
-";
 
 /// Reusable state observed from the Profile catalog. Current Workspace scope is
 /// composed separately by Operations and is not stored in this global catalog.
@@ -314,11 +292,7 @@ fn validate_index_schema_sql(
     expected: &str,
 ) -> Result<(), AgentProfileError> {
     let sql: Option<String> = connection
-        .query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='index' AND name=?1",
-            params![name],
-            |row| row.get(0),
-        )
+        .query_row(SELECT_INDEX_SCHEMA_SQL, params![name], |row| row.get(0))
         .optional()?;
     let Some(sql) = sql else {
         return Err(AgentProfileError::Schema(name));
@@ -344,16 +318,14 @@ impl AgentProfileCatalog {
             capability,
             super::MAX_CAPABILITY_BYTES,
         )?;
-        let limit = i64::try_from(MAX_AGENT_PROFILE_RESOLVER_CANDIDATES + 1)
-            .map_err(|_| AgentProfileError::Corrupt("resolver candidate bound"))?;
+        self.ensure_live_binding()?;
+        // Existing ChatGPT RuntimeSessions remain readable history, while no
+        // native provider adapter is registered to make a resolver candidate runnable.
         let mut statement = self.connection.prepare(RESOLVER_CANDIDATES_SQL)?;
-        let rows = statement.query_map(params![capability, limit], decode_candidate_row)?;
-        let mut candidates = rows.collect::<Result<Vec<_>, _>>()?;
-        let truncated = candidates.len() > MAX_AGENT_PROFILE_RESOLVER_CANDIDATES;
-        candidates.truncate(MAX_AGENT_PROFILE_RESOLVER_CANDIDATES);
+        let rows = statement.query_map(params![capability, 0_i64], decode_candidate_row)?;
         Ok(AgentProfileResolverCandidates {
-            candidates,
-            truncated,
+            candidates: rows.collect::<Result<Vec<_>, _>>()?,
+            truncated: false,
         })
     }
 
@@ -431,78 +403,8 @@ fn reserve_claim_in_transaction(
             command.profile_id,
         ));
     }
-    validate_claim_candidate(transaction, command)?;
-    transaction.execute(
-        "INSERT INTO agent_profile_resolution_claims(
-            claim_id,agent_request_id,slot_ordinal,claim_kind,profile_id,profile_revision,
-            runtime_session_id,runtime_session_revision,claimed_at_ms,released_at_ms,state,revision
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,1,1)",
-        params![
-            command.claim_id.as_bytes(),
-            command.agent_request_id.as_bytes(),
-            i64::from(command.slot_ordinal),
-            encode_claim_kind(command.kind),
-            command.profile_id.into_uuid().as_bytes(),
-            command.profile_revision.get(),
-            command
-                .runtime_session_id
-                .map(AgentProfileRuntimeSessionId::into_uuid)
-                .map(Uuid::into_bytes)
-                .map(Vec::from),
-            command.runtime_session_revision,
-            command.claimed_at.get(),
-        ],
-    )?;
-    let claim = claim_by_id(transaction, command.claim_id)?.ok_or(AgentProfileError::Corrupt(
-        "resolution claim insert readback",
-    ))?;
-    Ok((claim, true))
+    Err(AgentProfileError::ProviderRetired)
 }
-
-const RESOLVER_CANDIDATES_SQL: &str = r"
-WITH eligible AS (
-    SELECT p.profile_id,p.revision,p.last_used_at_ms,p.updated_at_ms
-    FROM agent_profiles p
-    JOIN agent_profile_capabilities c ON c.profile_id=p.profile_id
-    WHERE p.lifecycle_state=1
-      AND p.provider_family=1
-      AND c.capability=?1
-      AND NOT EXISTS (
-          SELECT 1 FROM agent_profile_resolution_claims rc
-          WHERE rc.profile_id=p.profile_id AND rc.state=1
-      )
-), ranked_runtime AS (
-    SELECT r.runtime_session_id,r.profile_id,r.state,r.revision,r.last_seen_at_ms,
-           ROW_NUMBER() OVER (
-               PARTITION BY r.profile_id,r.state
-               ORDER BY r.last_seen_at_ms DESC,r.runtime_session_id DESC
-           ) AS state_rank
-    FROM agent_profile_runtime_sessions r
-    JOIN eligible e ON e.profile_id=r.profile_id
-), status AS (
-    SELECT profile_id,
-           MAX(CASE WHEN state=1 THEN 1 ELSE 0 END) AS has_provisioning,
-           MAX(CASE WHEN state=3 THEN 1 ELSE 0 END) AS has_active,
-           MAX(CASE WHEN state=4 THEN 1 ELSE 0 END) AS has_suspending,
-           MAX(CASE WHEN state=6 THEN 1 ELSE 0 END) AS has_waking,
-           MAX(CASE WHEN state=7 THEN 1 ELSE 0 END) AS has_failed
-    FROM ranked_runtime
-    GROUP BY profile_id
-)
-SELECT e.profile_id,e.revision,e.last_used_at_ms,e.updated_at_ms,
-       ready.runtime_session_id,ready.revision,
-       offline.runtime_session_id,offline.revision,
-       COALESCE(s.has_provisioning,0),COALESCE(s.has_active,0),
-       COALESCE(s.has_suspending,0),COALESCE(s.has_waking,0),COALESCE(s.has_failed,0)
-FROM eligible e
-LEFT JOIN ranked_runtime ready
-       ON ready.profile_id=e.profile_id AND ready.state=2 AND ready.state_rank=1
-LEFT JOIN ranked_runtime offline
-       ON offline.profile_id=e.profile_id AND offline.state=5 AND offline.state_rank=1
-LEFT JOIN status s ON s.profile_id=e.profile_id
-ORDER BY COALESCE(e.last_used_at_ms,-1) DESC,e.updated_at_ms DESC,e.profile_id ASC
-LIMIT ?2
-";
 
 fn decode_candidate_row(
     row: &rusqlite::Row<'_>,
@@ -578,88 +480,6 @@ fn decode_runtime_id_sql(value: &[u8]) -> Result<AgentProfileRuntimeSessionId, r
     AgentProfileRuntimeSessionId::from_uuid(uuid).map_err(|_| rusqlite::Error::InvalidQuery)
 }
 
-fn validate_claim_candidate(
-    connection: &Connection,
-    command: &AgentProfileResolutionClaimCommand,
-) -> Result<(), AgentProfileError> {
-    let profile = load_profile(connection, command.profile_id)?
-        .ok_or(AgentProfileError::InvalidIdentity("resolution_profile_id"))?;
-    if profile.revision() != command.profile_revision
-        || profile.lifecycle_state() != AgentProfileLifecycleState::Active
-    {
-        return Err(AgentProfileError::ResolutionClaimConflict(
-            command.profile_id,
-        ));
-    }
-    match command.kind {
-        AgentProfileResolutionClaimKind::ReuseCurrentScope => {
-            let ready: bool = connection.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM agent_profile_runtime_sessions
-                    WHERE profile_id=?1 AND state=2
-                 )",
-                params![command.profile_id.into_uuid().as_bytes()],
-                |row| row.get(0),
-            )?;
-            if ready {
-                Ok(())
-            } else {
-                Err(AgentProfileError::ResolutionClaimConflict(
-                    command.profile_id,
-                ))
-            }
-        }
-        AgentProfileResolutionClaimKind::ReuseReadyRuntime => {
-            validate_runtime_claim(connection, command, AgentProfileRuntimeSessionState::Ready)
-        }
-        AgentProfileResolutionClaimKind::WakeExistingRuntime => validate_runtime_claim(
-            connection,
-            command,
-            AgentProfileRuntimeSessionState::Offline,
-        ),
-        AgentProfileResolutionClaimKind::WakeNewRuntime => {
-            let conflicting: bool = connection.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM agent_profile_runtime_sessions
-                    WHERE profile_id=?1 AND state IN (1,2,3,4,5,6,7)
-                 )",
-                params![command.profile_id.into_uuid().as_bytes()],
-                |row| row.get(0),
-            )?;
-            if conflicting {
-                Err(AgentProfileError::ResolutionClaimConflict(
-                    command.profile_id,
-                ))
-            } else {
-                Ok(())
-            }
-        }
-    }
-}
-
-fn validate_runtime_claim(
-    connection: &Connection,
-    command: &AgentProfileResolutionClaimCommand,
-    expected_state: AgentProfileRuntimeSessionState,
-) -> Result<(), AgentProfileError> {
-    let runtime_id = command
-        .runtime_session_id
-        .ok_or(AgentProfileError::Corrupt(
-            "resolution claim runtime missing",
-        ))?;
-    let runtime = load_runtime_session(connection, runtime_id)?
-        .ok_or(AgentProfileError::RuntimeSessionMissing(runtime_id))?;
-    if runtime.profile_id() != command.profile_id
-        || runtime.state() != expected_state
-        || Some(runtime.revision().get()) != command.runtime_session_revision
-    {
-        return Err(AgentProfileError::ResolutionClaimConflict(
-            command.profile_id,
-        ));
-    }
-    Ok(())
-}
-
 fn claim_by_request_slot(
     connection: &Connection,
     agent_request_id: Uuid,
@@ -667,10 +487,7 @@ fn claim_by_request_slot(
 ) -> Result<Option<AgentProfileResolutionClaim>, AgentProfileError> {
     let raw = connection
         .query_row(
-            "SELECT claim_id,agent_request_id,slot_ordinal,claim_kind,profile_id,profile_revision,
-                    runtime_session_id,runtime_session_revision,claimed_at_ms,revision
-             FROM agent_profile_resolution_claims
-             WHERE agent_request_id=?1 AND slot_ordinal=?2 AND state=1",
+            CLAIM_BY_REQUEST_SLOT_SQL,
             params![agent_request_id.as_bytes(), i64::from(slot_ordinal)],
             decode_claim_row,
         )
@@ -684,9 +501,7 @@ fn claim_by_id(
 ) -> Result<Option<AgentProfileResolutionClaim>, AgentProfileError> {
     let raw = connection
         .query_row(
-            "SELECT claim_id,agent_request_id,slot_ordinal,claim_kind,profile_id,profile_revision,
-                    runtime_session_id,runtime_session_revision,claimed_at_ms,revision
-             FROM agent_profile_resolution_claims WHERE claim_id=?1 AND state=1",
+            CLAIM_BY_ID_SQL,
             params![claim_id.as_bytes()],
             decode_claim_row,
         )
@@ -700,9 +515,7 @@ fn active_claim_for_profile(
 ) -> Result<Option<AgentProfileResolutionClaim>, AgentProfileError> {
     let raw = connection
         .query_row(
-            "SELECT claim_id,agent_request_id,slot_ordinal,claim_kind,profile_id,profile_revision,
-                    runtime_session_id,runtime_session_revision,claimed_at_ms,revision
-             FROM agent_profile_resolution_claims WHERE profile_id=?1 AND state=1",
+            ACTIVE_CLAIM_FOR_PROFILE_SQL,
             params![profile_id.into_uuid().as_bytes()],
             decode_claim_row,
         )
@@ -792,15 +605,6 @@ fn claim_matches(
         && claim.runtime_session_revision == command.runtime_session_revision
 }
 
-const fn encode_claim_kind(kind: AgentProfileResolutionClaimKind) -> i64 {
-    match kind {
-        AgentProfileResolutionClaimKind::ReuseCurrentScope => 1,
-        AgentProfileResolutionClaimKind::ReuseReadyRuntime => 2,
-        AgentProfileResolutionClaimKind::WakeExistingRuntime => 3,
-        AgentProfileResolutionClaimKind::WakeNewRuntime => 4,
-    }
-}
-
 fn decode_claim_kind(value: i64) -> Result<AgentProfileResolutionClaimKind, AgentProfileError> {
     match value {
         1 => Ok(AgentProfileResolutionClaimKind::ReuseCurrentScope),
@@ -815,8 +619,8 @@ fn decode_claim_kind(value: i64) -> Result<AgentProfileResolutionClaimKind, Agen
 mod tests {
     use super::*;
     use crate::profile_catalog::{
-        AgentProfileCreationOrigin, AgentProfileProviderFamily, AgentProfileRuntimeSession,
-        CreateAgentProfile, CreateAgentProfileRuntimeSession,
+        AgentProfileCreationOrigin, AgentProfileRuntimeSession, AgentProfileRuntimeSessionState,
+        CreateAgentProfile,
     };
     use std::{error::Error, fs};
 
@@ -830,7 +634,6 @@ mod tests {
             Uuid::from_u128(request),
             stable_name.to_owned(),
             format!("{stable_name} display"),
-            AgentProfileProviderFamily::ChatGpt,
             None,
             None,
             vec!["rust".to_owned()],
@@ -846,67 +649,21 @@ mod tests {
         conversation_id: &str,
     ) -> Result<(AgentProfileRuntimeSessionId, AgentProfileRuntimeSession), AgentProfileError> {
         let runtime_id = AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(runtime_seed))?;
-        let created = catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
-            runtime_id,
-            Uuid::from_u128(runtime_seed + 1),
-            profile_id,
-            AgentProfileProviderFamily::ChatGpt,
-            TimestampMillis::new(20)?,
-        )?)?;
-        if !created.created() {
-            return Err(AgentProfileError::Corrupt(
-                "resolver test runtime create replay",
-            ));
-        }
-        let ready = catalog.confirm_runtime_session_ready(
-            runtime_id,
-            created.session().revision(),
-            conversation_id,
-            TimestampMillis::new(21)?,
+        let session = super::super::seed_historical_runtime_session(
+            catalog,
+            super::super::HistoricalRuntimeFixture {
+                profile_id,
+                runtime_id,
+                request_id: Uuid::from_u128(runtime_seed + 1),
+                conversation_id: Some(conversation_id.to_owned()),
+                state: AgentProfileRuntimeSessionState::Ready,
+                opened_at: TimestampMillis::new(20)?,
+                last_seen_at: TimestampMillis::new(21)?,
+                closed_at: None,
+                revision: 2,
+            },
         )?;
-        Ok((runtime_id, ready))
-    }
-
-    fn assert_candidate_matrix(
-        candidates: &AgentProfileResolverCandidates,
-        ready_profile: AgentProfileId,
-        ready_runtime: AgentProfileRuntimeSessionId,
-        offline_profile: AgentProfileId,
-        offline_runtime: AgentProfileRuntimeSessionId,
-        busy_profile: AgentProfileId,
-        new_session_profile: AgentProfileId,
-    ) -> Result<(), Box<dyn Error>> {
-        assert!(!candidates.truncated());
-        assert_eq!(candidates.candidates().len(), 4);
-        let candidate = |profile_id| {
-            candidates
-                .candidates()
-                .iter()
-                .copied()
-                .find(|item| item.profile_id() == profile_id)
-                .ok_or("resolver candidate missing")
-        };
-        let ready = candidate(ready_profile)?;
-        assert_eq!(
-            ready.availability(),
-            AgentProfileResolverAvailability::Ready
-        );
-        assert_eq!(ready.runtime_session_id(), Some(ready_runtime));
-        let offline = candidate(offline_profile)?;
-        assert_eq!(
-            offline.availability(),
-            AgentProfileResolverAvailability::OfflineResumable
-        );
-        assert_eq!(offline.runtime_session_id(), Some(offline_runtime));
-        assert_eq!(
-            candidate(busy_profile)?.availability(),
-            AgentProfileResolverAvailability::Busy
-        );
-        assert_eq!(
-            candidate(new_session_profile)?.availability(),
-            AgentProfileResolverAvailability::OfflineNeedsSession
-        );
-        Ok(())
+        Ok((runtime_id, session))
     }
 
     fn assert_claim_replay_and_race(
@@ -928,6 +685,20 @@ mod tests {
             target,
             TimestampMillis::new(30)?,
         )?;
+        catalog.connection.execute(
+            "INSERT INTO agent_profile_resolution_claims(
+                claim_id,agent_request_id,slot_ordinal,claim_kind,profile_id,profile_revision,
+                runtime_session_id,runtime_session_revision,claimed_at_ms,released_at_ms,state,revision
+             ) VALUES(?1,?2,0,2,?3,?4,?5,?6,30,NULL,1,1)",
+            params![
+                Uuid::from_u128(0xB301).as_bytes(),
+                Uuid::from_u128(0xB302).as_bytes(),
+                profile.id().into_uuid().as_bytes(),
+                profile.revision().get(),
+                runtime_id.into_uuid().as_bytes(),
+                runtime.revision().get(),
+            ],
+        )?;
         let claims = catalog.reserve_resolution_claims(&[command])?;
         assert_eq!(claims.len(), 1);
         let claim = claims[0];
@@ -947,12 +718,7 @@ mod tests {
                 if profile_id == profile.id()
         ));
         let after_claim = catalog.resolver_candidates("rust")?;
-        assert!(
-            after_claim
-                .candidates()
-                .iter()
-                .all(|item| item.profile_id() != profile.id())
-        );
+        assert!(after_claim.candidates().is_empty());
         assert_eq!(
             catalog.resolution_claim(Uuid::from_u128(0xB302), 0)?,
             Some(claim)
@@ -961,8 +727,8 @@ mod tests {
     }
 
     #[test]
-    fn candidates_and_claims_share_one_bounded_replay_safe_contract() -> Result<(), Box<dyn Error>>
-    {
+    fn retired_provider_candidates_are_empty_and_only_historical_claims_replay()
+    -> Result<(), Box<dyn Error>> {
         let root = std::env::temp_dir().join(format!("profile-resolver-{}", Uuid::now_v7()));
         fs::create_dir(&root)?;
         let path = root.join("agent-profiles.sqlite3");
@@ -972,16 +738,8 @@ mod tests {
             .create_profile(&profile_command(0xB001, 0xB101, "resolver-ready")?)?
             .profile()
             .clone();
-        let offline_profile = catalog
-            .create_profile(&profile_command(0xB002, 0xB102, "resolver-offline")?)?
-            .profile()
-            .clone();
-        let busy_profile = catalog
-            .create_profile(&profile_command(0xB003, 0xB103, "resolver-busy")?)?
-            .profile()
-            .clone();
         let new_session_profile = catalog
-            .create_profile(&profile_command(0xB004, 0xB104, "resolver-new-session")?)?
+            .create_profile(&profile_command(0xB002, 0xB102, "resolver-new-unbound")?)?
             .profile()
             .clone();
 
@@ -991,47 +749,8 @@ mod tests {
             0xB201,
             "resolver-ready-conversation",
         )?;
-        let (offline_runtime_id, offline_ready) = ready_runtime(
-            &mut catalog,
-            offline_profile.id(),
-            0xB211,
-            "resolver-offline-conversation",
-        )?;
-        let suspending = catalog.transition_runtime_session(
-            offline_runtime_id,
-            offline_ready.revision(),
-            AgentProfileRuntimeSessionState::Suspending,
-            TimestampMillis::new(22)?,
-        )?;
-        let _offline = catalog.transition_runtime_session(
-            offline_runtime_id,
-            suspending.revision(),
-            AgentProfileRuntimeSessionState::Offline,
-            TimestampMillis::new(23)?,
-        )?;
-        let (busy_runtime_id, busy_ready) = ready_runtime(
-            &mut catalog,
-            busy_profile.id(),
-            0xB221,
-            "resolver-busy-conversation",
-        )?;
-        let _busy = catalog.transition_runtime_session(
-            busy_runtime_id,
-            busy_ready.revision(),
-            AgentProfileRuntimeSessionState::Active,
-            TimestampMillis::new(22)?,
-        )?;
-
         let candidates = catalog.resolver_candidates("rust")?;
-        assert_candidate_matrix(
-            &candidates,
-            ready_profile.id(),
-            ready_runtime_id,
-            offline_profile.id(),
-            offline_runtime_id,
-            busy_profile.id(),
-            new_session_profile.id(),
-        )?;
+        assert!(candidates.candidates().is_empty());
 
         assert_claim_replay_and_race(
             &mut catalog,
@@ -1039,6 +758,25 @@ mod tests {
             ready_runtime_id,
             &ready_session,
         )?;
+
+        let target = AgentProfileResolutionClaimTarget::new(
+            AgentProfileResolutionClaimKind::WakeNewRuntime,
+            new_session_profile.id(),
+            new_session_profile.revision(),
+            None,
+        )?;
+        let fresh = AgentProfileResolutionClaimCommand::new(
+            Uuid::from_u128(0xB305),
+            Uuid::from_u128(0xB306),
+            0,
+            target,
+            TimestampMillis::new(32)?,
+        )?;
+        assert!(matches!(
+            catalog.reserve_resolution_claims(&[fresh]),
+            Err(AgentProfileError::ProviderRetired)
+        ));
+        assert_eq!(catalog.resolution_claim(Uuid::from_u128(0xB306), 0)?, None);
 
         drop(catalog);
         fs::remove_dir_all(root)?;

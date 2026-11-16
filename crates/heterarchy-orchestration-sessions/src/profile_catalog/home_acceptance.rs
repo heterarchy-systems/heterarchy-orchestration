@@ -3,6 +3,7 @@
 mod model;
 mod repository;
 pub(super) mod schema;
+mod sql;
 
 #[cfg(test)]
 mod tests;
@@ -265,7 +266,7 @@ pub(super) fn ensure_unpinned(
     profile_id: AgentProfileId,
 ) -> Result<(), AgentProfileError> {
     let held: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agent_profile_home_acceptance_pins WHERE profile_id=?1 AND state=1)",
+        sql::HAS_ACTIVE_PIN_FOR_PROFILE_SQL,
         [profile_id.into_uuid().as_bytes()],
         |row| row.get(0),
     )?;

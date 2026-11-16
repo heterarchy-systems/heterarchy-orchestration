@@ -21,8 +21,6 @@ pub fn project_snapshot(value: &ChatSnapshot) -> ChatSnapshotWire {
             .query
             .agent_profile_id
             .map(heterarchy_orchestration_sessions::AgentProfileId::into_uuid),
-        targets: value.targets.iter().map(project_fence).collect(),
-        target: value.target.as_ref().map(project_fence),
         messages: value.entries.iter().map(project_entry).collect(),
         node_scope: value.query.node_scope.map(Into::into),
         before_sequence: value.query.before_sequence,

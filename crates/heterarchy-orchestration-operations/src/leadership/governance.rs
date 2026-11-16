@@ -1262,11 +1262,26 @@ fn decode_string_sql(bytes: Vec<u8>, field: &'static str) -> rusqlite::Result<St
     decode_string(bytes, field).map_err(to_sql_error)
 }
 
+macro_rules! select_review_sql {
+    () => {
+        "SELECT substr(request_id,1,17),substr(election_id,1,17),substr(workspace_id,1,17),scope_kind,substr(activity_id,1,17),substr(team_id,1,17),expected_leadership_revision,proposer_kind,substr(proposer_activity_id,1,17),substr(proposer_agent_id,1,17),substr(proposer_session_id,1,17),substr(proposer_participation_id,1,17),substr(proposer_profile_id,1,17),substr(proposer_participant_id,1,17),substr(CAST(proposer_display_name AS BLOB),1,129),substr(incumbent_participant_id,1,17),substr(incumbent_participation_id,1,17),substr(incumbent_profile_id,1,17),substr(incumbent_session_id,1,17),substr(CAST(incumbent_display_name AS BLOB),1,129),substr(CAST(reason AS BLOB),1,4097),defense_deadline_ms,discussion_deadline_ms,ballot_deadline_ms,defense_closed_at_ms,substr(incumbent_statement_id,1,17),created_at_ms FROM ops_leadership_reviews"
+    };
+}
+
+const SELECT_REVIEW_BY_REQUEST_SQL: crate::static_sql::StaticSql =
+    crate::static_sql::StaticSql::dml(concat!(select_review_sql!(), " WHERE request_id=?1"));
+const SELECT_REVIEW_BY_ELECTION_SQL: crate::static_sql::StaticSql =
+    crate::static_sql::StaticSql::dml(concat!(select_review_sql!(), " WHERE election_id=?1"));
+
 fn load_review_by_request(
     tx: &Transaction<'_>,
     request_id: Uuid,
 ) -> Result<Option<ReviewRow>, OperationsError> {
-    load_review(tx, "WHERE request_id=?1", params![request_id.as_bytes()])
+    load_review(
+        tx,
+        SELECT_REVIEW_BY_REQUEST_SQL,
+        params![request_id.as_bytes()],
+    )
 }
 
 fn load_review_election(
@@ -1285,7 +1300,11 @@ fn load_review_by_election(
     tx: &Transaction<'_>,
     election_id: Uuid,
 ) -> Result<Option<ReviewRow>, OperationsError> {
-    load_review(tx, "WHERE election_id=?1", params![election_id.as_bytes()])
+    load_review(
+        tx,
+        SELECT_REVIEW_BY_ELECTION_SQL,
+        params![election_id.as_bytes()],
+    )
 }
 
 fn load_review_query(
@@ -1320,13 +1339,10 @@ fn load_review_query(
 
 fn load_review(
     tx: &Transaction<'_>,
-    where_sql: &str,
+    sql: crate::static_sql::StaticSql,
     params: impl rusqlite::Params,
 ) -> Result<Option<ReviewRow>, OperationsError> {
-    let sql = format!(
-        "SELECT substr(request_id,1,17),substr(election_id,1,17),substr(workspace_id,1,17),scope_kind,substr(activity_id,1,17),substr(team_id,1,17),expected_leadership_revision,proposer_kind,substr(proposer_activity_id,1,17),substr(proposer_agent_id,1,17),substr(proposer_session_id,1,17),substr(proposer_participation_id,1,17),substr(proposer_profile_id,1,17),substr(proposer_participant_id,1,17),substr(CAST(proposer_display_name AS BLOB),1,129),substr(incumbent_participant_id,1,17),substr(incumbent_participation_id,1,17),substr(incumbent_profile_id,1,17),substr(incumbent_session_id,1,17),substr(CAST(incumbent_display_name AS BLOB),1,129),substr(CAST(reason AS BLOB),1,4097),defense_deadline_ms,discussion_deadline_ms,ballot_deadline_ms,defense_closed_at_ms,substr(incumbent_statement_id,1,17),created_at_ms FROM ops_leadership_reviews {where_sql}"
-    );
-    tx.query_row(&sql, params, |row| {
+    tx.query_row(sql.as_str(), params, |row| {
         let request_id = decode_uuid_sql(row.get(0)?, "leadership review request")?;
         let election_id = decode_uuid_sql(row.get(1)?, "leadership review election")?;
         let workspace_id =

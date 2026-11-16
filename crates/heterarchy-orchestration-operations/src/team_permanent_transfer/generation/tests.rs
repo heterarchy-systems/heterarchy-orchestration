@@ -50,53 +50,6 @@ fn workspace_id() -> WorkspaceId {
 }
 
 #[test]
-fn schema_v65_backfill_uses_original_intent_times_for_roots() -> Result<(), Box<dyn Error>> {
-    let connection = database()?;
-    let decision_a = Uuid::from_u128(0xF010);
-    let decision_b = Uuid::from_u128(0xF011);
-    let transfer_a = Uuid::from_u128(0xF020);
-    let transfer_b = Uuid::from_u128(0xF021);
-    insert_intent(&connection, transfer_a, decision_a, 0, 123)?;
-    insert_intent(&connection, transfer_b, decision_b, 3, 456)?;
-
-    backfill_v65_roots(&connection)?;
-
-    let root_a = read_generation(&connection, workspace_id(), transfer_a)?.ok_or(
-        OperationsError::Corrupt("test permanent transfer root generation missing"),
-    )?;
-    let root_b = read_generation(&connection, workspace_id(), transfer_b)?.ok_or(
-        OperationsError::Corrupt("test permanent transfer root generation missing"),
-    )?;
-    assert_eq!(root_a.generation(), 1);
-    assert_eq!(root_a.predecessor_transfer_id(), None);
-    assert_eq!(root_a.recorded_at().get(), 123);
-    assert_eq!(root_a.head_transfer_id(), transfer_a);
-    assert_eq!(root_a.head_generation(), 1);
-    assert!(root_a.active());
-    assert_eq!(root_b.recorded_at().get(), 456);
-    assert!(root_b.active());
-    assert!(
-        connection
-            .execute(
-                "UPDATE ops_team_permanent_transfer_generation_ancestry
-             SET recorded_at_ms=124 WHERE workspace_id=?1 AND transfer_id=?2",
-                params![workspace_id().into_uuid().as_bytes(), transfer_a.as_bytes()],
-            )
-            .is_err()
-    );
-    assert!(
-        connection
-            .execute(
-                "DELETE FROM ops_team_permanent_transfer_generation_heads
-             WHERE workspace_id=?1 AND destination_decision_id=?2 AND destination_ordinal=0",
-                params![workspace_id().into_uuid().as_bytes(), decision_a.as_bytes(),],
-            )
-            .is_err()
-    );
-    Ok(())
-}
-
-#[test]
 fn replacement_compares_head_and_advances_one_generation_at_a_time() -> Result<(), Box<dyn Error>> {
     let connection = database()?;
     let workspace = workspace_id();

@@ -21,8 +21,8 @@ use forge_persistence::{
 use forge_workspace::WorkspaceStateLayout;
 use heterarchy_orchestration_sessions::{
     AgentProfileCatalog, AgentProfileCreationOrigin, AgentProfileId,
-    AgentProfileLogicalSessionLink, AgentProfileProviderFamily, AgentSessionCatalog,
-    CreateAgentProfile, link_existing_logical_session,
+    AgentProfileLogicalSessionLink, AgentSessionCatalog, CreateAgentProfile,
+    link_existing_logical_session,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -134,15 +134,6 @@ fn binding_rejection_attempt_is_readback_only_and_preserves_membership_history()
         },
     )?;
     drop(catalog);
-    let legacy = Connection::open(&catalog_path)?;
-    legacy.execute_batch(
-        "DROP TABLE ops_agent_provision_uncertainty_retirements;
-         DROP TABLE ops_binding_rejection_attempt_resolutions;",
-    )?;
-    crate::catalog::restore_v46_message_schema_for_legacy_fixture(&legacy)?;
-    crate::catalog::restore_v47_assignment_schema_for_legacy_fixture(&legacy)?;
-    legacy.pragma_update(None, "user_version", 44_i64)?;
-    drop(legacy);
     let mut catalog = OperationsCatalog::open(&catalog_path, destination)?;
     assert_eq!(
         catalog
@@ -150,7 +141,7 @@ fn binding_rejection_attempt_is_readback_only_and_preserves_membership_history()
             .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))?,
         crate::catalog::VERSION
     );
-    let migrated_attempt: Vec<rusqlite::types::Value> = catalog.connection.query_row(
+    let reopened_attempt: Vec<rusqlite::types::Value> = catalog.connection.query_row(
         "SELECT * FROM ops_binding_rejection_attempts WHERE request_id=?1",
         params![binding.request_id().as_bytes()],
         |row| {
@@ -159,12 +150,12 @@ fn binding_rejection_attempt_is_readback_only_and_preserves_membership_history()
                 .collect()
         },
     )?;
-    assert_eq!(migrated_attempt, attempt_before_resolution);
+    assert_eq!(reopened_attempt, attempt_before_resolution);
     assert!(
         catalog
             .registration_binding_rejection_attempt_resolution(binding.request_id())?
             .is_none(),
-        "a migrated uncertain attempt without an explicit resolution remains readback-only"
+        "a reopened uncertain attempt without an explicit resolution remains readback-only"
     );
     assert_eq!(
         catalog.prepare_registration_binding_rejection_attempt(&attempt)?,
@@ -1494,7 +1485,7 @@ fn historical_event_snapshots_preserve_distinct_revisions_without_live_members()
     clippy::too_many_lines,
     reason = "Keeps the real Source import, native registration activation, append, replay, and reopen evidence together."
 )]
-fn ready_native_participant_can_append_enqueue_replay_and_read_back_node_message()
+fn ready_native_participant_appends_and_reads_generic_workspace_history()
 -> Result<(), Box<dyn Error>> {
     let destination = Uuid::from_u128(0xFC00);
     let seed = 0xFC01;
@@ -1617,112 +1608,45 @@ fn ready_native_participant_can_append_enqueue_replay_and_read_back_node_message
             seed + 0x10A,
         ))),
     )?;
-    let (target, node_witness, leadership_revision) = seed_native_node_route(
-        &mut reopened,
-        &source,
-        destination,
-        command.actor,
-        participant_id,
-        node_context,
-        seed,
-    )?;
     let node_command = crate::AppendWorkspaceMessageCommand {
         message_id: Uuid::from_u128(seed + 0x10B),
         workspace_id: workspace,
-        channel: crate::MessageChannel::Direct(target.participation_id()),
+        channel: crate::MessageChannel::Workspace,
         actor: command.actor,
-        body: "Native Main node conversation".to_owned(),
+        body: "Native Main node history".to_owned(),
         submitted_at: timestamp(5_002)?,
         context: node_context,
     };
-    let node_first = reopened.append_and_enqueue_provider_message(
-        node_command.clone(),
-        target.clone(),
-        Some(node_witness.clone()),
-    )?;
+    let node_first = reopened.append_workspace_message(node_command.clone())?;
     assert!(node_first.created());
-    assert_eq!(
-        node_first.outbox().state(),
-        crate::ProviderMessageState::Queued
-    );
-    assert_eq!(
-        node_first.outbox().node_route_witness(),
-        Some(&node_witness)
-    );
-    let node_message = reopened
-        .workspace_message(node_command.message_id)?
-        .ok_or("native node message missing after append")?;
+    assert_eq!(node_first.message().body(), "Native Main node history");
     assert!(matches!(
-        node_message.author(),
+        node_first.message().author(),
         crate::MessageAuthor::NativeParticipant {
             participant_id: stored_participant,
             session_id: stored_session,
         } if *stored_participant == participant_id && *stored_session == session
     ));
-
-    let mut stale_command = node_command.clone();
-    stale_command.message_id = Uuid::from_u128(seed + 0x120);
-    let stale_leadership_revision = leadership_revision
-        .checked_add(1)
-        .ok_or("leadership revision overflow")?;
-    let stale_witness = crate::NodeMessageRouteWitness::new(
-        node_witness.operation_id(),
-        node_witness.participation_revision(),
-        node_witness.runtime_revision(),
-        stale_command.actor,
-        Some(stale_leadership_revision),
-        node_witness.target(),
-    )?;
-    assert!(matches!(
-        reopened.append_and_enqueue_provider_message(
-            stale_command.clone(),
-            target.clone(),
-            Some(stale_witness),
-        ),
-        Err(OperationsError::Conflict("node message sender leadership"))
-    ));
+    let node_replay = reopened.append_workspace_message(node_command.clone())?;
+    assert!(!node_replay.created());
+    assert_eq!(node_replay.message(), node_first.message());
     assert!(
         reopened
-            .workspace_message(stale_command.message_id)?
+            .provider_message_outbox(node_command.message_id)?
             .is_none()
-    );
-    assert!(
-        reopened
-            .provider_message_outbox(stale_command.message_id)?
-            .is_none()
-    );
-
-    let replay = reopened.append_and_enqueue_provider_message(
-        node_command.clone(),
-        target.clone(),
-        Some(node_witness.clone()),
-    )?;
-    assert!(!replay.created());
-    assert_eq!(replay.outbox(), node_first.outbox());
-    assert_eq!(
-        reopened
-            .workspace_message(node_command.message_id)?
-            .as_ref(),
-        Some(&node_message)
     );
 
     drop(reopened);
-    let mut reopened = OperationsCatalog::open(&catalog_path, destination)?;
-    let stored_message = reopened
+    let reopened = OperationsCatalog::open(&catalog_path, destination)?;
+    let node_message = reopened
         .workspace_message(node_command.message_id)?
-        .ok_or("native node message missing after reopen")?;
-    let stored_outbox = reopened
-        .provider_message_outbox(node_command.message_id)?
-        .ok_or("native node outbox missing after reopen")?;
-    assert_eq!(stored_message, node_message);
-    assert_eq!(stored_outbox, *node_first.outbox());
-    let replay = reopened.append_and_enqueue_provider_message(
-        node_command.clone(),
-        target,
-        Some(node_witness),
-    )?;
-    assert!(!replay.created());
-    assert_eq!(replay.outbox(), &stored_outbox);
+        .ok_or("generic node history missing after reopen")?;
+    assert_eq!(node_message, *node_first.message());
+    assert!(
+        reopened
+            .provider_message_outbox(node_command.message_id)?
+            .is_none()
+    );
     let message_count: i64 = reopened.connection.query_row(
         "SELECT count(*) FROM ops_workspace_messages WHERE message_id=?1",
         rusqlite::params![node_command.message_id.as_bytes()],
@@ -1734,7 +1658,7 @@ fn ready_native_participant_can_append_enqueue_replay_and_read_back_node_message
         |row| row.get(0),
     )?;
     assert_eq!(message_count, 1);
-    assert_eq!(outbox_count, 1);
+    assert_eq!(outbox_count, 0);
     drop(reopened);
     source.cleanup()?;
     fs::remove_dir_all(catalog_root)?;
@@ -1745,170 +1669,6 @@ fn ready_native_participant_can_append_enqueue_replay_and_read_back_node_message
     clippy::too_many_lines,
     reason = "Builds one real Operations recipient route, node assignment, and current native leadership witness for the queue regression."
 )]
-fn seed_native_node_route(
-    catalog: &mut OperationsCatalog,
-    source: &SourceFixture,
-    destination: Uuid,
-    sender: crate::OperationalActor,
-    sender_participant: Uuid,
-    context: crate::MessageContext,
-    seed: u128,
-) -> Result<
-    (
-        crate::ProviderMessageTarget,
-        crate::NodeMessageRouteWitness,
-        i64,
-    ),
-    Box<dyn Error>,
-> {
-    let workspace = source.workspace;
-    let migration_id = source.migration;
-    let (activity, sender_agent, sender_session) = match sender {
-        crate::OperationalActor::Participant {
-            activity_id,
-            agent_id,
-            session_id,
-        } => (activity_id, agent_id, session_id),
-        crate::OperationalActor::LocalOperator => return Err("native sender required".into()),
-    };
-    let operation_id = Uuid::from_u128(seed + 0x200);
-    let request_id = Uuid::from_u128(seed + 0x201);
-    let recipient_participant = Uuid::from_u128(seed + 0x202);
-    let recipient_agent = AgentInstanceId::from_uuid(Uuid::from_u128(seed + 0x203));
-    let recipient_session = AgentSessionId::from_uuid(Uuid::from_u128(seed + 0x204));
-    let profile_id = AgentProfileId::from_uuid(Uuid::from_u128(seed + 0x205))?;
-    let participation_id = WorkspaceParticipationId::from_uuid(Uuid::from_u128(seed + 0x206))?;
-    let runtime_session_id =
-        heterarchy_orchestration_sessions::AgentProfileRuntimeSessionId::from_uuid(
-            Uuid::from_u128(seed + 0x207),
-        )?;
-    let assignment_id = Uuid::from_u128(seed + 0x208);
-    let leadership_assignment_id = Uuid::from_u128(seed + 0x209);
-
-    catalog.connection.execute(
-        "INSERT INTO ops_workspace_participations(workspace_id,agent_profile_id,participation_id,created_at_ms,revision) VALUES(?1,?2,?3,4000,1)",
-        rusqlite::params![workspace.into_uuid().as_bytes(), profile_id.into_uuid().as_bytes(), participation_id.into_uuid().as_bytes()],
-    )?;
-    catalog.connection.execute(
-        "INSERT INTO ops_logical_members(workspace_id,participant_id,session_id,principal_kind,principal_id,display_name,declared_role,transport_kind,membership_revision,created_at_ms) VALUES(?1,?2,?3,0,NULL,'Node target','worker',1,1,4000)",
-        rusqlite::params![workspace.into_uuid().as_bytes(), recipient_participant.as_bytes(), recipient_session.into_uuid().as_bytes()],
-    )?;
-    catalog.connection.execute(
-        "INSERT INTO ops_current_effect_bindings(workspace_id,participant_id,activity_id,session_id,agent_id,source_kind,source_request_id) VALUES(?1,?2,?3,?4,?5,0,?6)",
-        rusqlite::params![workspace.into_uuid().as_bytes(), recipient_participant.as_bytes(), activity.into_uuid().as_bytes(), recipient_session.into_uuid().as_bytes(), recipient_agent.into_uuid().as_bytes(), operation_id.as_bytes()],
-    )?;
-    catalog.connection.execute(
-        "INSERT INTO ops_workspace_participation_mappings(request_id,workspace_id,participation_id,agent_profile_id,profile_revision,profile_mapping_request_id,session_id,session_revision,participant_id,participant_membership_revision,mapped_at_ms) VALUES(?1,?2,?3,?4,1,?5,?6,1,?7,1,4000)",
-        rusqlite::params![Uuid::from_u128(seed + 0x20A).as_bytes(), workspace.into_uuid().as_bytes(), participation_id.into_uuid().as_bytes(), profile_id.into_uuid().as_bytes(), operation_id.as_bytes(), recipient_session.into_uuid().as_bytes(), recipient_participant.as_bytes()],
-    )?;
-    catalog.connection.execute(
-        "INSERT INTO ops_agent_requests(request_id,workspace_id,activity_id,requester_agent_id,requester_session_id,coordinator_revision,objective,capability,requested_count,effect_scope,independence_requirement,reason,state,created_at_ms,revision) VALUES(?1,?2,?3,?4,?5,1,'node','worker',1,0,0,'native node conversation',1,4000,1)",
-        rusqlite::params![request_id.as_bytes(), workspace.into_uuid().as_bytes(), activity.into_uuid().as_bytes(), sender_agent.into_uuid().as_bytes(), sender_session.into_uuid().as_bytes()],
-    )?;
-    catalog.connection.execute(
-        "INSERT INTO ops_agent_request_resolutions(request_id,slot_ordinal,resolution_kind,claim_id,profile_id,profile_revision,runtime_session_id,runtime_session_revision,policy_revision,reserved_at_ms) VALUES(?1,0,2,?2,?3,1,?4,1,1,4000)",
-        rusqlite::params![request_id.as_bytes(), Uuid::from_u128(seed + 0x20B).as_bytes(), profile_id.into_uuid().as_bytes(), runtime_session_id.into_uuid().as_bytes()],
-    )?;
-    catalog.connection.execute(
-        "INSERT INTO ops_agent_provision_operations(operation_id,request_id,slot_ordinal,effect_kind,provider_family,profile_id,runtime_session_id,state,provider_conversation_id,prepared_at_ms,updated_at_ms,revision) VALUES(?1,?2,0,1,1,?3,?4,5,'native-node-conversation',4000,4000,1)",
-        rusqlite::params![operation_id.as_bytes(), request_id.as_bytes(), profile_id.into_uuid().as_bytes(), runtime_session_id.into_uuid().as_bytes()],
-    )?;
-
-    let scope = crate::NodeTeamBindingScope::new(
-        workspace,
-        activity,
-        context.goal_id().ok_or("node Goal missing")?,
-        context
-            .goal_created_at()
-            .ok_or("node creation timestamp missing")?,
-        context.dag_revision().ok_or("node DAG revision missing")?,
-        context
-            .dag_base_goal_revision()
-            .ok_or("node base Goal revision missing")?,
-        context.node_id().ok_or("node ID missing")?,
-    )?;
-    let _assignment_affinity =
-        catalog.record_assignment_affinity(&crate::AssignmentAffinityCommand {
-            workspace_id: workspace,
-            assignment_id: forge_domain::AgentAssignmentId::from_uuid(assignment_id),
-            activity_id: activity,
-            target_agent_id: recipient_agent,
-            target_session_id: recipient_session,
-            expected_target_principal: forge_domain::AuthenticatedPrincipal::TrustedStdio,
-            requester: crate::OperationalActor::LocalOperator,
-            team_id: None,
-            assignment_payload_fingerprint: [0xD1; 32],
-            original_offer_payload: b"native-node-fixture".to_vec(),
-            observed_at: timestamp(4_100)?,
-            node_scope: scope,
-            expected_binding_revision: None,
-        })?;
-
-    let offered_at = 5_000;
-    catalog.connection.execute(
-        "INSERT INTO ops_effect_fact_consumers(migration_id,workspace_id,destination_id,last_sequence,applied_count) VALUES(?1,?2,?3,0,0)",
-        rusqlite::params![migration_id.as_bytes(), workspace.into_uuid().as_bytes(), destination.as_bytes()],
-    )?;
-    catalog.connection.execute(
-        "INSERT INTO ops_assignment_offer_projection(migration_id,source_sequence,fact_digest,assignment_id,workspace_id,activity_id,goal_id,node_id,target_agent_id,target_session_id,credit_budget,offered_at_ms) VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?10)",
-        rusqlite::params![migration_id.as_bytes(), [0xD1_u8; 32].as_slice(), leadership_assignment_id.as_bytes(), workspace.into_uuid().as_bytes(), activity.into_uuid().as_bytes(), context.goal_id().ok_or("node Goal missing")?.into_uuid().as_bytes(), context.node_id().ok_or("node ID missing")?.into_uuid().as_bytes(), sender_agent.into_uuid().as_bytes(), sender_session.into_uuid().as_bytes(), offered_at],
-    )?;
-    {
-        let transaction = catalog.connection.transaction()?;
-        crate::leadership::bootstrap_from_offer(
-            &transaction,
-            crate::leadership::OfferBootstrapObservation {
-                workspace_id: workspace,
-                activity_id: activity,
-                assignment_id: forge_domain::AgentAssignmentId::from_uuid(leadership_assignment_id),
-                target_agent_id: sender_agent,
-                offered_at_ms: offered_at,
-            },
-        )?;
-        transaction.commit()?;
-    }
-    let leadership_scope = crate::LeadershipScope::workspace(workspace);
-    let bootstrapped = catalog
-        .leadership_scope_view(leadership_scope, offered_at)?
-        .ok_or("native Workspace leadership bootstrap missing")?;
-    let confirmed = catalog.confirm_bootstrap_evidence(crate::ConfirmBootstrapEvidenceCommand {
-        scope: leadership_scope,
-        assignment_id: forge_domain::AgentAssignmentId::from_uuid(leadership_assignment_id),
-        expected_revision: bootstrapped.leadership_revision(),
-        now_ms: offered_at + 1,
-    })?;
-    let authority = catalog
-        .current_leadership_authority(leadership_scope)?
-        .ok_or("native Workspace leader missing")?;
-    assert_eq!(authority.participant_id(), sender_participant);
-    assert_eq!(
-        authority.leadership_revision(),
-        confirmed.leadership_revision()
-    );
-
-    let target = crate::ProviderMessageTarget::new(
-        workspace,
-        profile_id,
-        participation_id,
-        runtime_session_id,
-        "native-node-conversation".to_owned(),
-    )?;
-    let witness = crate::NodeMessageRouteWitness::new(
-        operation_id,
-        1,
-        1,
-        sender,
-        Some(authority.leadership_revision()),
-        crate::NodeMessageRouteTarget::Agent {
-            assignment_id,
-            assignment_revision: 1,
-            agent_id: recipient_agent.into_uuid(),
-            session_id: recipient_session.into_uuid(),
-        },
-    )?;
-    Ok((target, witness, authority.leadership_revision()))
-}
-
 #[test]
 fn ready_registration_without_canonical_native_marker_cannot_claim_native_actor()
 -> Result<(), Box<dyn Error>> {
@@ -2318,24 +2078,6 @@ fn prepare_inbox_actor(
         )?,
     )?;
     Ok((binding, pending.participant_id()))
-}
-
-fn reopen_inbox_catalog_from_v4(
-    path: &Path,
-    destination: Uuid,
-) -> Result<OperationsCatalog, Box<dyn Error>> {
-    let connection = Connection::open(path)?;
-    crate::workspace_participation::drop_schema_for_legacy_fixture(&connection)?;
-    connection.execute_batch(
-        "DROP TABLE ops_admission_records; DROP TABLE ops_approval_requests; DROP TABLE ops_approval_policy; DROP TABLE ops_issuer_config; DROP TABLE ops_leadership_confirm_intents; DROP TABLE ops_ballots; DROP TABLE ops_election_electorate; DROP TABLE ops_leadership_elections; DROP TABLE ops_leadership_receipts; DROP TABLE ops_leadership; DROP TABLE ops_work_credit_entries; DROP TABLE ops_assignment_submit_source_refs; DROP TABLE ops_assignment_submit_projection; DROP TABLE ops_assignment_offer_projection; DROP TABLE ops_assignment_review_projection; DROP TABLE ops_change_set_projection; DROP TABLE ops_execution_terminal_projection; DROP TABLE ops_effect_fact_consumers; DROP TABLE ops_logical_departure_receipts; DROP TABLE ops_logical_departures; DROP TABLE ops_logical_departure_events; DROP TABLE ops_legacy_adoptions; DROP TABLE ops_current_effect_bindings; DROP TRIGGER ops_logical_receipt_state_insert; DROP TABLE ops_logical_receipt_state; PRAGMA user_version=4;",
-    )?;
-    drop(connection);
-    let catalog = OperationsCatalog::open(path, destination)?;
-    let version: i64 = catalog
-        .connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(version, crate::catalog::VERSION);
-    Ok(catalog)
 }
 
 fn acknowledge_logical_inbox_once(
@@ -3403,7 +3145,7 @@ fn logical_inbox_reads_without_ack_and_v4_upgrade_backfills_receipt_state()
     )?;
 
     drop(catalog);
-    let mut catalog = reopen_inbox_catalog_from_v4(&catalog_path, destination)?;
+    let mut catalog = OperationsCatalog::open(&catalog_path, destination)?;
 
     let target = LogicalInboxTarget::new(
         source.workspace,
@@ -3606,183 +3348,6 @@ fn registration_rejects_late_reservation_after_import_abort() -> Result<(), Box<
 }
 
 #[test]
-fn registration_schema_v1_upgrade_preserves_import_evidence() -> Result<(), Box<dyn Error>> {
-    let destination = Uuid::from_u128(0xFC00);
-    let seed = 0xFC01;
-    let source = source_fixture(seed, 1, false, destination)?;
-    let (root, path) = catalog_root(seed)?;
-    let mut catalog = OperationsCatalog::open(&path, destination)?;
-    catalog.prepare(&source.freeze)?;
-    import_all(&mut catalog, &source)?;
-    let verified = verify_all(&mut catalog, &source)?;
-    assert_eq!(verified.phase(), ImportPhase::Verified);
-    drop(catalog);
-
-    let connection = Connection::open(&path)?;
-    crate::workspace_participation::drop_schema_for_legacy_fixture(&connection)?;
-    connection.execute_batch(
-        "DROP TABLE ops_admission_records; DROP TABLE ops_approval_requests; DROP TABLE ops_approval_policy; DROP TABLE ops_issuer_config; DROP TABLE ops_leadership_confirm_intents; DROP TABLE ops_ballots; DROP TABLE ops_election_electorate; DROP TABLE ops_leadership_elections; DROP TABLE ops_leadership_receipts; DROP TABLE ops_leadership; DROP TABLE ops_work_credit_entries; DROP TABLE ops_assignment_submit_source_refs; DROP TABLE ops_assignment_submit_projection; DROP TABLE ops_assignment_offer_projection; DROP TABLE ops_assignment_review_projection; DROP TABLE ops_change_set_projection; DROP TABLE ops_execution_terminal_projection; DROP TABLE ops_effect_fact_consumers; DROP TABLE ops_logical_departure_receipts; DROP TABLE ops_logical_departures; DROP TABLE ops_logical_departure_events; DROP TABLE ops_legacy_adoptions; DROP TABLE ops_current_effect_bindings; DROP TRIGGER ops_logical_receipt_state_insert; DROP TABLE ops_logical_receipt_state; DROP TABLE ops_logical_presence; DROP TABLE ops_binding_activations; DROP TABLE ops_logical_receipts; DROP TABLE ops_logical_bindings; DROP TABLE ops_logical_events; DROP TABLE ops_logical_members; DROP TABLE ops_registration_requests; DROP TABLE ops_pending_participants; PRAGMA user_version=1;",
-    )?;
-    drop(connection);
-
-    let catalog = OperationsCatalog::open(&path, destination)?;
-    assert_eq!(
-        catalog
-            .progress(source.migration)?
-            .ok_or("import evidence missing after schema upgrade")?
-            .phase(),
-        ImportPhase::Verified
-    );
-    let registration_tables: i64 = catalog.connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('ops_pending_participants','ops_registration_requests')",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(registration_tables, 2);
-    drop(catalog);
-    source.cleanup()?;
-    fs::remove_dir_all(root)?;
-    Ok(())
-}
-
-#[test]
-fn membership_schema_v2_upgrade_preserves_registration_data() -> Result<(), Box<dyn Error>> {
-    let destination = Uuid::from_u128(0xFC10);
-    let seed = 0xFC11;
-    let source = source_fixture(seed, 1, false, destination)?;
-    let (root, path) = catalog_root(seed)?;
-    let mut catalog = OperationsCatalog::open(&path, destination)?;
-    catalog.prepare(&source.freeze)?;
-    import_all(&mut catalog, &source)?;
-    verify_all(&mut catalog, &source)?;
-    let binding = AgentBindingReservationRequest::new(
-        Uuid::from_u128(0xFC20),
-        ActivityId::from_uuid(Uuid::from_u128(seed + 2)),
-        AgentInstanceId::from_uuid(Uuid::from_u128(0xFC210)),
-        AgentSessionId::from_uuid(Uuid::from_u128(0xFC22)),
-        AuthenticatedPrincipal::TrustedStdio,
-        timestamp(1_001)?,
-    )?;
-    let request = RegistrationRequest::new(
-        Uuid::from_u128(0xFC23),
-        binding,
-        AgentDisplayName::new("v2 registration".to_owned())?,
-        AgentDeclaredRole::new("worker".to_owned())?,
-        AgentTransportKind::Stdio,
-    )?;
-    let pending = catalog.prepare_registration(source.migration, &request)?;
-    drop(catalog);
-
-    let connection = Connection::open(&path)?;
-    crate::workspace_participation::drop_schema_for_legacy_fixture(&connection)?;
-    connection.execute_batch(
-        "DROP TABLE ops_admission_records; DROP TABLE ops_approval_requests; DROP TABLE ops_approval_policy; DROP TABLE ops_issuer_config; DROP TABLE ops_leadership_confirm_intents; DROP TABLE ops_ballots; DROP TABLE ops_election_electorate; DROP TABLE ops_leadership_elections; DROP TABLE ops_leadership_receipts; DROP TABLE ops_leadership; DROP TABLE ops_work_credit_entries; DROP TABLE ops_assignment_submit_source_refs; DROP TABLE ops_assignment_submit_projection; DROP TABLE ops_assignment_offer_projection; DROP TABLE ops_assignment_review_projection; DROP TABLE ops_change_set_projection; DROP TABLE ops_execution_terminal_projection; DROP TABLE ops_effect_fact_consumers; DROP TABLE ops_logical_departure_receipts; DROP TABLE ops_logical_departures; DROP TABLE ops_logical_departure_events; DROP TABLE ops_legacy_adoptions; DROP TABLE ops_current_effect_bindings; DROP TRIGGER ops_logical_receipt_state_insert; DROP TABLE ops_logical_receipt_state; DROP TABLE ops_logical_presence; DROP TABLE ops_binding_activations; DROP TABLE ops_logical_receipts; DROP TABLE ops_logical_bindings; DROP TABLE ops_logical_events; DROP TABLE ops_logical_members; PRAGMA user_version=2;",
-    )?;
-    drop(connection);
-
-    let catalog = OperationsCatalog::open(&path, destination)?;
-    assert_eq!(
-        catalog.registration_progress(request.binding().request_id())?,
-        Some(pending)
-    );
-    let membership_tables: i64 = catalog.connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('ops_logical_members','ops_logical_events','ops_logical_bindings','ops_logical_receipts')",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(membership_tables, 4);
-    let activation_tables: i64 = catalog.connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name='ops_binding_activations'",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(activation_tables, 1);
-    drop(catalog);
-    source.cleanup()?;
-    fs::remove_dir_all(root)?;
-    Ok(())
-}
-
-#[test]
-fn schema_v3_upgrade_adds_logical_presence_without_changing_catalog_identity()
--> Result<(), Box<dyn Error>> {
-    let destination = Uuid::from_u128(0xFC30);
-    let seed = 0xFC31;
-    let (root, path) = catalog_root(seed)?;
-    let catalog = OperationsCatalog::open(&path, destination)?;
-    drop(catalog);
-
-    let connection = Connection::open(&path)?;
-    crate::workspace_participation::drop_schema_for_legacy_fixture(&connection)?;
-    connection.execute_batch("DROP TABLE ops_admission_records; DROP TABLE ops_approval_requests; DROP TABLE ops_approval_policy; DROP TABLE ops_issuer_config; DROP TABLE ops_leadership_confirm_intents; DROP TABLE ops_ballots; DROP TABLE ops_election_electorate; DROP TABLE ops_leadership_elections; DROP TABLE ops_leadership_receipts; DROP TABLE ops_leadership; DROP TABLE ops_work_credit_entries; DROP TABLE ops_assignment_submit_source_refs; DROP TABLE ops_assignment_submit_projection; DROP TABLE ops_assignment_offer_projection; DROP TABLE ops_assignment_review_projection; DROP TABLE ops_change_set_projection; DROP TABLE ops_execution_terminal_projection; DROP TABLE ops_effect_fact_consumers; DROP TABLE ops_logical_departure_receipts; DROP TABLE ops_logical_departures; DROP TABLE ops_logical_departure_events; DROP TABLE ops_legacy_adoptions; DROP TABLE ops_current_effect_bindings; DROP TRIGGER ops_logical_receipt_state_insert; DROP TABLE ops_logical_receipt_state; DROP TABLE ops_logical_presence; PRAGMA user_version=3;")?;
-    drop(connection);
-
-    let catalog = OperationsCatalog::open(&path, destination)?;
-    assert_eq!(catalog.destination_id(), destination);
-    let version: i64 = catalog
-        .connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(version, crate::catalog::VERSION);
-    let presence_tables: i64 = catalog.connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='ops_logical_presence'",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(presence_tables, 1);
-    let inbox_state_objects: i64 = catalog.connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('ops_logical_receipt_state','ops_logical_receipt_state_insert')",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(inbox_state_objects, 2);
-    drop(catalog);
-    fs::remove_dir_all(root)?;
-    Ok(())
-}
-
-#[test]
-fn schema_v15_upgrade_adds_approval_authority_without_changing_catalog_identity()
--> Result<(), Box<dyn Error>> {
-    let destination = Uuid::from_u128(0xFC40);
-    let seed = 0xFC41;
-    let (root, path) = catalog_root(seed)?;
-    let catalog = OperationsCatalog::open(&path, destination)?;
-    drop(catalog);
-
-    // Demote a current catalog to exactly its v15 shape: the approval
-    // authority tables and later source-ref additions must not exist yet.
-    let connection = Connection::open(&path)?;
-    crate::workspace_participation::drop_schema_for_legacy_fixture(&connection)?;
-    connection.execute_batch("DROP TABLE ops_assignment_submit_source_refs; ALTER TABLE ops_assignment_submit_projection DROP COLUMN source_refs_recorded; ALTER TABLE ops_change_set_projection DROP COLUMN digest_version; DROP TABLE ops_admission_records; DROP TABLE ops_approval_requests; DROP TABLE ops_approval_policy; DROP TABLE ops_issuer_config; PRAGMA user_version=15;")?;
-    drop(connection);
-
-    let catalog = OperationsCatalog::open(&path, destination)?;
-    assert_eq!(catalog.destination_id(), destination);
-    let version: i64 = catalog
-        .connection
-        .pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(version, crate::catalog::VERSION);
-    let approval_objects: i64 = catalog.connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('ops_issuer_config','ops_approval_policy','ops_approval_requests','ops_approval_requests_workspace_idx','ops_admission_records')",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(approval_objects, 5);
-    let leadership_objects: i64 = catalog.connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('ops_leadership','ops_leadership_confirm_intents')",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(leadership_objects, 2);
-    drop(catalog);
-
-    // Reopening the upgraded catalog revalidates the current schema.
-    drop(OperationsCatalog::open(&path, destination)?);
-    fs::remove_dir_all(root)?;
-    Ok(())
-}
-
-#[test]
 fn registration_rejects_wire_metadata_that_disagrees_with_canonical_participant()
 -> Result<(), Box<dyn Error>> {
     let destination = Uuid::from_u128(0xFD00);
@@ -3969,7 +3534,6 @@ fn replacement_identity_seed(root: &Path) -> Result<ReplacementIdentitySeed, Box
         Uuid::from_u128(0xCD02),
         "phase-d-replacement".to_owned(),
         "Phase D Replacement".to_owned(),
-        AgentProfileProviderFamily::ChatGpt,
         Some("gpt-5.6-luna".to_owned()),
         Some("max".to_owned()),
         vec!["rust".to_owned()],

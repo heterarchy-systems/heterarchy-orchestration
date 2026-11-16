@@ -1,4 +1,4 @@
-//! Complete `AgentRequest` admission flow shared by transport adapters.
+//! Exact `AgentRequest` history recovery shared by transport adapters.
 
 use super::operations::ProvisionOperationFullSummary;
 use super::{
@@ -10,19 +10,6 @@ use forge_domain::AuthenticatedPrincipal;
 
 #[cfg(test)]
 mod tests;
-
-/// The existing durable stage whose failure a transport must classify.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentRequestAdmissionStage {
-    /// Validate and durably submit the immutable request intent.
-    Submit,
-    /// Observe candidates and reserve the deterministic resolution.
-    Reserve,
-    /// Prepare and bind durable provider-effect targets without dispatching.
-    Prepare,
-    /// Reconcile confirmed participation into request fulfillment.
-    Reconcile,
-}
 
 /// Same-owner read of an exact request and all currently durable stage evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,43 +91,5 @@ impl OrchestrationRuntime {
                 .map(|value| AgentRequestResolutionSummary::from_resolution(value, false)),
             operations,
         }))
-    }
-
-    /// Run the complete existing submit/reserve/prepare/reconcile sequence.
-    ///
-    /// The caller proves coordinator authority and owns bounded admission.
-    /// Clock and error conversion stay at the adapter boundary. Clock reads
-    /// occur at the same stage boundaries as the native workflow, outside
-    /// catalog guards. This operation neither dispatches provider effects nor
-    /// authorizes retries after an incomplete stage.
-    ///
-    /// # Errors
-    /// Returns the adapter's clock failure or stage-classified provisioning
-    /// error. Failures after submission can leave durable intent or targets;
-    /// callers must retain exact request readback rather than imply rollback.
-    pub fn admit_agent_request<E>(
-        &self,
-        command: AgentRequestSubmit,
-        mut clock: impl FnMut(AgentRequestAdmissionStage) -> Result<i64, E>,
-        mut map_error: impl FnMut(AgentRequestAdmissionStage, ProvisioningError) -> E,
-    ) -> Result<AgentRequestSubmitSummary, E> {
-        use AgentRequestAdmissionStage::{Prepare, Reconcile, Reserve, Submit};
-        let submitted = self
-            .submit_agent_request(command)
-            .map_err(|error| map_error(Submit, error))?;
-        let request_id = submitted.request_id;
-        let claimed_at = clock(Reserve)?;
-        let reserved_at = clock(Reserve)?;
-        self.reserve_agent_request_resolution(request_id, claimed_at, reserved_at)
-            .map_err(|error| map_error(Reserve, error))?;
-        let prepared_at = clock(Prepare)?;
-        let bound_at = clock(Prepare)?;
-        self.prepare_agent_request_effect_targets(request_id, prepared_at, bound_at)
-            .map_err(|error| map_error(Prepare, error))?;
-        let mut reconciled = self
-            .reconcile_agent_request_fulfillment(request_id, clock(Reconcile)?)
-            .map_err(|error| map_error(Reconcile, error))?;
-        reconciled.created = submitted.created;
-        Ok(reconciled)
     }
 }

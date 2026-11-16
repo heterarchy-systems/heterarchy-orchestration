@@ -19,6 +19,7 @@ pub(crate) fn validate_effect_fact_inputs(
             EffectFactInput::AssignmentReviewed(fact) => validate_review(fact)?,
             EffectFactInput::AssignmentOffered(fact) => validate_offer(fact)?,
             EffectFactInput::AssignmentSubmitted(fact) => validate_submission(fact)?,
+            EffectFactInput::DagSettled(fact) => validate_dag_settled(fact)?,
         }
     }
     Ok(())
@@ -126,6 +127,29 @@ fn validate_offer(fact: &super::AssignmentOfferedFact) -> Result<(), OperationsE
         fact.target_session_id,
     )?;
     require_timestamp(fact.offered_at_ms)
+}
+
+fn validate_dag_settled(fact: &super::DagSettledFact) -> Result<(), OperationsError> {
+    require_id(fact.settlement_id, "dag settled settlement id")?;
+    require_id(fact.workspace_id.into_uuid(), "dag settled workspace id")?;
+    require_id(fact.activity_id.into_uuid(), "dag settled activity id")?;
+    require_id(fact.goal_id.into_uuid(), "dag settled goal id")?;
+    require_id(
+        fact.coordinator_agent_id.into_uuid(),
+        "dag settled coordinator agent id",
+    )?;
+    if let Some(session_id) = fact.coordinator_session_id {
+        require_id(session_id.into_uuid(), "dag settled coordinator session id")?;
+    }
+    require_positive(fact.goal_revision, "dag settled goal revision")?;
+    require_positive(fact.dag_revision, "dag settled DAG revision")?;
+    if i64::try_from(fact.settled_file_count).is_err() {
+        return Err(OperationsError::Bounds("dag settled file count"));
+    }
+    if fact.settled_tree_digest == [0_u8; 32] {
+        return Err(OperationsError::Conflict("dag settled tree digest"));
+    }
+    require_timestamp(fact.settled_at_ms)
 }
 
 fn validate_submission(fact: &super::AssignmentSubmittedFact<'_>) -> Result<(), OperationsError> {

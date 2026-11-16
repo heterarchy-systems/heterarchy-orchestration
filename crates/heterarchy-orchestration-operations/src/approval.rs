@@ -61,7 +61,32 @@ const REQUESTS_SQL: &str = "CREATE TABLE ops_approval_requests (request_id BLOB 
 const REQUESTS_WORKSPACE_INDEX: &str = "CREATE INDEX ops_approval_requests_workspace_idx ON ops_approval_requests(workspace_id, requested_at_ms)";
 const ADMISSIONS_SQL: &str = "CREATE TABLE ops_admission_records (admission_id BLOB PRIMARY KEY NOT NULL CHECK(length(admission_id)=16), request_id BLOB NOT NULL UNIQUE REFERENCES ops_approval_requests(request_id) CHECK(length(request_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), issuer_id TEXT NOT NULL CHECK(length(issuer_id)=36), backend_id TEXT NOT NULL CHECK(length(backend_id)=36), issued_at_ms INTEGER NOT NULL CHECK(issued_at_ms>=0), expires_at_ms INTEGER NOT NULL CHECK(expires_at_ms>issued_at_ms), state TEXT NOT NULL CHECK(state IN('issued','consumed','expired')), consumed_at_ms INTEGER CHECK(consumed_at_ms IS NULL OR consumed_at_ms>=issued_at_ms), CHECK(state='consumed' OR consumed_at_ms IS NULL))";
 
-const REQUEST_COLUMNS: &str = "substr(request_id,1,17),substr(workspace_id,1,17),action_class,substr(request_digest,1,33),principal_kind,substr(principal_id,1,17),substr(session_id,1,17),workspace_read,workspace_write,network,policy_revision,substr(auto_scope_id,1,17),state,requested_at_ms,expires_at_ms,decided_at_ms,substr(decided_by,1,17),(SELECT revision FROM ops_approval_request_versions WHERE request_id=ops_approval_requests.request_id)";
+macro_rules! request_columns {
+    () => {
+        "substr(request_id,1,17),substr(workspace_id,1,17),action_class,substr(request_digest,1,33),principal_kind,substr(principal_id,1,17),substr(session_id,1,17),workspace_read,workspace_write,network,policy_revision,substr(auto_scope_id,1,17),state,requested_at_ms,expires_at_ms,decided_at_ms,substr(decided_by,1,17),(SELECT revision FROM ops_approval_request_versions WHERE request_id=ops_approval_requests.request_id)"
+    };
+}
+
+const SELECT_REQUEST_BY_ID_SQL: &str = crate::static_sql::StaticSql::dml(concat!(
+    "SELECT ",
+    request_columns!(),
+    " FROM ops_approval_requests WHERE request_id=?1"
+))
+.as_str();
+
+const SELECT_REQUESTS_BY_WORKSPACE_AND_STATE_SQL: &str = crate::static_sql::StaticSql::dml(concat!(
+    "SELECT ",
+    request_columns!(),
+    " FROM ops_approval_requests WHERE workspace_id=?1 AND state=?2 ORDER BY requested_at_ms,request_id LIMIT ?3"
+))
+.as_str();
+
+const SELECT_REQUESTS_BY_WORKSPACE_SQL: &str = crate::static_sql::StaticSql::dml(concat!(
+    "SELECT ",
+    request_columns!(),
+    " FROM ops_approval_requests WHERE workspace_id=?1 ORDER BY requested_at_ms,request_id LIMIT ?2"
+))
+.as_str();
 
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
@@ -465,17 +490,13 @@ impl RequestRow {
     }
 }
 
-fn request_select(where_clause: &str) -> String {
-    format!("SELECT {REQUEST_COLUMNS} FROM ops_approval_requests {where_clause}")
-}
-
 fn load_request_row(
     connection: &Connection,
     request_id: ApprovalRequestId,
 ) -> Result<Option<RequestRow>, OperationsError> {
     connection
         .query_row(
-            request_select("WHERE request_id=?1").as_str(),
+            SELECT_REQUEST_BY_ID_SQL,
             params![request_id.into_uuid().as_bytes()],
             RawRequest::from_row,
         )
@@ -1786,10 +1807,9 @@ impl OperationsCatalog {
                 + 1,
         )?;
         let rows: Vec<RawRequest> = if let Some(state) = query.state {
-            let sql = request_select(
-                "WHERE workspace_id=?1 AND state=?2 ORDER BY requested_at_ms,request_id LIMIT ?3",
-            );
-            let mut statement = self.connection.prepare(sql.as_str())?;
+            let mut statement = self
+                .connection
+                .prepare(SELECT_REQUESTS_BY_WORKSPACE_AND_STATE_SQL)?;
             statement
                 .query_map(
                     params![
@@ -1802,10 +1822,7 @@ impl OperationsCatalog {
                 )?
                 .collect::<Result<Vec<_>, _>>()?
         } else {
-            let sql = request_select(
-                "WHERE workspace_id=?1 ORDER BY requested_at_ms,request_id LIMIT ?2",
-            );
-            let mut statement = self.connection.prepare(sql.as_str())?;
+            let mut statement = self.connection.prepare(SELECT_REQUESTS_BY_WORKSPACE_SQL)?;
             statement
                 .query_map(
                     params![query.workspace_id.into_uuid().as_bytes(), window],

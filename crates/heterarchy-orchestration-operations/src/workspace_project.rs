@@ -29,22 +29,28 @@ impl WorkspaceProjectScope {
         workspace_revision: i64,
         locator: String,
     ) -> Result<Self, OperationsError> {
-        if workspace_id.is_nil()
-            || location_id.is_nil()
-            || location_revision <= 0
-            || workspace_revision <= 0
-            || locator.is_empty()
-            || locator.len() > MAX_LOCATOR_BYTES
-        {
-            return Err(OperationsError::Conflict("Workspace scope"));
-        }
-        Ok(Self {
+        let scope = Self {
             workspace_id,
             location_id,
             location_revision,
             workspace_revision,
             locator,
-        })
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), OperationsError> {
+        if self.workspace_id.is_nil()
+            || self.location_id.is_nil()
+            || self.location_revision <= 0
+            || self.workspace_revision <= 0
+            || self.locator.is_empty()
+            || self.locator.len() > MAX_LOCATOR_BYTES
+        {
+            return Err(OperationsError::Conflict("Workspace scope"));
+        }
+        Ok(())
     }
 
     #[must_use]

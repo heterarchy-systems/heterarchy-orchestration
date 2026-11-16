@@ -31,10 +31,6 @@ const MAX_TEAM_PROFILES_PER_WORKSPACE: usize = 4;
 pub const MIN_FORMING_TEAM_MEMBERS: usize = 2;
 pub const MAX_INITIAL_TEAM_MEMBERS: usize = 64;
 
-const TEAMS_SQL_V36: &str = "CREATE TABLE ops_teams (team_id BLOB PRIMARY KEY NOT NULL CHECK(length(team_id)=16 AND team_id != zeroblob(16)), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), name TEXT NOT NULL CHECK(length(CAST(name AS BLOB)) BETWEEN 1 AND 128), purpose TEXT NOT NULL CHECK(length(CAST(purpose AS BLOB)) BETWEEN 0 AND 2048), state TEXT NOT NULL CHECK(state IN('ACTIVE','RETIRED')), revision INTEGER NOT NULL CHECK(revision>=1), created_by_key TEXT NOT NULL CHECK(length(CAST(created_by_key AS BLOB)) BETWEEN 1 AND 256), created_by_display_name TEXT NOT NULL CHECK(length(CAST(created_by_display_name AS BLOB)) BETWEEN 1 AND 128), created_by_participation_id BLOB CHECK(created_by_participation_id IS NULL OR length(created_by_participation_id)=16), created_by_profile_id BLOB CHECK(created_by_profile_id IS NULL OR length(created_by_profile_id)=16), created_by_participant_id BLOB CHECK(created_by_participant_id IS NULL OR length(created_by_participant_id)=16), created_by_session_id BLOB CHECK(created_by_session_id IS NULL OR length(created_by_session_id)=16), created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms>=created_at_ms), UNIQUE(workspace_id,team_id))";
-const TEAM_REQUESTS_SQL_V36: &str = "CREATE TABLE ops_team_requests (request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id)=16 AND request_id != zeroblob(16)), operation TEXT NOT NULL CHECK(operation IN('CREATE','JOIN','LEAVE','RETIRE')), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), team_id BLOB NOT NULL CHECK(length(team_id)=16 AND team_id != zeroblob(16)), actor_key TEXT NOT NULL CHECK(length(CAST(actor_key AS BLOB)) BETWEEN 1 AND 256), actor_display_name TEXT NOT NULL CHECK(length(CAST(actor_display_name AS BLOB)) BETWEEN 1 AND 128), actor_participation_id BLOB CHECK(actor_participation_id IS NULL OR length(actor_participation_id)=16), actor_profile_id BLOB CHECK(actor_profile_id IS NULL OR length(actor_profile_id)=16), actor_participant_id BLOB CHECK(actor_participant_id IS NULL OR length(actor_participant_id)=16), actor_session_id BLOB CHECK(actor_session_id IS NULL OR length(actor_session_id)=16), name TEXT CHECK(name IS NULL OR length(CAST(name AS BLOB)) BETWEEN 1 AND 128), purpose TEXT CHECK(purpose IS NULL OR length(CAST(purpose AS BLOB)) BETWEEN 0 AND 2048), expected_team_revision INTEGER CHECK(expected_team_revision IS NULL OR expected_team_revision>=1), result_team_state TEXT NOT NULL CHECK(result_team_state IN('ACTIVE','RETIRED')), result_team_revision INTEGER NOT NULL CHECK(result_team_revision>=1), result_team_updated_at_ms INTEGER NOT NULL CHECK(result_team_updated_at_ms>=0), result_membership_state TEXT CHECK(result_membership_state IS NULL OR result_membership_state IN('JOINED','LEFT')), result_membership_participation_id BLOB CHECK(result_membership_participation_id IS NULL OR length(result_membership_participation_id)=16), result_membership_revision INTEGER CHECK(result_membership_revision IS NULL OR result_membership_revision>=1), result_membership_joined_at_ms INTEGER CHECK(result_membership_joined_at_ms IS NULL OR result_membership_joined_at_ms>=0), result_membership_left_at_ms INTEGER CHECK(result_membership_left_at_ms IS NULL OR result_membership_left_at_ms>=0), created INTEGER NOT NULL CHECK(created IN(0,1)), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0))";
-const TEAM_MEMBERS_SQL_V36: &str = "CREATE TABLE ops_team_members (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), team_id BLOB NOT NULL CHECK(length(team_id)=16 AND team_id != zeroblob(16)), participation_id BLOB NOT NULL CHECK(length(participation_id)=16 AND participation_id != zeroblob(16)), state TEXT NOT NULL CHECK(state IN('JOINED','LEFT')), revision INTEGER NOT NULL CHECK(revision>=1), joined_at_ms INTEGER NOT NULL CHECK(joined_at_ms>=0), left_at_ms INTEGER CHECK(left_at_ms IS NULL OR left_at_ms>=joined_at_ms), PRIMARY KEY(workspace_id,team_id,participation_id), FOREIGN KEY(workspace_id,team_id) REFERENCES ops_teams(workspace_id,team_id), FOREIGN KEY(workspace_id,participation_id) REFERENCES ops_workspace_participations(workspace_id,participation_id))";
-const TEAM_MEMBER_EVENTS_SQL_V36: &str = "CREATE TABLE ops_team_member_events (request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id)=16 AND request_id != zeroblob(16)), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), team_id BLOB NOT NULL CHECK(length(team_id)=16 AND team_id != zeroblob(16)), participation_id BLOB NOT NULL CHECK(length(participation_id)=16 AND participation_id != zeroblob(16)), state TEXT NOT NULL CHECK(state IN('JOINED','LEFT')), membership_revision INTEGER NOT NULL CHECK(membership_revision>=1), actor_key TEXT NOT NULL CHECK(length(CAST(actor_key AS BLOB)) BETWEEN 1 AND 256), actor_display_name TEXT NOT NULL CHECK(length(CAST(actor_display_name AS BLOB)) BETWEEN 1 AND 128), actor_participation_id BLOB CHECK(actor_participation_id IS NULL OR length(actor_participation_id)=16), actor_profile_id BLOB CHECK(actor_profile_id IS NULL OR length(actor_profile_id)=16), actor_participant_id BLOB CHECK(actor_participant_id IS NULL OR length(actor_participant_id)=16), actor_session_id BLOB CHECK(actor_session_id IS NULL OR length(actor_session_id)=16), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0), FOREIGN KEY(request_id) REFERENCES ops_team_requests(request_id), FOREIGN KEY(workspace_id,team_id,participation_id) REFERENCES ops_team_members(workspace_id,team_id,participation_id))";
 const TEAMS_SQL: &str = "CREATE TABLE ops_teams (team_id BLOB PRIMARY KEY NOT NULL CHECK(length(team_id)=16 AND team_id != zeroblob(16)), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), name TEXT NOT NULL CHECK(length(CAST(name AS BLOB)) BETWEEN 1 AND 128), purpose TEXT NOT NULL CHECK(length(CAST(purpose AS BLOB)) BETWEEN 0 AND 2048), state TEXT NOT NULL CHECK(state IN('ACTIVE','RETIRED')), revision INTEGER NOT NULL CHECK(revision>=1), created_by_key TEXT NOT NULL CHECK(length(CAST(created_by_key AS BLOB)) BETWEEN 1 AND 256), created_by_display_name TEXT NOT NULL CHECK(length(CAST(created_by_display_name AS BLOB)) BETWEEN 1 AND 128), created_by_participation_id BLOB CHECK(created_by_participation_id IS NULL OR length(created_by_participation_id)=16), created_by_profile_id BLOB CHECK(created_by_profile_id IS NULL OR length(created_by_profile_id)=16), created_by_participant_id BLOB CHECK(created_by_participant_id IS NULL OR length(created_by_participant_id)=16), created_by_session_id BLOB CHECK(created_by_session_id IS NULL OR length(created_by_session_id)=16), created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms>=created_at_ms), formed_at_ms INTEGER CHECK(formed_at_ms IS NULL OR formed_at_ms>=created_at_ms), UNIQUE(workspace_id,team_id))";
 const TEAM_REQUESTS_SQL: &str = "CREATE TABLE ops_team_requests (request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id)=16 AND request_id != zeroblob(16)), operation TEXT NOT NULL CHECK(operation IN('CREATE','JOIN','LEAVE','RETIRE')), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), team_id BLOB NOT NULL CHECK(length(team_id)=16 AND team_id != zeroblob(16)), actor_key TEXT NOT NULL CHECK(length(CAST(actor_key AS BLOB)) BETWEEN 1 AND 256), actor_display_name TEXT NOT NULL CHECK(length(CAST(actor_display_name AS BLOB)) BETWEEN 1 AND 128), actor_participation_id BLOB CHECK(actor_participation_id IS NULL OR length(actor_participation_id)=16), actor_profile_id BLOB CHECK(actor_profile_id IS NULL OR length(actor_profile_id)=16), actor_participant_id BLOB CHECK(actor_participant_id IS NULL OR length(actor_participant_id)=16), actor_session_id BLOB CHECK(actor_session_id IS NULL OR length(actor_session_id)=16), name TEXT CHECK(name IS NULL OR length(CAST(name AS BLOB)) BETWEEN 1 AND 128), purpose TEXT CHECK(purpose IS NULL OR length(CAST(purpose AS BLOB)) BETWEEN 0 AND 2048), expected_team_revision INTEGER CHECK(expected_team_revision IS NULL OR expected_team_revision>=1), result_team_state TEXT NOT NULL CHECK(result_team_state IN('ACTIVE','RETIRED')), result_team_revision INTEGER NOT NULL CHECK(result_team_revision>=1), result_team_updated_at_ms INTEGER NOT NULL CHECK(result_team_updated_at_ms>=0), result_membership_state TEXT CHECK(result_membership_state IS NULL OR result_membership_state IN('JOINED','LEFT')), result_membership_participation_id BLOB CHECK(result_membership_participation_id IS NULL OR length(result_membership_participation_id)=16), result_membership_revision INTEGER CHECK(result_membership_revision IS NULL OR result_membership_revision>=1), result_membership_joined_at_ms INTEGER CHECK(result_membership_joined_at_ms IS NULL OR result_membership_joined_at_ms>=0), result_membership_left_at_ms INTEGER CHECK(result_membership_left_at_ms IS NULL OR result_membership_left_at_ms>=0), created INTEGER NOT NULL CHECK(created IN(0,1)), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0), request_actor_kind TEXT CHECK(request_actor_kind IS NULL OR request_actor_kind IN('OPERATOR','PARTICIPANT')), request_actor_activity_id BLOB CHECK(request_actor_activity_id IS NULL OR (length(request_actor_activity_id)=16 AND request_actor_activity_id != zeroblob(16))), request_actor_agent_id BLOB CHECK(request_actor_agent_id IS NULL OR (length(request_actor_agent_id)=16 AND request_actor_agent_id != zeroblob(16))), request_leadership_revision INTEGER CHECK(request_leadership_revision IS NULL OR request_leadership_revision>=1), role TEXT CHECK(role IS NULL OR (length(CAST(role AS BLOB)) BETWEEN 1 AND 256 AND length(trim(role))>0)), result_membership_role TEXT CHECK(result_membership_role IS NULL OR (length(CAST(result_membership_role AS BLOB)) BETWEEN 1 AND 256 AND length(trim(result_membership_role))>0)), CHECK((request_actor_kind IS NULL AND request_actor_activity_id IS NULL AND request_actor_agent_id IS NULL AND request_leadership_revision IS NULL) OR (request_actor_kind='OPERATOR' AND request_actor_activity_id IS NULL AND request_actor_agent_id IS NULL AND request_leadership_revision IS NULL) OR (request_actor_kind='PARTICIPANT' AND request_actor_activity_id IS NOT NULL AND request_actor_agent_id IS NOT NULL)))";
 const TEAM_MEMBERS_SQL: &str = "CREATE TABLE ops_team_members (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), team_id BLOB NOT NULL CHECK(length(team_id)=16 AND team_id != zeroblob(16)), participation_id BLOB NOT NULL CHECK(length(participation_id)=16 AND participation_id != zeroblob(16)), state TEXT NOT NULL CHECK(state IN('JOINED','LEFT')), revision INTEGER NOT NULL CHECK(revision>=1), joined_at_ms INTEGER NOT NULL CHECK(joined_at_ms>=0), left_at_ms INTEGER CHECK(left_at_ms IS NULL OR left_at_ms>=joined_at_ms), role TEXT CHECK(role IS NULL OR (length(CAST(role AS BLOB)) BETWEEN 1 AND 256 AND length(trim(role))>0)), PRIMARY KEY(workspace_id,team_id,participation_id), FOREIGN KEY(workspace_id,team_id) REFERENCES ops_teams(workspace_id,team_id), FOREIGN KEY(workspace_id,participation_id) REFERENCES ops_workspace_participations(workspace_id,participation_id))";
@@ -50,46 +46,6 @@ pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)
         ("table", "ops_team_member_events", TEAM_MEMBER_EVENTS_SQL),
         ("table", "ops_team_create_roster", TEAM_CREATE_ROSTER_SQL),
     ]
-}
-
-pub(crate) fn schema_objects_v36() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
-        ("table", "ops_teams", TEAMS_SQL_V36),
-        ("table", "ops_team_requests", TEAM_REQUESTS_SQL_V36),
-        ("table", "ops_team_members", TEAM_MEMBERS_SQL_V36),
-        (
-            "table",
-            "ops_team_member_events",
-            TEAM_MEMBER_EVENTS_SQL_V36,
-        ),
-    ]
-}
-
-/// Rebuild the four frozen V36 Team tables in current V37 shape while preserving
-/// every historical row with NULL formation/role/provenance fields.
-pub(crate) fn migrate_v36_to_v37(tx: &Transaction<'_>) -> Result<(), OperationsError> {
-    tx.execute_batch(
-        "ALTER TABLE ops_team_member_events RENAME TO ops_team_member_events_v36;
-         ALTER TABLE ops_team_members RENAME TO ops_team_members_v36;
-         ALTER TABLE ops_team_requests RENAME TO ops_team_requests_v36;
-         ALTER TABLE ops_teams RENAME TO ops_teams_v36;",
-    )?;
-    create_schema(tx)?;
-    tx.execute_batch(
-        "INSERT INTO ops_teams(team_id,workspace_id,name,purpose,state,revision,created_by_key,created_by_display_name,created_by_participation_id,created_by_profile_id,created_by_participant_id,created_by_session_id,created_at_ms,updated_at_ms,formed_at_ms)
-         SELECT team_id,workspace_id,name,purpose,state,revision,created_by_key,created_by_display_name,created_by_participation_id,created_by_profile_id,created_by_participant_id,created_by_session_id,created_at_ms,updated_at_ms,NULL FROM ops_teams_v36;
-         INSERT INTO ops_team_requests(request_id,operation,workspace_id,team_id,actor_key,actor_display_name,actor_participation_id,actor_profile_id,actor_participant_id,actor_session_id,name,purpose,expected_team_revision,result_team_state,result_team_revision,result_team_updated_at_ms,result_membership_state,result_membership_participation_id,result_membership_revision,result_membership_joined_at_ms,result_membership_left_at_ms,created,observed_at_ms,request_actor_kind,request_actor_activity_id,request_actor_agent_id,request_leadership_revision,role,result_membership_role)
-         SELECT request_id,operation,workspace_id,team_id,actor_key,actor_display_name,actor_participation_id,actor_profile_id,actor_participant_id,actor_session_id,name,purpose,expected_team_revision,result_team_state,result_team_revision,result_team_updated_at_ms,result_membership_state,result_membership_participation_id,result_membership_revision,result_membership_joined_at_ms,result_membership_left_at_ms,created,observed_at_ms,NULL,NULL,NULL,NULL,NULL,NULL FROM ops_team_requests_v36;
-         INSERT INTO ops_team_members(workspace_id,team_id,participation_id,state,revision,joined_at_ms,left_at_ms,role)
-         SELECT workspace_id,team_id,participation_id,state,revision,joined_at_ms,left_at_ms,NULL FROM ops_team_members_v36;
-         INSERT INTO ops_team_member_events(request_id,workspace_id,team_id,participation_id,state,membership_revision,actor_key,actor_display_name,actor_participation_id,actor_profile_id,actor_participant_id,actor_session_id,observed_at_ms,role)
-         SELECT request_id,workspace_id,team_id,participation_id,state,membership_revision,actor_key,actor_display_name,actor_participation_id,actor_profile_id,actor_participant_id,actor_session_id,observed_at_ms,NULL FROM ops_team_member_events_v36;
-         DROP TABLE ops_team_member_events_v36;
-         DROP TABLE ops_team_members_v36;
-         DROP TABLE ops_team_requests_v36;
-         DROP TABLE ops_teams_v36;",
-    )?;
-    Ok(())
 }
 
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsError> {
@@ -1213,8 +1169,9 @@ pub(crate) fn team_member_counts(
 
 /// Fresh Team admission only. The caller binds `t` to `ops_teams`; frozen
 /// election authority and already-admitted work deliberately do not use it.
-pub(crate) const FORMED_TEAM_ADMISSION_PREDICATE: &str =
-    "t.state='ACTIVE' AND t.formed_at_ms IS NOT NULL
+macro_rules! formed_team_admission_predicate {
+    () => {
+        "t.state='ACTIVE' AND t.formed_at_ms IS NOT NULL
      AND NOT EXISTS(SELECT 1 FROM ops_team_members missing_role
        WHERE missing_role.workspace_id=t.workspace_id AND missing_role.team_id=t.team_id
          AND missing_role.state='JOINED' AND missing_role.role IS NULL)
@@ -1228,7 +1185,17 @@ pub(crate) const FORMED_TEAM_ADMISSION_PREDICATE: &str =
             AND binding.session_id=logical.session_id
        WHERE member.workspace_id=t.workspace_id AND member.team_id=t.team_id AND member.state='JOINED'
        GROUP BY member.workspace_id,member.team_id
-       HAVING COUNT(DISTINCT member.participation_id)>=2 AND COUNT(DISTINCT logical.participant_id)>=2)";
+       HAVING COUNT(DISTINCT member.participation_id)>=2 AND COUNT(DISTINCT logical.participant_id)>=2)"
+    };
+}
+pub(crate) use formed_team_admission_predicate;
+
+const EXISTS_FORMED_TEAM_SQL: &str = crate::static_sql::StaticSql::dml(concat!(
+    "SELECT EXISTS(SELECT 1 FROM ops_teams t WHERE t.workspace_id=?1 AND t.team_id=?2 AND (",
+    formed_team_admission_predicate!(),
+    "))"
+))
+.as_str();
 
 pub(crate) fn ensure_team_formed(
     connection: &Connection,
@@ -1237,8 +1204,8 @@ pub(crate) fn ensure_team_formed(
 ) -> Result<(), OperationsError> {
     validate_team_id(team_id)?;
     let formed: bool = connection.query_row(
-        &format!("SELECT EXISTS(SELECT 1 FROM ops_teams t WHERE t.workspace_id=?1 AND t.team_id=?2 AND ({FORMED_TEAM_ADMISSION_PREDICATE}))"),
-        params![workspace_id.into_uuid().as_bytes(),team_id.as_bytes()],
+        EXISTS_FORMED_TEAM_SQL,
+        params![workspace_id.into_uuid().as_bytes(), team_id.as_bytes()],
         |row| row.get(0),
     )?;
     if !formed {

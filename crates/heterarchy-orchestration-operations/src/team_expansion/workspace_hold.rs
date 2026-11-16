@@ -10,8 +10,7 @@ mod schema;
 mod tests;
 
 pub(super) use schema::{
-    PRE_HOLD_DECISION_BACKFILL_SQL, create_recovery_schema,
-    create_schema as create_workspace_hold_schema, recovery_schema_objects,
+    create_recovery_schema, create_schema as create_workspace_hold_schema, recovery_schema_objects,
     schema_objects as workspace_hold_schema_objects,
 };
 

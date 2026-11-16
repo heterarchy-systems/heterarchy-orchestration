@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeMap,
     error::Error,
     fs,
     path::PathBuf,
@@ -17,7 +16,7 @@ use forge_domain::{
     EvaluationT1CoverageMember, ForgeBackendId, OrchestrationIssuerId, TimestampMillis,
     WorkspaceId,
 };
-use rusqlite::{params, types::Value};
+use rusqlite::params;
 use uuid::Uuid;
 
 use crate::{
@@ -1426,137 +1425,6 @@ fn cumulative_source_binding_requires_same_assignment_and_activity_identity()
     reject_changed_activity(&mut fixture)?;
     reject_bound_to_unknown_downgrade(&mut fixture)?;
     assert_eq!(binding_count(&fixture)?, 2);
-    Ok(())
-}
-
-type CatalogRowsSnapshot = BTreeMap<String, Vec<Vec<Value>>>;
-
-fn snapshot_catalog_rows(
-    connection: &rusqlite::Connection,
-) -> Result<CatalogRowsSnapshot, Box<dyn Error>> {
-    let table_names = {
-        let mut statement = connection.prepare(
-            "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-        )?;
-        statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    let mut snapshot = BTreeMap::new();
-    for name in table_names {
-        let quoted_name = format!("\"{}\"", name.replace('"', "\"\""));
-        let mut statement = connection.prepare(&format!("SELECT * FROM {quoted_name}"))?;
-        let columns = statement.column_count();
-        let rows = statement
-            .query_map([], |row| {
-                (0..columns)
-                    .map(|column| row.get::<_, Value>(column))
-                    .collect::<Result<Vec<_>, _>>()
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        snapshot.insert(name, rows);
-    }
-    Ok(snapshot)
-}
-
-fn assert_schema55_governance_tables_empty(
-    connection: &rusqlite::Connection,
-) -> Result<(), Box<dyn Error>> {
-    let objects = crate::temporary_dispatch::schema_objects()
-        .into_iter()
-        .chain(
-            crate::reviewer_qualification_rule::schema_objects()
-                .iter()
-                .copied(),
-        );
-    for (kind, name, _) in objects {
-        if kind == "table" {
-            let count: i64 =
-                connection.query_row(&format!("SELECT COUNT(*) FROM {name}"), [], |row| {
-                    row.get(0)
-                })?;
-            assert_eq!(count, 0, "new governance table {name} must be empty");
-        }
-    }
-    Ok(())
-}
-
-fn assert_foreign_keys_clean(connection: &rusqlite::Connection) -> Result<(), Box<dyn Error>> {
-    let mut statement = connection.prepare("PRAGMA foreign_key_check")?;
-    let violations = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    assert!(
-        violations.is_empty(),
-        "foreign-key check found {violations:?}"
-    );
-    Ok(())
-}
-
-#[test]
-fn schema_v54_upgrade_preserves_nonempty_mission_evidence_records() -> Result<(), Box<dyn Error>> {
-    let mut fixture = Fixture::new()?;
-    let bundle = fixture.manifest_bundle(None, None, fixture.source_digest)?;
-    let binding = bind_pending_manifest(&mut fixture, bundle)?;
-    let (_, observation) = record_first_pending_observation(&mut fixture, &binding)?;
-    assert_eq!(binding_count(&fixture)?, 1);
-    let observation_count: i64 = fixture.catalog.connection.query_row(
-        "SELECT COUNT(*) FROM ops_mission_evidence_observations",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(observation_count, 1);
-    let observation_member_count: i64 = fixture.catalog.connection.query_row(
-        "SELECT COUNT(*) FROM ops_mission_evidence_observation_members WHERE observation_request_id=?1",
-        params![observation.request_id().as_bytes()],
-        |row| row.get(0),
-    )?;
-    assert_eq!(observation_member_count, 2);
-
-    let before = snapshot_catalog_rows(&fixture.catalog.connection)?;
-    crate::catalog::drop_v55_governance_schema_for_legacy_fixture(&fixture.catalog.connection)?;
-    fixture
-        .catalog
-        .connection
-        .pragma_update(None, "user_version", 54)?;
-    fixture.reopen()?;
-    assert_eq!(
-        fixture
-            .catalog
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        crate::catalog::VERSION
-    );
-    assert_eq!(snapshot_catalog_rows(&fixture.catalog.connection)?, before);
-    assert_eq!(
-        fixture
-            .catalog
-            .mission_evidence_binding(fixture.workspace, fixture.plan_id, 1)?,
-        Some(binding.clone())
-    );
-    assert_eq!(
-        fixture
-            .catalog
-            .mission_evidence_observation(fixture.workspace, observation.request_id())?,
-        Some(observation.clone())
-    );
-    assert_schema55_governance_tables_empty(&fixture.catalog.connection)?;
-    assert_foreign_keys_clean(&fixture.catalog.connection)?;
-
-    fixture.close_catalog()?;
-    let read_only = OperationsCatalog::open_existing_read_only(&fixture.path, fixture.destination)?;
-    assert_eq!(snapshot_catalog_rows(&read_only.connection)?, before);
-    assert_eq!(
-        read_only.mission_evidence_binding(fixture.workspace, fixture.plan_id, 1)?,
-        Some(binding)
-    );
-    assert_eq!(
-        read_only.mission_evidence_observation(fixture.workspace, observation.request_id())?,
-        Some(observation)
-    );
-    assert_schema55_governance_tables_empty(&read_only.connection)?;
-    assert_foreign_keys_clean(&read_only.connection)?;
-    drop(read_only);
     Ok(())
 }
 

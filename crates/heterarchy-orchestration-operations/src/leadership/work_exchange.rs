@@ -13,7 +13,19 @@ use uuid::Uuid;
 
 const TABLE: &str = "CREATE TABLE ops_leadership_work_exchanges (request_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_leadership_confirm_intents(request_id) CHECK(length(request_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1,2)), activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16), team_id BLOB CHECK(team_id IS NULL OR length(team_id)=16), election_id BLOB NOT NULL REFERENCES ops_leadership_elections(election_id) CHECK(length(election_id)=16), incumbent_participant_id BLOB CHECK(incumbent_participant_id IS NULL OR length(incumbent_participant_id)=16), elected_participant_id BLOB NOT NULL CHECK(length(elected_participant_id)=16), incumbent_participation_id BLOB CHECK(incumbent_participation_id IS NULL OR length(incumbent_participation_id)=16), elected_participation_id BLOB CHECK(elected_participation_id IS NULL OR length(elected_participation_id)=16), leadership_revision INTEGER NOT NULL CHECK(leadership_revision>=1), fence_revision INTEGER NOT NULL CHECK(fence_revision>=1), confirmed_at_ms INTEGER NOT NULL CHECK(confirmed_at_ms>=0), reason INTEGER NOT NULL CHECK(reason BETWEEN 0 AND 5), CHECK((scope_kind=0 AND activity_id IS NULL AND team_id IS NULL) OR (scope_kind=1 AND activity_id IS NOT NULL AND team_id IS NULL) OR (scope_kind=2 AND activity_id IS NULL AND team_id IS NOT NULL)))";
 const INDEX: &str = "CREATE INDEX ops_leadership_work_exchanges_pending ON ops_leadership_work_exchanges(workspace_id,request_id) WHERE reason IN(3,4,5)";
-const SELECT: &str = "SELECT substr(request_id,1,17),substr(workspace_id,1,17),scope_kind,substr(activity_id,1,17),substr(team_id,1,17),substr(election_id,1,17),substr(incumbent_participant_id,1,17),substr(elected_participant_id,1,17),substr(incumbent_participation_id,1,17),substr(elected_participation_id,1,17),leadership_revision,fence_revision,confirmed_at_ms,reason FROM ops_leadership_work_exchanges";
+macro_rules! select_work_exchange_sql {
+    () => {
+        "SELECT substr(request_id,1,17),substr(workspace_id,1,17),scope_kind,substr(activity_id,1,17),substr(team_id,1,17),substr(election_id,1,17),substr(incumbent_participant_id,1,17),substr(elected_participant_id,1,17),substr(incumbent_participation_id,1,17),substr(elected_participation_id,1,17),leadership_revision,fence_revision,confirmed_at_ms,reason FROM ops_leadership_work_exchanges"
+    };
+}
+const SELECT_PENDING_PAGE_SQL: &str = crate::static_sql::StaticSql::dml(concat!(
+    select_work_exchange_sql!(),
+    " WHERE workspace_id=?1 AND reason IN(3,4,5) AND (?2 IS NULL OR request_id>?2) ORDER BY request_id LIMIT ?3"
+))
+.as_str();
+const SELECT_BY_REQUEST_ID_SQL: &str =
+    crate::static_sql::StaticSql::dml(concat!(select_work_exchange_sql!(), " WHERE request_id=?1"))
+        .as_str();
 
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
@@ -210,7 +222,7 @@ impl OperationsCatalog {
             }
         }
         let mut records = {
-            let mut query = tx.prepare(&format!("{SELECT} WHERE workspace_id=?1 AND reason IN(3,4,5) AND (?2 IS NULL OR request_id>?2) ORDER BY request_id LIMIT ?3"))?;
+            let mut query = tx.prepare(SELECT_PENDING_PAGE_SQL)?;
             query
                 .query_map(
                     params![
@@ -420,7 +432,7 @@ fn load(
 ) -> Result<Option<LeadershipWorkExchangeRecord>, OperationsError> {
     connection
         .query_row(
-            &format!("{SELECT} WHERE request_id=?1"),
+            SELECT_BY_REQUEST_ID_SQL,
             params![request_id.as_bytes()],
             RawRecord::read,
         )

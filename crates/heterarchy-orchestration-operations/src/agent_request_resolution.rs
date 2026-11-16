@@ -269,12 +269,12 @@ impl AgentRequestResolutionOutcome {
 }
 
 impl OperationsCatalog {
-    /// Commit one complete resolver reservation batch. Exact replay returns the
-    /// first batch; changed replay conflicts.
+    /// Read an exact historical resolver reservation replay.
     ///
     /// # Errors
-    /// Rejects stale request revisions, selection/count mismatches, changed
-    /// replay, malformed durable rows, or uncertain commits.
+    /// Fresh provider-backed reservations always return
+    /// [`OperationsError::ProviderRetired`] before any insert or update.
+    /// Existing exact replays remain readable; changed replays conflict.
     pub fn commit_agent_request_resolution(
         &mut self,
         command: &CommitAgentRequestResolution,
@@ -314,45 +314,7 @@ impl OperationsCatalog {
                 "AgentRequest resolution request revision",
             ));
         }
-        if resolution_row_count(&transaction, command.request_id)? != 0 {
-            return Err(OperationsError::Corrupt(
-                "AgentRequest pending resolution already has rows",
-            ));
-        }
-        for selection in &command.selections {
-            insert_selection(&transaction, command, *selection)?;
-        }
-        let changed = transaction.execute(
-            "UPDATE ops_agent_requests SET state=2,revision=2
-             WHERE request_id=?1 AND state=1 AND revision=?2",
-            params![
-                command.request_id.as_bytes(),
-                i64::try_from(command.expected_request_revision)
-                    .map_err(|_| OperationsError::Bounds("AgentRequest resolution revision"))?,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(OperationsError::Conflict(
-                "AgentRequest resolution request revision",
-            ));
-        }
-        let reserved_request = load_request_for_resolution(&transaction, command.request_id)?
-            .ok_or(OperationsError::Corrupt(
-                "AgentRequest resolution update readback",
-            ))?;
-        let resolution = load_resolution(&transaction, &reserved_request)?.ok_or(
-            OperationsError::Corrupt("AgentRequest resolution insert readback"),
-        )?;
-        transaction
-            .commit()
-            .map_err(|source| OperationsError::AgentRequestCommitUnconfirmed {
-                request_id: command.request_id,
-                source,
-            })?;
-        Ok(AgentRequestResolutionOutcome {
-            resolution,
-            created: true,
-        })
+        Err(OperationsError::ProviderRetired)
     }
 
     /// Read a committed resolution batch by `AgentRequest` identity.
@@ -375,15 +337,6 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsErr
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn drop_schema_for_legacy_fixture(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    crate::agent_provision::drop_schema_for_legacy_fixture(connection)?;
-    connection.execute_batch("DROP TABLE IF EXISTS ops_agent_request_resolutions;")?;
-    Ok(())
-}
-
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![(
         "table",
@@ -398,52 +351,6 @@ fn validate_slot(slot_ordinal: u8) -> Result<(), OperationsError> {
     }
     Ok(())
 }
-
-fn insert_selection(
-    connection: &Connection,
-    command: &CommitAgentRequestResolution,
-    selection: AgentRequestResolutionSelection,
-) -> Result<(), OperationsError> {
-    connection.execute(
-        "INSERT INTO ops_agent_request_resolutions(
-            request_id,slot_ordinal,resolution_kind,claim_id,profile_id,profile_revision,
-            runtime_session_id,runtime_session_revision,policy_revision,reserved_at_ms
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-        params![
-            command.request_id.as_bytes(),
-            i64::from(selection.slot_ordinal),
-            encode_kind(selection.kind),
-            selection.claim_id.map(Uuid::into_bytes).map(Vec::from),
-            selection
-                .profile_id
-                .map(AgentProfileId::into_uuid)
-                .map(Uuid::into_bytes)
-                .map(Vec::from),
-            selection.profile_revision.map(AgentProfileRevision::get),
-            selection
-                .runtime_session_id
-                .map(AgentProfileRuntimeSessionId::into_uuid)
-                .map(Uuid::into_bytes)
-                .map(Vec::from),
-            selection.runtime_session_revision,
-            i64::try_from(command.policy_revision)
-                .map_err(|_| OperationsError::Bounds("AgentRequest policy revision"))?,
-            command.reserved_at.get(),
-        ],
-    )?;
-    Ok(())
-}
-
-fn resolution_row_count(connection: &Connection, request_id: Uuid) -> Result<i64, OperationsError> {
-    connection
-        .query_row(
-            "SELECT COUNT(*) FROM ops_agent_request_resolutions WHERE request_id=?1",
-            params![request_id.as_bytes()],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
-}
-
 pub(crate) fn load_resolution(
     connection: &Connection,
     request: &AgentRequestRecord,
@@ -608,17 +515,6 @@ fn resolution_matches_command(
                 slot.selection == *selection && slot.policy_revision == command.policy_revision
             })
 }
-
-const fn encode_kind(kind: AgentRequestResolutionKind) -> i64 {
-    match kind {
-        AgentRequestResolutionKind::ReuseCurrentScope => 1,
-        AgentRequestResolutionKind::ReuseReadyRuntime => 2,
-        AgentRequestResolutionKind::WakeExistingRuntime => 3,
-        AgentRequestResolutionKind::WakeNewRuntime => 4,
-        AgentRequestResolutionKind::ProvisionNew => 5,
-    }
-}
-
 fn decode_kind(value: i64) -> Result<AgentRequestResolutionKind, OperationsError> {
     match value {
         1 => Ok(AgentRequestResolutionKind::ReuseCurrentScope),
@@ -638,13 +534,13 @@ mod tests {
         AgentRequestRequester,
     };
     use forge_domain::{ActivityId, AgentInstanceId, AgentSessionId, WorkspaceId};
-    use rusqlite::Connection;
     use std::{error::Error, fs};
 
     #[test]
-    fn v26_request_migrates_and_resolution_reservation_replays_exactly()
+    fn historical_resolution_reads_exact_history_and_replays_while_fresh_reservation_is_retired()
     -> Result<(), Box<dyn Error>> {
-        let root = std::env::temp_dir().join(format!("agent-request-v27-{}", Uuid::now_v7()));
+        let root =
+            std::env::temp_dir().join(format!("agent-request-resolution-{}", Uuid::now_v7()));
         fs::create_dir(&root)?;
         let path = root.join("operations.sqlite3");
         let destination = Uuid::from_u128(0xD701);
@@ -670,14 +566,7 @@ mod tests {
             TimestampMillis::new(10)?,
         )?;
         let _ = catalog.submit_agent_request(&request)?;
-        drop(catalog);
-
-        let connection = Connection::open(&path)?;
-        crate::agent_request::downgrade_schema_to_v26_fixture(&connection)?;
-        drop(connection);
-
-        let mut migrated = OperationsCatalog::open(&path, destination)?;
-        let preserved = migrated
+        let preserved = catalog
             .agent_request(request_id)?
             .ok_or("request missing")?;
         assert_eq!(preserved.state(), AgentRequestState::ResolutionPending);
@@ -689,27 +578,45 @@ mod tests {
             vec![AgentRequestResolutionSelection::provision_new(0)?],
             TimestampMillis::new(20)?,
         )?;
-        let first = migrated.commit_agent_request_resolution(&command)?;
-        assert!(first.created());
+        assert!(matches!(
+            catalog.commit_agent_request_resolution(&command),
+            Err(OperationsError::ProviderRetired)
+        ));
+        let unchanged = catalog
+            .agent_request(request_id)?
+            .ok_or("pending request missing after rejected reservation")?;
+        assert_eq!(unchanged.state(), AgentRequestState::ResolutionPending);
+        assert_eq!(unchanged.revision(), 1);
+        assert!(catalog.agent_request_resolution(request_id)?.is_none());
+
+        // Seed exact historical reservation SQL rather than calling the retired writer.
+        catalog.connection.execute(
+            "INSERT INTO ops_agent_request_resolutions(request_id,slot_ordinal,resolution_kind,claim_id,profile_id,profile_revision,runtime_session_id,runtime_session_revision,policy_revision,reserved_at_ms) VALUES(?1,0,5,NULL,NULL,NULL,NULL,NULL,1,20)",
+            rusqlite::params![request_id.as_bytes()],
+        )?;
+        catalog.connection.execute(
+            "UPDATE ops_agent_requests SET state=2,revision=2 WHERE request_id=?1 AND state=1 AND revision=1",
+            rusqlite::params![request_id.as_bytes()],
+        )?;
+        let first = catalog
+            .agent_request_resolution(request_id)?
+            .ok_or("historical resolution missing")?;
         assert_eq!(
-            first.resolution().request().state(),
+            first.request().state(),
             AgentRequestState::ResolutionReserved
         );
-        assert_eq!(first.resolution().request().revision(), 2);
+        assert_eq!(first.request().revision(), 2);
         assert_eq!(
-            first.resolution().slots()[0].selection().kind(),
+            first.slots()[0].selection().kind(),
             AgentRequestResolutionKind::ProvisionNew
         );
-        let replay = migrated.commit_agent_request_resolution(&command)?;
+        let replay = catalog.commit_agent_request_resolution(&command)?;
         assert!(!replay.created());
-        assert_eq!(replay.resolution(), first.resolution());
-        drop(migrated);
+        assert_eq!(replay.resolution(), &first);
+        drop(catalog);
 
         let reopened = OperationsCatalog::open(&path, destination)?;
-        assert_eq!(
-            reopened.agent_request_resolution(request_id)?,
-            Some(first.resolution().clone())
-        );
+        assert_eq!(reopened.agent_request_resolution(request_id)?, Some(first));
         drop(reopened);
         fs::remove_dir_all(root)?;
         Ok(())

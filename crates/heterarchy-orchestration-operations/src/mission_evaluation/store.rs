@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use forge_domain::{AgentSessionId, WorkspaceId};
-use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params, params_from_iter};
+use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use uuid::Uuid;
 
 use crate::{
@@ -1351,6 +1351,11 @@ fn decode_positive_weight(value: i64) -> Result<PositiveWeight, OperationsError>
     .map_err(|_| OperationsError::Corrupt("mission evaluation obligation weight"))
 }
 
+const SELECT_COHORT_OBLIGATION_WEIGHT_SQL: &str = crate::static_sql::StaticSql::dml(
+    "SELECT substr(obligation_id,1,17),weight FROM ops_mission_evaluation_obligations WHERE workspace_id=?1 AND mission_id=?2 AND obligation_id=?3",
+)
+.as_str();
+
 fn load_plan_cohort_weights(
     connection: &rusqlite::Connection,
     workspace_id: WorkspaceId,
@@ -1360,44 +1365,31 @@ fn load_plan_cohort_weights(
     if cohort.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let placeholders = (3..(cohort.len() + 3))
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!(
-        "SELECT substr(obligation_id,1,17),weight FROM ops_mission_evaluation_obligations WHERE workspace_id=?1 AND mission_id=?2 AND obligation_id IN ({placeholders})"
-    );
-    let mut values = Vec::with_capacity(cohort.len() + 2);
-    values.push(rusqlite::types::Value::Blob(
-        workspace_id.into_uuid().into_bytes().to_vec(),
-    ));
-    values.push(rusqlite::types::Value::Blob(
-        mission_id.into_uuid().into_bytes().to_vec(),
-    ));
-    values.extend(cohort.iter().map(|entry| {
-        rusqlite::types::Value::Blob(entry.obligation_id.into_uuid().into_bytes().to_vec())
-    }));
-    let mut statement = connection.prepare(&sql)?;
-    let rows = statement
-        .query_map(params_from_iter(values), |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(statement);
-    if rows.len() != cohort.len() {
-        return Err(OperationsError::Conflict(
-            "mission evaluation cohort obligation scope",
-        ));
-    }
+    let mut statement = connection.prepare(SELECT_COHORT_OBLIGATION_WEIGHT_SQL)?;
     let mut weights = BTreeMap::new();
-    for (id, weight) in rows {
+    for entry in cohort {
+        let row = statement
+            .query_row(
+                params![
+                    workspace_id.into_uuid().as_bytes(),
+                    mission_id.into_uuid().as_bytes(),
+                    entry.obligation_id.into_uuid().as_bytes(),
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let Some((id, weight)) = row else {
+            return Err(OperationsError::Conflict(
+                "mission evaluation cohort obligation scope",
+            ));
+        };
         let id = decode_uuid(id, "mission evaluation cohort obligation")?;
         if weights
             .insert(id, decode_positive_weight(weight)?)
             .is_some()
         {
-            return Err(OperationsError::Corrupt(
-                "mission evaluation cohort duplicate obligation",
+            return Err(OperationsError::Conflict(
+                "mission evaluation cohort obligation scope",
             ));
         }
     }

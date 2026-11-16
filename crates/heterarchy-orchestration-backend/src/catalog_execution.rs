@@ -104,6 +104,35 @@ impl CatalogExecution {
         Ok(receiver)
     }
 
+    /// Track a bounded `SwarmRuntimeDispatcher` supervision task in `tasks` so
+    /// graceful shutdown (`stop_admission` + `drain`) awaits completion without
+    /// holding a scarce `admitted_slots` permit needed by re-entrant worker CLI calls.
+    pub(super) fn spawn_swarm_dispatch<T, F>(
+        &self,
+        operation: F,
+    ) -> Result<oneshot::Receiver<Result<T, ApiError>>, ApiError>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, ApiError>> + Send + 'static,
+    {
+        let _gate = self
+            .admission_gate
+            .lock()
+            .map_err(|_| ApiError::Unavailable)?;
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(ApiError::Unavailable);
+        }
+        let (sender, receiver) = oneshot::channel();
+        let _tracked = self.tasks.spawn(async move {
+            let result = tokio::spawn(operation).await.unwrap_or_else(|error| {
+                warn!(?error, "owned Swarm dispatch operation failed to join");
+                Err(ApiError::Unavailable)
+            });
+            let _disconnected = sender.send(result);
+        });
+        Ok(receiver)
+    }
+
     pub(super) async fn drain(&self) {
         self.tasks.close();
         self.tasks.wait().await;

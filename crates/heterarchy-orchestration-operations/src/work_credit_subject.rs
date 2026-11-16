@@ -16,7 +16,6 @@ use uuid::Uuid;
 
 const SNAPSHOT_DIGEST_DOMAIN: &[u8] = b"heterarchy.work-credit.election-subject-snapshot.v1\0";
 
-const ELECTION_SNAPSHOT_SQL_V31: &str = "CREATE TABLE ops_election_work_credit_snapshots (election_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_leadership_elections(election_id) CHECK(length(election_id)=16 AND election_id != zeroblob(16)), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), candidate_participant_id BLOB NOT NULL CHECK(length(candidate_participant_id)=16 AND candidate_participant_id != zeroblob(16)), subject_kind INTEGER NOT NULL CHECK(subject_kind IN(0,1)), subject_id BLOB NOT NULL CHECK(length(subject_id)=16 AND subject_id != zeroblob(16)), agent_profile_id BLOB CHECK(agent_profile_id IS NULL OR (length(agent_profile_id)=16 AND agent_profile_id != zeroblob(16))), participation_revision INTEGER CHECK(participation_revision IS NULL OR participation_revision>0), subject_revision INTEGER NOT NULL CHECK(subject_revision=1), source_participant_count INTEGER NOT NULL CHECK(source_participant_count>=1), window_ms INTEGER NOT NULL CHECK(window_ms>0), evaluated_at_ms INTEGER NOT NULL CHECK(evaluated_at_ms>=0), candidate_total_credits INTEGER NOT NULL CHECK(candidate_total_credits>=0), workspace_total_credits INTEGER NOT NULL CHECK(workspace_total_credits>=0), workspace_arithmetic_mean INTEGER NOT NULL CHECK(workspace_arithmetic_mean>=0), mean_remainder_numerator INTEGER NOT NULL CHECK(mean_remainder_numerator>=0), mean_subject_count INTEGER NOT NULL CHECK(mean_subject_count>=0), qualified INTEGER NOT NULL CHECK(qualified IN(0,1)), snapshot_digest BLOB NOT NULL CHECK(length(snapshot_digest)=32 AND snapshot_digest != zeroblob(32)), CHECK((subject_kind=0 AND agent_profile_id IS NOT NULL AND participation_revision IS NOT NULL) OR (subject_kind=1 AND agent_profile_id IS NULL AND participation_revision IS NULL AND source_participant_count=1)), CHECK(mean_subject_count=0 OR mean_remainder_numerator<mean_subject_count))";
 const ELECTION_SNAPSHOT_SQL: &str = "CREATE TABLE ops_election_work_credit_snapshots (election_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_leadership_elections(election_id) CHECK(length(election_id)=16 AND election_id != zeroblob(16)), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), candidate_participant_id BLOB NOT NULL CHECK(length(candidate_participant_id)=16 AND candidate_participant_id != zeroblob(16)), subject_kind INTEGER NOT NULL CHECK(subject_kind IN(0,1)), subject_id BLOB NOT NULL CHECK(length(subject_id)=16 AND subject_id != zeroblob(16)), agent_profile_id BLOB CHECK(agent_profile_id IS NULL OR (length(agent_profile_id)=16 AND agent_profile_id != zeroblob(16))), participation_revision INTEGER CHECK(participation_revision IS NULL OR participation_revision>0), subject_revision INTEGER NOT NULL CHECK(subject_revision=1), source_participant_count INTEGER NOT NULL CHECK(source_participant_count>=1), window_ms INTEGER NOT NULL CHECK(window_ms>0), evaluated_at_ms INTEGER NOT NULL CHECK(evaluated_at_ms>=0), candidate_total_credits INTEGER NOT NULL CHECK(candidate_total_credits>=0), workspace_total_credits INTEGER NOT NULL CHECK(workspace_total_credits>=0), workspace_arithmetic_mean INTEGER NOT NULL CHECK(workspace_arithmetic_mean>=0), mean_remainder_numerator INTEGER NOT NULL CHECK(mean_remainder_numerator>=0), mean_subject_count INTEGER NOT NULL CHECK(mean_subject_count>=0), qualified INTEGER NOT NULL CHECK(qualified IN(0,1)), snapshot_digest BLOB NOT NULL CHECK(length(snapshot_digest)=32 AND snapshot_digest != zeroblob(32)), team_id BLOB CHECK(team_id IS NULL OR (length(team_id)=16 AND team_id != zeroblob(16))), CHECK((subject_kind=0 AND agent_profile_id IS NOT NULL AND participation_revision IS NOT NULL) OR (subject_kind=1 AND agent_profile_id IS NULL AND participation_revision IS NULL AND source_participant_count=1)), CHECK(mean_subject_count=0 OR mean_remainder_numerator<mean_subject_count))";
 
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -27,42 +26,8 @@ pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)
     )]
 }
 
-pub(crate) fn schema_objects_v31() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![(
-        "table",
-        "ops_election_work_credit_snapshots",
-        ELECTION_SNAPSHOT_SQL_V31,
-    )]
-}
-
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsError> {
     connection.execute_batch(ELECTION_SNAPSHOT_SQL)?;
-    Ok(())
-}
-
-pub(crate) fn migrate_v31_to_v32(transaction: &Transaction<'_>) -> Result<(), OperationsError> {
-    let has_team_id: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name='team_id')",
-        ["ops_election_work_credit_snapshots"],
-        |row| row.get(0),
-    )?;
-    if has_team_id {
-        return Ok(());
-    }
-    transaction.execute(
-        "ALTER TABLE ops_election_work_credit_snapshots ADD COLUMN team_id BLOB CHECK(team_id IS NULL OR (length(team_id)=16 AND team_id != zeroblob(16)))",
-		[],
-	)?;
-    Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn drop_schema_for_legacy_fixture(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    crate::agent_request_resolution::drop_schema_for_legacy_fixture(connection)?;
-    crate::agent_request::drop_schema_for_legacy_fixture(connection)?;
-    connection.execute_batch("DROP TABLE IF EXISTS ops_election_work_credit_snapshots;")?;
     Ok(())
 }
 
@@ -912,14 +877,6 @@ mod tests {
         profile_id: AgentProfileId,
     }
 
-    fn table_sql(connection: &Connection, name: &str) -> Result<String, Box<dyn Error>> {
-        Ok(connection.query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
-            params![name],
-            |row| row.get(0),
-        )?)
-    }
-
     fn insert_member(
         connection: &Connection,
         workspace: WorkspaceId,
@@ -1188,56 +1145,6 @@ mod tests {
         ));
         drop(fixture.catalog);
         fs::remove_dir_all(fixture.root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn v24_to_v25_adds_only_election_work_credit_snapshot_table() -> Result<(), Box<dyn Error>> {
-        let root =
-            std::env::temp_dir().join(format!("heterarchy-work-credit-current-{}", Uuid::now_v7()));
-        fs::create_dir(&root)?;
-        let path = root.join("operations.sqlite3");
-        let destination = Uuid::from_u128(0xF900);
-        let catalog = crate::OperationsCatalog::open(&path, destination)?;
-        drop(catalog);
-        let connection = Connection::open(&path)?;
-        let ledger_before = table_sql(&connection, "ops_work_credit_entries")?;
-        let participation_before = table_sql(&connection, "ops_workspace_participations")?;
-        let leadership_before = table_sql(&connection, "ops_leadership")?;
-        let election_subject_before = table_sql(&connection, "ops_election_voter_subjects")?;
-        drop_schema_for_legacy_fixture(&connection)?;
-        connection.pragma_update(None, "user_version", 24_i64)?;
-        drop(connection);
-        let migrated = crate::OperationsCatalog::open(&path, destination)?;
-        let version: i64 = migrated
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, crate::catalog::VERSION);
-        assert_eq!(
-            table_sql(&migrated.connection, "ops_work_credit_entries")?,
-            ledger_before
-        );
-        assert_eq!(
-            table_sql(&migrated.connection, "ops_workspace_participations")?,
-            participation_before
-        );
-        crate::catalog::assert_fixture_table_schema(
-            &migrated.connection,
-            "ops_leadership",
-            &leadership_before,
-        )?;
-        assert_eq!(
-            table_sql(&migrated.connection, "ops_election_voter_subjects")?,
-            election_subject_before
-        );
-        let added: i64 = migrated.connection.query_row(
-            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name='ops_election_work_credit_snapshots'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(added, 1);
-        drop(migrated);
-        fs::remove_dir_all(root)?;
         Ok(())
     }
 }

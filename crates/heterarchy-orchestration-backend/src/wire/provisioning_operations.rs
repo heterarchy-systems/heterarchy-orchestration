@@ -15,26 +15,6 @@ pub struct ProvisionOperationQueryRequest {
     pub operation_id: Uuid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProvisionOperationCancelRequest {
-    pub scope: WorkspaceQueryScope,
-    pub session_id: Uuid,
-    pub operation_id: Uuid,
-    pub expected_revision: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ProvisionOperationUncertaintyRetirementRequest {
-    pub scope: WorkspaceQueryScope,
-    pub session_id: Uuid,
-    pub retirement_id: Uuid,
-    pub operation_id: Uuid,
-    pub expected_revision: u64,
-    pub recovery_version: u8,
-}
-
 /// Immutable evidence that recovery stopped while the provider effect truth
 /// remains unknown.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -97,23 +77,6 @@ pub struct ProvisionOperationQueryResponse {
     pub scope: WorkspaceQueryScope,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub operation: Option<ProvisionOperationWire>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProvisionOperationCancelResponse {
-    pub scope: WorkspaceQueryScope,
-    pub operation: ProvisionOperationWire,
-    pub changed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProvisionOperationUncertaintyRetirementResponse {
-    pub scope: WorkspaceQueryScope,
-    pub operation: ProvisionOperationWire,
-    pub retirement: ProvisionOperationUncertaintyRetirementWire,
-    pub changed: bool,
 }
 
 impl From<&AgentProvisionUncertaintyRetirement> for ProvisionOperationUncertaintyRetirementWire {

@@ -1,61 +1,28 @@
-//! Full scoped `AgentRequest` admission and immutable domain-intent recovery.
+//! Exact readback for historical `AgentRequest` admission evidence.
 
 use crate::wire::agent_request_admission::{
     AdmissionEffectScopeWire, AdmissionIndependenceWire, AdmissionRequestStateWire,
     AdmissionResolutionKindWire, AdmissionResolutionSlotWire, AdmissionResolutionWire,
     AgentRequestAdmissionReceiptWire, AgentRequestAdmissionRecoverResponse,
-    AgentRequestAdmissionRequest, AgentRequestAdmissionResponse, AgentRequestAdmissionSnapshotWire,
+    AgentRequestAdmissionRequest, AgentRequestAdmissionSnapshotWire,
 };
-use crate::{ApiError, BackendState, ErrorResponse, RealtimeEventKind};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use crate::{ApiError, BackendState};
 use axum::{
     Extension, Json, Router,
     extract::{Path, State},
     routing::post,
 };
 use forge_domain::AuthenticatedPrincipal;
-use heterarchy_orchestration_runtime::{
-    RuntimeError,
-    provisioning::{
-        AgentRequestAdmissionSnapshot, AgentRequestAdmissionStage, AgentRequestResolutionSummary,
-        AgentRequestSubmit, AgentRequestSubmitSummary,
-    },
+use heterarchy_orchestration_runtime::provisioning::{
+    AgentRequestAdmissionSnapshot, AgentRequestResolutionSummary, AgentRequestSubmit,
+    AgentRequestSubmitSummary,
 };
 
 pub(super) fn routes() -> Router<BackendState> {
-    Router::new()
-        .route(
-            "/internal/v1/workspaces/{workspace_id}/agent-requests/admit",
-            post(admit),
-        )
-        .route(
-            "/internal/v1/workspaces/{workspace_id}/agent-requests/admit/recover",
-            post(recover),
-        )
-}
-
-#[derive(Debug)]
-enum AdmissionError {
-    Api(ApiError),
-    Incomplete(RuntimeError),
-}
-impl From<ApiError> for AdmissionError {
-    fn from(value: ApiError) -> Self {
-        Self::Api(value)
-    }
-}
-impl IntoResponse for AdmissionError {
-    fn into_response(self) -> Response {
-        match self {
-            Self::Api(error) => error.into_response(),
-            Self::Incomplete(_cause) => (StatusCode::CONFLICT, Json(ErrorResponse {
-                code: "COMMITTED_BUT_UNCONFIRMED",
-                message: "Read the original AgentRequest intent, resolution and provision targets before resuming.",
-                retryable: false,
-            })).into_response(),
-        }
-    }
+    Router::new().route(
+        "/internal/v1/workspaces/{workspace_id}/agent-requests/admit/recover",
+        post(recover),
+    )
 }
 
 fn validate(path: &str, body: &AgentRequestAdmissionRequest) -> Result<(), ApiError> {
@@ -74,11 +41,7 @@ fn validate(path: &str, body: &AgentRequestAdmissionRequest) -> Result<(), ApiEr
     Ok(())
 }
 
-fn command(
-    body: &AgentRequestAdmissionRequest,
-    created_at_ms: i64,
-) -> Result<AgentRequestSubmit, ApiError> {
-    use heterarchy_orchestration_operations::{AgentRequestEffectScope, AgentRequestIndependence};
+fn command(body: &AgentRequestAdmissionRequest) -> Result<AgentRequestSubmit, ApiError> {
     Ok(AgentRequestSubmit {
         workspace_id: body.scope.workspace_id,
         activity_id: body.activity_id,
@@ -91,96 +54,24 @@ fn command(
         capability: body.capability.clone(),
         count: body.count,
         reason: body.reason.clone(),
-        created_at_ms,
+        created_at_ms: 0,
         effect_scope: match body.effect_scope {
-            AdmissionEffectScopeWire::ReadOnly => AgentRequestEffectScope::ReadOnly,
-            AdmissionEffectScopeWire::SourceWrite => AgentRequestEffectScope::SourceWrite,
+            AdmissionEffectScopeWire::ReadOnly => {
+                heterarchy_orchestration_operations::AgentRequestEffectScope::ReadOnly
+            }
+            AdmissionEffectScopeWire::SourceWrite => {
+                heterarchy_orchestration_operations::AgentRequestEffectScope::SourceWrite
+            }
         },
         independence: match body.independence {
-            AdmissionIndependenceWire::None => AgentRequestIndependence::None,
+            AdmissionIndependenceWire::None => {
+                heterarchy_orchestration_operations::AgentRequestIndependence::None
+            }
             AdmissionIndependenceWire::IndependentFromCurrentWriter => {
-                AgentRequestIndependence::IndependentFromCurrentWriter
+                heterarchy_orchestration_operations::AgentRequestIndependence::IndependentFromCurrentWriter
             }
         },
     })
-}
-
-fn clock(
-    stage: AgentRequestAdmissionStage,
-) -> Result<i64, (AgentRequestAdmissionStage, RuntimeError)> {
-    let failure = || {
-        (
-            stage,
-            RuntimeError::Io(std::io::Error::other("AgentRequest clock unavailable")),
-        )
-    };
-    let duration = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| failure())?;
-    i64::try_from(duration.as_millis()).map_err(|_| failure())
-}
-
-async fn admit(
-    State(state): State<BackendState>,
-    Path(path): Path<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    Json(body): Json<AgentRequestAdmissionRequest>,
-) -> Result<Json<AgentRequestAdmissionResponse>, AdmissionError> {
-    validate(&path, &body)?;
-    let input = command(&body, 0)?;
-    let publisher = state.clone();
-    let result = state
-        .run_agent_request_mutation(
-            Some(body.scope.clone()),
-            input,
-            principal,
-            move |runtime, command| {
-                let id = command.request_id;
-                let workspace = command.workspace_id;
-                let mut revision = runtime.agent_request(id)?.map(|value| value.revision);
-                let mut operation_revisions = runtime
-                    .agent_request_provision_operations(id)?
-                    .into_iter()
-                    .map(|value| (value.operation_id, value.revision))
-                    .collect::<std::collections::BTreeMap<_, _>>();
-                let mut publish = || {
-                    publish_delta(
-                        runtime,
-                        &publisher,
-                        id,
-                        workspace,
-                        &mut revision,
-                        &mut operation_revisions,
-                    )
-                };
-                let outcome = runtime.admit_agent_request(
-                    command,
-                    |stage| {
-                        publish().map_err(|error| (stage, error))?;
-                        clock(stage)
-                    },
-                    |stage, error| (stage, RuntimeError::from(error)),
-                );
-                // Publication follows durable readback, including partially committed
-                // failures. It is never evidence of successful provider delivery.
-                if let Err(error) = publish() {
-                    return Ok(Err((AgentRequestAdmissionStage::Reconcile, error)));
-                }
-                Ok(outcome)
-            },
-        )
-        .await?;
-    let summary = result.map_err(|(stage, error)| {
-        if stage == AgentRequestAdmissionStage::Submit {
-            AdmissionError::Api(ApiError::Runtime(error))
-        } else {
-            AdmissionError::Incomplete(error)
-        }
-    })?;
-    Ok(Json(AgentRequestAdmissionResponse {
-        receipt: receipt(&summary)?,
-        request: body,
-    }))
 }
 
 async fn recover(
@@ -190,7 +81,7 @@ async fn recover(
     Json(body): Json<AgentRequestAdmissionRequest>,
 ) -> Result<Json<AgentRequestAdmissionRecoverResponse>, ApiError> {
     validate(&path, &body)?;
-    let input = command(&body, 0)?;
+    let input = command(&body)?;
     let snapshot = state
         .catalog_job(move |runtime| runtime.recover_agent_request_admission(input, principal))
         .await?;
@@ -198,39 +89,6 @@ async fn recover(
         request: body,
         snapshot: snapshot.as_ref().map(project_snapshot).transpose()?,
     }))
-}
-
-fn publish_delta(
-    runtime: &heterarchy_orchestration_runtime::OrchestrationRuntime,
-    publisher: &BackendState,
-    request_id: uuid::Uuid,
-    workspace: uuid::Uuid,
-    revision: &mut Option<u64>,
-    operations: &mut std::collections::BTreeMap<uuid::Uuid, u64>,
-) -> Result<(), RuntimeError> {
-    if let Some(request) = runtime.agent_request(request_id)?
-        && Some(request.revision) != *revision
-    {
-        publisher.publish_state_changed(
-            RealtimeEventKind::AgentRequestStateChanged,
-            request_id,
-            request.revision,
-            Some(workspace),
-        );
-        *revision = Some(request.revision);
-    }
-    for operation in runtime.agent_request_provision_operations(request_id)? {
-        if operations.get(&operation.operation_id) != Some(&operation.revision) {
-            publisher.publish_state_changed(
-                RealtimeEventKind::ProvisioningStateChanged,
-                operation.operation_id,
-                operation.revision,
-                Some(workspace),
-            );
-            operations.insert(operation.operation_id, operation.revision);
-        }
-    }
-    Ok(())
 }
 
 fn state(value: &str) -> Result<AdmissionRequestStateWire, ApiError> {
@@ -300,27 +158,4 @@ fn project_snapshot(
             .map(super::operations::operation_wire)
             .collect(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use http_body_util::BodyExt;
-
-    #[tokio::test]
-    async fn refusal_after_submit_never_claims_that_nothing_was_admitted()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let response = AdmissionError::Incomplete(RuntimeError::Conflict).into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = response.into_body().collect().await?.to_bytes();
-        let value: serde_json::Value = serde_json::from_slice(&body)?;
-        assert_eq!(value["code"], "COMMITTED_BUT_UNCONFIRMED");
-        assert_eq!(value["retryable"], false);
-        let response =
-            AdmissionError::Api(ApiError::Runtime(RuntimeError::Conflict)).into_response();
-        let body = response.into_body().collect().await?.to_bytes();
-        let value: serde_json::Value = serde_json::from_slice(&body)?;
-        assert_eq!(value["code"], "ORCHESTRATION_CONFLICT");
-        Ok(())
-    }
 }

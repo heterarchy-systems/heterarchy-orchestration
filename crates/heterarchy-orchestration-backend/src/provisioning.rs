@@ -1,17 +1,9 @@
-//! Axum adapter for the transport-neutral AgentRequest/provisioning
-//! application layer.
-//!
-//! Mirrors the MCP `agent_request` tool's application flow (submit, then
-//! reserve when still pending, then prepare effect targets) over the runtime
-//! operations. No provider effect is ever executed or confirmed here: the
-//! dispatch journal keeps releasing effects exclusively through
-//! `next_agent_provision_dispatch`, and confirmations stay on the
-//! confirmed-readback path. Confirmed participation uses the canonical Session,
-//! shared member stages and exact source binding witnesses.
+//! Axum adapter for generic `AgentRequest` intents and historical provisioning
+//! evidence. Submitting a request persists only its intent; resolver, effect,
+//! and provider-backed participation routes have been retired.
 
 mod admission;
 mod operations;
-mod participation;
 mod requests;
 
 use axum::extract::{Path, Query, State};
@@ -32,20 +24,11 @@ pub(crate) fn routes() -> Router<BackendState> {
     Router::new()
         .merge(admission::routes())
         .merge(operations::routes())
-        .merge(participation::routes())
         .merge(requests::routes())
         .route("/internal/v1/agent-requests", post(submit))
         .route(
             "/internal/v1/agent-requests/{request_id}/resolution",
-            get(resolution).post(reserve),
-        )
-        .route(
-            "/internal/v1/agent-requests/{request_id}/provision-targets",
-            post(prepare_targets).get(prepared_targets),
-        )
-        .route(
-            "/internal/v1/agent-requests/{request_id}/reconcile",
-            post(reconcile_fulfillment),
+            get(resolution),
         )
         .route(
             "/internal/v1/workspaces/{workspace_id}/agent-requests",
@@ -102,43 +85,6 @@ struct RequestPageWire {
     truncated: bool,
 }
 
-async fn reconcile_fulfillment(
-    State(state): State<BackendState>,
-    Path(request_id): Path<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-) -> Result<Json<RequestWire>, LaneError> {
-    let request_id = canonical_uuid(Some(request_id.as_str()))?;
-    let observed_at = now_millis()?;
-    let publisher = state.clone();
-    let summary = state
-        .run_operator_mutation(principal, move |runtime| {
-            let before = runtime
-                .agent_request(request_id)?
-                .ok_or(crate::RuntimeError::NotFound)?;
-            let summary = runtime.reconcile_agent_request_fulfillment(request_id, observed_at)?;
-            if summary.revision != before.revision {
-                publisher.publish_state_changed(
-                    RealtimeEventKind::AgentRequestStateChanged,
-                    summary.request_id,
-                    summary.revision,
-                    Some(summary.workspace_id),
-                );
-            }
-            Ok(summary)
-        })
-        .await?;
-    Ok(Json(RequestWire {
-        request_id: summary.request_id,
-        workspace_id: summary.workspace_id.to_string(),
-        activity_id: summary.activity_id.to_string(),
-        capability: summary.capability.clone(),
-        count: summary.count,
-        state: summary.state,
-        revision: summary.revision,
-        created: false,
-    }))
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SubmitBody {
@@ -177,9 +123,9 @@ async fn submit(
         created_at_ms: now_millis()?,
     };
     let publisher = state.clone();
-    let (summary, resolution) = state
+    let summary = state
         .run_agent_request_mutation(None, command, principal, move |runtime, command| {
-            let mut summary = runtime.submit_agent_request(command)?;
+            let summary = runtime.submit_agent_request(command)?;
             if summary.created {
                 publisher.publish_state_changed(
                     RealtimeEventKind::AgentRequestStateChanged,
@@ -188,47 +134,10 @@ async fn submit(
                     Some(summary.workspace_id),
                 );
             }
-            let resolution = if summary.state
-                == heterarchy_orchestration_runtime::provisioning::request_state_label(
-                    heterarchy_orchestration_operations::AgentRequestState::ResolutionPending,
-                ) {
-                let observed = crate::current_timestamp_millis()
-                    .map_err(|_| crate::RuntimeError::InvalidInput)?;
-                Some(runtime.reserve_agent_request_resolution(
-                    summary.request_id,
-                    observed,
-                    observed,
-                )?)
-            } else {
-                Some(
-                    runtime
-                        .agent_request_resolution(summary.request_id)?
-                        .ok_or(crate::RuntimeError::persistence(
-                            heterarchy_orchestration_operations::OperationsError::Corrupt(
-                                "reserved AgentRequest is missing resolver rows",
-                            ),
-                        ))?,
-                )
-            };
-            if let Some(resolution) = &resolution {
-                if resolution.created {
-                    publisher.publish_state_changed(
-                        RealtimeEventKind::AgentRequestStateChanged,
-                        resolution.request_id,
-                        resolution.request_revision,
-                        Some(resolution.workspace_id),
-                    );
-                }
-                summary.state = resolution.request_state;
-                summary.revision = resolution.request_revision;
-            }
-            Ok((summary, resolution))
+            Ok(summary)
         })
         .await?;
-    Ok(Json(SubmitResponse::from_parts(
-        &summary,
-        resolution.as_ref(),
-    )))
+    Ok(Json(SubmitResponse::from_parts(&summary, None)))
 }
 
 #[derive(Debug, Serialize)]
@@ -349,150 +258,6 @@ async fn resolution(
         })
         .await?;
     Ok(Json(summary.as_ref().map(ResolutionWire::from_summary)))
-}
-
-async fn reserve(
-    State(state): State<BackendState>,
-    Path(request_id): Path<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-) -> Result<Json<ResolutionWire>, LaneError> {
-    let request_id = canonical_uuid(Some(request_id.as_str()))?;
-    let claimed_at = now_millis()?;
-    let reserved_at = now_millis()?;
-    let publisher = state.clone();
-    let summary = state
-        .run_operator_mutation(principal, move |runtime| {
-            let summary =
-                runtime.reserve_agent_request_resolution(request_id, claimed_at, reserved_at)?;
-            if summary.created {
-                publisher.publish_state_changed(
-                    RealtimeEventKind::AgentRequestStateChanged,
-                    summary.request_id,
-                    summary.request_revision,
-                    Some(summary.workspace_id),
-                );
-            }
-            Ok(summary)
-        })
-        .await?;
-    Ok(Json(ResolutionWire::from_summary(&summary)))
-}
-
-async fn prepare_targets(
-    State(state): State<BackendState>,
-    Path(request_id): Path<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-) -> Result<Json<Vec<ProvisionOperationWire>>, LaneError> {
-    let request_id = canonical_uuid(Some(request_id.as_str()))?;
-    let prepared_at = now_millis()?;
-    let bound_at = now_millis()?;
-    let publisher = state.clone();
-    let operations = state
-        .run_operator_mutation(principal, move |runtime| {
-            let request = runtime
-                .agent_request(request_id)?
-                .ok_or(crate::RuntimeError::NotFound)?;
-            let workspace_id = Uuid::parse_str(&request.workspace_id).map_err(|_| {
-                crate::RuntimeError::persistence(
-                    heterarchy_orchestration_operations::OperationsError::Corrupt(
-                        "request Workspace identity",
-                    ),
-                )
-            })?;
-            let before = runtime.agent_request_provision_operations(request_id)?;
-            let result =
-                runtime.prepare_agent_request_effect_targets(request_id, prepared_at, bound_at);
-            // A later slot can fail after earlier commits. Read those exact
-            // owner records and publish actual deltas before returning the error.
-            let after = runtime.agent_request_provision_operations(request_id)?;
-            for operation in &after {
-                let previous = before
-                    .iter()
-                    .find(|old| old.operation_id == operation.operation_id);
-                if previous.is_none_or(|old| old.revision != operation.revision) {
-                    publisher.publish_state_changed(
-                        RealtimeEventKind::ProvisioningStateChanged,
-                        operation.operation_id,
-                        operation.revision,
-                        Some(workspace_id),
-                    );
-                }
-            }
-            result.map_err(crate::RuntimeError::from)
-        })
-        .await?;
-    Ok(Json(
-        operations
-            .iter()
-            .map(ProvisionOperationWire::from_summary)
-            .collect(),
-    ))
-}
-
-async fn prepared_targets(
-    State(state): State<BackendState>,
-    Path(request_id): Path<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    headers: axum::http::HeaderMap,
-) -> Result<Json<Vec<ProvisionOperationWire>>, LaneError> {
-    let request_id = canonical_uuid(Some(request_id.as_str()))?;
-    let workspace = crate::app_support::workspace_selector(&headers)?;
-    let session = crate::app_support::session_selector(&headers)?;
-    let operations = state
-        .run_resource_query(workspace, session, principal, move |runtime| {
-            let Some(request) = runtime.agent_request(request_id)? else {
-                return Ok(None);
-            };
-            let scope = Uuid::parse_str(&request.workspace_id).map_err(|_| {
-                crate::RuntimeError::persistence(
-                    heterarchy_orchestration_operations::OperationsError::Corrupt(
-                        "request Workspace identity",
-                    ),
-                )
-            })?;
-            Ok(Some((
-                scope,
-                runtime.agent_request_provision_operations(request_id)?,
-            )))
-        })
-        .await?
-        .ok_or(crate::ApiError::NotFound)?;
-    Ok(Json(
-        operations
-            .iter()
-            .map(ProvisionOperationWire::from_summary)
-            .collect(),
-    ))
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProvisionOperationWire {
-    operation_id: Uuid,
-    slot_ordinal: u8,
-    state: &'static str,
-    profile_id: Option<Uuid>,
-    runtime_session_id: Option<Uuid>,
-    created: bool,
-    revision: u64,
-    changed: bool,
-}
-
-impl ProvisionOperationWire {
-    fn from_summary(
-        operation: &heterarchy_orchestration_runtime::provisioning::ProvisionOperationSummary,
-    ) -> Self {
-        Self {
-            operation_id: operation.operation_id,
-            slot_ordinal: operation.slot_ordinal,
-            state: operation.state,
-            profile_id: operation.profile_id,
-            runtime_session_id: operation.runtime_session_id,
-            created: operation.created,
-            revision: operation.revision,
-            changed: operation.changed,
-        }
-    }
 }
 
 fn canonical_uuid(value: Option<&str>) -> Result<Uuid, LaneError> {

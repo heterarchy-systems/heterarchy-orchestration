@@ -626,8 +626,8 @@ mod tests {
                 "POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: {bearer}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
             )).await?;
             assert!(
-                response.starts_with("HTTP/1.1 403"),
-                "worker privilege denied for {path}"
+                response.starts_with("HTTP/1.1 404"),
+                "retired provider route must be unavailable: {path}"
             );
         }
         Ok(())

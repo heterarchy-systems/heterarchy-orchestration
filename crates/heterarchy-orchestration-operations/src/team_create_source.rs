@@ -122,17 +122,6 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsErr
     Ok(())
 }
 
-pub(crate) fn migrate_v58_to_v59(transaction: &Transaction<'_>) -> Result<(), OperationsError> {
-    create_schema(transaction)?;
-    transaction.execute(
-        "INSERT INTO ops_team_create_source_legacy(request_id,workspace_id,team_id,migrated_from_version)
-         SELECT request_id,workspace_id,team_id,58
-         FROM ops_team_requests WHERE operation='CREATE'",
-        [],
-    )?;
-    Ok(())
-}
-
 /// Test-only reconstruction of a source-less schema-58 CREATE. Production
 /// code never deletes a verified receipt or converts its provenance class.
 #[cfg(test)]

@@ -39,14 +39,6 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsErr
     }
     Ok(())
 }
-#[cfg(test)]
-pub(crate) fn drop_schema_for_legacy_fixture(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    connection.execute_batch("DROP TABLE IF EXISTS ops_approval_request_versions;")?;
-    connection.execute_batch("DROP TABLE IF EXISTS ops_leadership_work_roster_sessions; DROP TABLE IF EXISTS ops_leadership_work_roster_barriers; DROP TABLE IF EXISTS ops_leadership_work_rosters;")?;
-    Ok(())
-}
 
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

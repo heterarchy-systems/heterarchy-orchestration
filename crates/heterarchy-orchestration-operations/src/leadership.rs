@@ -120,21 +120,12 @@ const QUALIFICATION_DENOMINATOR: i64 = 20;
 const ELECTION_ID_DOMAIN: &[u8] = b"heterarchy-orchestration-leadership-election-id-v1";
 const NO_ACTIVITY_MARKER: &[u8] = &[0_u8; 16];
 
-const LEADERSHIP_SQL_V19: &str = "CREATE TABLE ops_leadership (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1)), activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16), state TEXT NOT NULL CHECK(state IN('LEADERLESS','BOOTSTRAPPING','STABILIZING','ACTIVE','ELECTING','AUTHORITY_PENDING','HANDOFF_PENDING','FAILOVER_REQUIRED','VACANT','RECOVERY_REQUIRED')), leader_participant_id BLOB CHECK(leader_participant_id IS NULL OR length(leader_participant_id)=16), leadership_revision INTEGER NOT NULL CHECK(leadership_revision>=1), stabilization_until_ms INTEGER CHECK(stabilization_until_ms IS NULL OR stabilization_until_ms>=0), current_election_id BLOB CHECK(current_election_id IS NULL OR length(current_election_id)=16), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms>=0), CHECK((scope_kind=0 AND activity_id IS NULL) OR (scope_kind=1 AND activity_id IS NOT NULL)))";
-const LEADERSHIP_SQL_V31: &str = "CREATE TABLE ops_leadership (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1)), activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16), state TEXT NOT NULL CHECK(state IN('LEADERLESS','BOOTSTRAPPING','STABILIZING','ACTIVE','ELECTING','AUTHORITY_PENDING','FAILOVER_REQUIRED','VACANT','RECOVERY_REQUIRED')), leader_participant_id BLOB CHECK(leader_participant_id IS NULL OR length(leader_participant_id)=16), leadership_revision INTEGER NOT NULL CHECK(leadership_revision>=1), stabilization_until_ms INTEGER CHECK(stabilization_until_ms IS NULL OR stabilization_until_ms>=0), current_election_id BLOB CHECK(current_election_id IS NULL OR length(current_election_id)=16), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms>=0), CHECK((scope_kind=0 AND activity_id IS NULL) OR (scope_kind=1 AND activity_id IS NOT NULL)))";
 const LEADERSHIP_SQL: &str = "CREATE TABLE ops_leadership (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1,2)), activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16), team_id BLOB CHECK(team_id IS NULL OR length(team_id)=16), state TEXT NOT NULL CHECK(state IN('LEADERLESS','BOOTSTRAPPING','STABILIZING','ACTIVE','ELECTING','AUTHORITY_PENDING','FAILOVER_REQUIRED','VACANT','RECOVERY_REQUIRED')), leader_participant_id BLOB CHECK(leader_participant_id IS NULL OR length(leader_participant_id)=16), leadership_revision INTEGER NOT NULL CHECK(leadership_revision>=1), stabilization_until_ms INTEGER CHECK(stabilization_until_ms IS NULL OR stabilization_until_ms>=0), current_election_id BLOB CHECK(current_election_id IS NULL OR length(current_election_id)=16), updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms>=0), CHECK((scope_kind=0 AND activity_id IS NULL AND team_id IS NULL) OR (scope_kind=1 AND activity_id IS NOT NULL AND team_id IS NULL) OR (scope_kind=2 AND activity_id IS NULL AND team_id IS NOT NULL)))";
-const LEADERSHIP_SCOPE_INDEX_V31: &str = "CREATE UNIQUE INDEX ops_leadership_scope_idx ON ops_leadership(workspace_id, scope_kind, COALESCE(activity_id, zeroblob(16)))";
 const LEADERSHIP_SCOPE_INDEX: &str = "CREATE UNIQUE INDEX ops_leadership_scope_idx ON ops_leadership(workspace_id, scope_kind, COALESCE(activity_id, zeroblob(16)), COALESCE(team_id, zeroblob(16)))";
-const ELECTIONS_SQL_V31: &str = "CREATE TABLE ops_leadership_elections (election_id BLOB PRIMARY KEY NOT NULL CHECK(length(election_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1)), activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16), kind TEXT NOT NULL CHECK(kind IN('RECALL')), state TEXT NOT NULL CHECK(state IN('ELECTING','CLOSED_ELECTED','CLOSED_NO_MAJORITY','CANCELLED')), incumbent_participant_id BLOB CHECK(incumbent_participant_id IS NULL OR length(incumbent_participant_id)=16), candidate_participant_id BLOB NOT NULL CHECK(length(candidate_participant_id)=16), ballot_deadline_ms INTEGER NOT NULL CHECK(ballot_deadline_ms>=0), elected_participant_id BLOB CHECK(elected_participant_id IS NULL OR length(elected_participant_id)=16), tally_yes INTEGER CHECK(tally_yes IS NULL OR tally_yes>=0), tally_no INTEGER CHECK(tally_no IS NULL OR tally_no>=0), tally_abstain INTEGER CHECK(tally_abstain IS NULL OR tally_abstain>=0), created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0), closed_at_ms INTEGER CHECK(closed_at_ms IS NULL OR closed_at_ms>=0), CHECK((scope_kind=0 AND activity_id IS NULL) OR (scope_kind=1 AND activity_id IS NOT NULL)), CHECK(state!='ELECTING' OR (closed_at_ms IS NULL AND elected_participant_id IS NULL AND tally_yes IS NULL AND tally_no IS NULL AND tally_abstain IS NULL)), CHECK(state!='CLOSED_ELECTED' OR (elected_participant_id IS NOT NULL AND tally_yes IS NOT NULL AND tally_no IS NOT NULL AND tally_abstain IS NOT NULL)), CHECK(state!='CLOSED_NO_MAJORITY' OR (elected_participant_id IS NULL AND tally_yes IS NOT NULL AND tally_no IS NOT NULL AND tally_abstain IS NOT NULL)))";
 const ELECTIONS_SQL: &str = "CREATE TABLE ops_leadership_elections (election_id BLOB PRIMARY KEY NOT NULL CHECK(length(election_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1,2)), activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16), team_id BLOB CHECK(team_id IS NULL OR length(team_id)=16), kind TEXT NOT NULL CHECK(kind IN('RECALL')), state TEXT NOT NULL CHECK(state IN('ELECTING','CLOSED_ELECTED','CLOSED_NO_MAJORITY','CANCELLED')), incumbent_participant_id BLOB CHECK(incumbent_participant_id IS NULL OR length(incumbent_participant_id)=16), candidate_participant_id BLOB NOT NULL CHECK(length(candidate_participant_id)=16), ballot_deadline_ms INTEGER NOT NULL CHECK(ballot_deadline_ms>=0), elected_participant_id BLOB CHECK(elected_participant_id IS NULL OR length(elected_participant_id)=16), tally_yes INTEGER CHECK(tally_yes IS NULL OR tally_yes>=0), tally_no INTEGER CHECK(tally_no IS NULL OR tally_no>=0), tally_abstain INTEGER CHECK(tally_abstain IS NULL OR tally_abstain>=0), created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0), closed_at_ms INTEGER CHECK(closed_at_ms IS NULL OR closed_at_ms>=0), CHECK((scope_kind=0 AND activity_id IS NULL AND team_id IS NULL) OR (scope_kind=1 AND activity_id IS NOT NULL AND team_id IS NULL) OR (scope_kind=2 AND activity_id IS NULL AND team_id IS NOT NULL)), CHECK(state!='ELECTING' OR (closed_at_ms IS NULL AND elected_participant_id IS NULL AND tally_yes IS NULL AND tally_no IS NULL AND tally_abstain IS NULL)), CHECK(state!='CLOSED_ELECTED' OR (elected_participant_id IS NOT NULL AND tally_yes IS NOT NULL AND tally_no IS NOT NULL AND tally_abstain IS NOT NULL)), CHECK(state!='CLOSED_NO_MAJORITY' OR (elected_participant_id IS NULL AND tally_yes IS NOT NULL AND tally_no IS NOT NULL AND tally_abstain IS NOT NULL)))";
 const ELECTORATE_SQL: &str = "CREATE TABLE ops_election_electorate (election_id BLOB NOT NULL REFERENCES ops_leadership_elections(election_id) CHECK(length(election_id)=16), participant_id BLOB NOT NULL CHECK(length(participant_id)=16 AND participant_id != zeroblob(16)), PRIMARY KEY(election_id,participant_id))";
 const BALLOTS_SQL: &str = "CREATE TABLE ops_ballots (election_id BLOB NOT NULL REFERENCES ops_leadership_elections(election_id) CHECK(length(election_id)=16), voter_participant_id BLOB NOT NULL CHECK(length(voter_participant_id)=16 AND voter_participant_id != zeroblob(16)), choice TEXT NOT NULL CHECK(choice IN('YES','NO','ABSTAIN')), ballot_revision INTEGER NOT NULL CHECK(ballot_revision>=1), cast_at_ms INTEGER NOT NULL CHECK(cast_at_ms>=0), PRIMARY KEY(election_id,voter_participant_id))";
-/// Receipt vocabulary as it existed from schema version 14 through 18, before
-/// the handoff and recovery receipts were added.
-const RECEIPTS_SQL_V18: &str = "CREATE TABLE ops_leadership_receipts (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1)), activity_id BLOB NOT NULL CHECK(length(activity_id)=16), receipt_ordinal INTEGER NOT NULL CHECK(receipt_ordinal>=1), receipt_kind TEXT NOT NULL CHECK(receipt_kind IN('BOOTSTRAP','ELECTED','CONFIRMED','VACATED','FAILOVER')), work_assignment_id BLOB CHECK(work_assignment_id IS NULL OR length(work_assignment_id)=16), election_id BLOB CHECK(election_id IS NULL OR length(election_id)=16), participant_id BLOB CHECK(participant_id IS NULL OR length(participant_id)=16), leadership_revision INTEGER NOT NULL CHECK(leadership_revision>=1), recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0), PRIMARY KEY(workspace_id,scope_kind,activity_id,receipt_ordinal))";
-const RECEIPTS_SQL_V31: &str = "CREATE TABLE ops_leadership_receipts (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1)), activity_id BLOB NOT NULL CHECK(length(activity_id)=16), receipt_ordinal INTEGER NOT NULL CHECK(receipt_ordinal>=1), receipt_kind TEXT NOT NULL CHECK(receipt_kind IN('BOOTSTRAP','ELECTED','CONFIRMED','VACATED','FAILOVER','HANDOFF','RECOVERY')), work_assignment_id BLOB CHECK(work_assignment_id IS NULL OR length(work_assignment_id)=16), election_id BLOB CHECK(election_id IS NULL OR length(election_id)=16), participant_id BLOB CHECK(participant_id IS NULL OR length(participant_id)=16), leadership_revision INTEGER NOT NULL CHECK(leadership_revision>=1), recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0), PRIMARY KEY(workspace_id,scope_kind,activity_id,receipt_ordinal))";
 const RECEIPTS_SQL: &str = "CREATE TABLE ops_leadership_receipts (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1,2)), activity_id BLOB NOT NULL CHECK(length(activity_id)=16), team_id BLOB NOT NULL CHECK(length(team_id)=16), receipt_ordinal INTEGER NOT NULL CHECK(receipt_ordinal>=1), receipt_kind TEXT NOT NULL CHECK(receipt_kind IN('BOOTSTRAP','ELECTED','CONFIRMED','VACATED','FAILOVER','HANDOFF','RECOVERY')), work_assignment_id BLOB CHECK(work_assignment_id IS NULL OR length(work_assignment_id)=16), election_id BLOB CHECK(election_id IS NULL OR length(election_id)=16), participant_id BLOB CHECK(participant_id IS NULL OR length(participant_id)=16), leadership_revision INTEGER NOT NULL CHECK(leadership_revision>=1), recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms>=0), PRIMARY KEY(workspace_id,scope_kind,activity_id,team_id,receipt_ordinal))";
-const CONFIRM_INTENTS_SQL_V31: &str = "CREATE TABLE ops_leadership_confirm_intents (request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id)=16), kind TEXT NOT NULL CHECK(kind='election_confirm'), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1)), activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16), election_id BLOB NOT NULL CHECK(length(election_id)=16), elected_participant_id BLOB NOT NULL CHECK(length(elected_participant_id)=16), expected_local_revision INTEGER NOT NULL CHECK(expected_local_revision>=1), requested_fence_revision INTEGER NOT NULL CHECK(requested_fence_revision=expected_local_revision), owner_instance_id BLOB NOT NULL CHECK(length(owner_instance_id)=16), remote_recorded_revision INTEGER CHECK(remote_recorded_revision IS NULL OR remote_recorded_revision>=1), confirmed_at_ms INTEGER CHECK(confirmed_at_ms IS NULL OR confirmed_at_ms>=0), state TEXT NOT NULL CHECK(state IN('pending','remote_recorded','committed','superseded','rejected')), created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0), resolved_at_ms INTEGER CHECK(resolved_at_ms IS NULL OR resolved_at_ms>=0), CHECK((scope_kind=0 AND activity_id IS NULL) OR (scope_kind=1 AND activity_id IS NOT NULL)))";
 const CONFIRM_INTENTS_SQL: &str = "CREATE TABLE ops_leadership_confirm_intents (request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id)=16), kind TEXT NOT NULL CHECK(kind='election_confirm'), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1,2)), activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16), team_id BLOB CHECK(team_id IS NULL OR length(team_id)=16), election_id BLOB NOT NULL CHECK(length(election_id)=16), elected_participant_id BLOB NOT NULL CHECK(length(elected_participant_id)=16), expected_local_revision INTEGER NOT NULL CHECK(expected_local_revision>=1), requested_fence_revision INTEGER NOT NULL CHECK(requested_fence_revision=expected_local_revision), owner_instance_id BLOB NOT NULL CHECK(length(owner_instance_id)=16), remote_recorded_revision INTEGER CHECK(remote_recorded_revision IS NULL OR remote_recorded_revision>=1), confirmed_at_ms INTEGER CHECK(confirmed_at_ms IS NULL OR confirmed_at_ms>=0), state TEXT NOT NULL CHECK(state IN('pending','remote_recorded','committed','superseded','rejected')), created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0), resolved_at_ms INTEGER CHECK(resolved_at_ms IS NULL OR resolved_at_ms>=0), CHECK((scope_kind=0 AND activity_id IS NULL AND team_id IS NULL) OR (scope_kind=1 AND activity_id IS NOT NULL AND team_id IS NULL) OR (scope_kind=2 AND activity_id IS NULL AND team_id IS NOT NULL)))";
 
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -153,475 +144,10 @@ pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)
     ]
 }
 
-/// Exact leadership schema objects at catalog version 31.  Historical
-/// validators and the v31 -> v32 migration use this immutable DDL; it must not
-/// drift when the current Team-aware schema evolves.
-pub(crate) fn schema_objects_v31() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
-        ("table", "ops_leadership", LEADERSHIP_SQL_V31),
-        (
-            "index",
-            "ops_leadership_scope_idx",
-            LEADERSHIP_SCOPE_INDEX_V31,
-        ),
-        ("table", "ops_leadership_elections", ELECTIONS_SQL_V31),
-        ("table", "ops_election_electorate", ELECTORATE_SQL),
-        ("table", "ops_ballots", BALLOTS_SQL),
-        ("table", "ops_leadership_receipts", RECEIPTS_SQL_V31),
-        (
-            "table",
-            "ops_leadership_confirm_intents",
-            CONFIRM_INTENTS_SQL_V31,
-        ),
-    ]
-}
-
-/// Leadership schema objects as they existed at catalog version 14, before
-/// leadership confirmation gained its durable intent journal.
-pub(crate) fn schema_objects_v14() -> Vec<(&'static str, &'static str, String)> {
-    vec![
-        ("table", "ops_leadership", LEADERSHIP_SQL_V19.to_owned()),
-        (
-            "index",
-            "ops_leadership_scope_idx",
-            LEADERSHIP_SCOPE_INDEX_V31.to_owned(),
-        ),
-        (
-            "table",
-            "ops_leadership_elections",
-            ELECTIONS_SQL_V31.to_owned(),
-        ),
-        (
-            "table",
-            "ops_election_electorate",
-            ELECTORATE_SQL.to_owned(),
-        ),
-        ("table", "ops_ballots", BALLOTS_SQL.to_owned()),
-        (
-            "table",
-            "ops_leadership_receipts",
-            RECEIPTS_SQL_V18.to_owned(),
-        ),
-    ]
-}
-
-/// Leadership schema objects as they existed at catalog version 18: the
-/// confirm-intent journal was present, but the receipt vocabulary still
-/// predated the handoff and recovery receipts.
-pub(crate) fn schema_objects_v18() -> Vec<(&'static str, &'static str, String)> {
-    let mut objects = schema_objects_v14();
-    objects.push((
-        "table",
-        "ops_leadership_confirm_intents",
-        CONFIRM_INTENTS_SQL_V31.to_owned(),
-    ));
-    objects
-}
-
-/// Exact leadership schema at catalog version 19, before the unused
-/// `HANDOFF_PENDING` state was retired. Receipt history already used the
-/// extended vocabulary at this version.
-pub(crate) fn schema_objects_v19() -> Vec<(&'static str, &'static str, String)> {
-    vec![
-        ("table", "ops_leadership", LEADERSHIP_SQL_V19.to_owned()),
-        (
-            "index",
-            "ops_leadership_scope_idx",
-            LEADERSHIP_SCOPE_INDEX_V31.to_owned(),
-        ),
-        (
-            "table",
-            "ops_leadership_elections",
-            ELECTIONS_SQL_V31.to_owned(),
-        ),
-        (
-            "table",
-            "ops_election_electorate",
-            ELECTORATE_SQL.to_owned(),
-        ),
-        ("table", "ops_ballots", BALLOTS_SQL.to_owned()),
-        (
-            "table",
-            "ops_leadership_receipts",
-            RECEIPTS_SQL_V31.to_owned(),
-        ),
-        (
-            "table",
-            "ops_leadership_confirm_intents",
-            CONFIRM_INTENTS_SQL_V31.to_owned(),
-        ),
-    ]
-}
-
-/// Additive v18 -> v19 upgrade: rebuild the receipts table with the extended
-/// receipt vocabulary, preserving every existing history row. No other table
-/// references the receipts table, so the rebuild is side-effect free.
-pub(crate) fn rebuild_receipts_v19(tx: &Transaction<'_>) -> Result<(), OperationsError> {
-    let upgraded = RECEIPTS_SQL_V31.replacen(
-        "CREATE TABLE ops_leadership_receipts ",
-        "CREATE TABLE ops_leadership_receipts_v19 ",
-        1,
-    );
-    tx.execute_batch(&upgraded)?;
-    tx.execute(
-        "INSERT INTO ops_leadership_receipts_v19 SELECT * FROM ops_leadership_receipts",
-        [],
-    )?;
-    tx.execute("DROP TABLE ops_leadership_receipts", [])?;
-    tx.execute_batch("ALTER TABLE ops_leadership_receipts_v19 RENAME TO ops_leadership_receipts")?;
-    Ok(())
-}
-
-/// v19 -> v20 retirement of the unused leadership handoff phase. Historical
-/// `HANDOFF` receipts remain readable evidence, but a live `HANDOFF_PENDING` row
-/// is fail-closed into `FAILOVER_REQUIRED` with no current leader. The revision
-/// advances and an explicit FAILOVER receipt records the migration so stale
-/// callers cannot retain pre-migration authority.
-pub(crate) fn rebuild_leadership_v20(tx: &Transaction<'_>) -> Result<(), OperationsError> {
-    let overflow: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM ops_leadership WHERE state='HANDOFF_PENDING' AND leadership_revision>=?1)",
-        params![i64::MAX],
-        |row| row.get(0),
-    )?;
-    if overflow {
-        return Err(OperationsError::Bounds("leadership migration revision"));
-    }
-    tx.execute(
-        "INSERT INTO ops_leadership_receipts(workspace_id,scope_kind,activity_id,receipt_ordinal,receipt_kind,work_assignment_id,election_id,participant_id,leadership_revision,recorded_at_ms) SELECT l.workspace_id,l.scope_kind,COALESCE(l.activity_id,zeroblob(16)),(SELECT COALESCE(MAX(r.receipt_ordinal),0)+1 FROM ops_leadership_receipts r WHERE r.workspace_id=l.workspace_id AND r.scope_kind=l.scope_kind AND r.activity_id IS COALESCE(l.activity_id,zeroblob(16))),'FAILOVER',NULL,NULL,l.leader_participant_id,l.leadership_revision+1,l.updated_at_ms FROM ops_leadership l WHERE l.state='HANDOFF_PENDING'",
-        [],
-    )?;
-    let upgraded = LEADERSHIP_SQL_V31.replacen(
-        "CREATE TABLE ops_leadership ",
-        "CREATE TABLE ops_leadership_v20 ",
-        1,
-    );
-    tx.execute_batch(&upgraded)?;
-    tx.execute(
-        "INSERT INTO ops_leadership_v20(workspace_id,scope_kind,activity_id,state,leader_participant_id,leadership_revision,stabilization_until_ms,current_election_id,updated_at_ms) SELECT workspace_id,scope_kind,activity_id,CASE WHEN state='HANDOFF_PENDING' THEN 'FAILOVER_REQUIRED' ELSE state END,CASE WHEN state='HANDOFF_PENDING' THEN NULL ELSE leader_participant_id END,leadership_revision+CASE WHEN state='HANDOFF_PENDING' THEN 1 ELSE 0 END,CASE WHEN state='HANDOFF_PENDING' THEN NULL ELSE stabilization_until_ms END,CASE WHEN state='HANDOFF_PENDING' THEN NULL ELSE current_election_id END,updated_at_ms FROM ops_leadership",
-        [],
-    )?;
-    tx.execute("DROP TABLE ops_leadership", [])?;
-    tx.execute_batch(LEADERSHIP_SQL_V31)?;
-    tx.execute(
-        "INSERT INTO ops_leadership(workspace_id,scope_kind,activity_id,state,leader_participant_id,leadership_revision,stabilization_until_ms,current_election_id,updated_at_ms) SELECT workspace_id,scope_kind,activity_id,state,leader_participant_id,leadership_revision,stabilization_until_ms,current_election_id,updated_at_ms FROM ops_leadership_v20",
-        [],
-    )?;
-    tx.execute("DROP TABLE ops_leadership_v20", [])?;
-    tx.execute_batch(LEADERSHIP_SCOPE_INDEX_V31)?;
-    Ok(())
-}
-
-/// Reconcile scope-local elections before the v35 catalog cutover. The
-/// caller owns the surrounding IMMEDIATE migration transaction.
-///
-/// # Errors
-/// Rejects corrupt election/scope links, committed intents that still point
-/// at an unresolved election, revision overflow, and storage failures.
-pub(crate) fn reconcile_legacy_leadership_elections_for_v35(
-    tx: &Transaction<'_>,
-) -> Result<(), OperationsError> {
-    const PAGE_LIMIT: i64 = 64;
-    let mut after: Option<Vec<u8>> = None;
-    loop {
-        let candidates = legacy_election_page_v35(tx, after.as_deref(), PAGE_LIMIT)?;
-        let Some((last_id, _, _)) = candidates.last() else {
-            return Ok(());
-        };
-        after = Some(last_id.clone());
-        for (raw_id, created_at_ms, closed_at_ms) in candidates {
-            let election_id = Uuid::from_bytes(wire::id(raw_id)?);
-            reconcile_legacy_election_v35(tx, election_id, created_at_ms, closed_at_ms)?;
-        }
-    }
-}
-
-type LegacyElectionMigrationRow = (Vec<u8>, i64, Option<i64>);
-
-fn legacy_election_page_v35(
-    tx: &Transaction<'_>,
-    after: Option<&[u8]>,
-    limit: i64,
-) -> Result<Vec<LegacyElectionMigrationRow>, OperationsError> {
-    let mut query = tx.prepare(
-        "SELECT substr(e.election_id,1,17),e.created_at_ms,e.closed_at_ms
-         FROM ops_leadership_elections e
-         WHERE e.scope_kind IN(0,2) AND (?1 IS NULL OR e.election_id>?1)
-           AND (e.state='ELECTING' OR (e.state='CLOSED_ELECTED' AND EXISTS(
-             SELECT 1 FROM ops_leadership l
-             WHERE l.workspace_id=e.workspace_id AND l.scope_kind=e.scope_kind
-               AND l.activity_id IS e.activity_id AND l.team_id IS e.team_id
-               AND l.current_election_id=e.election_id
-               AND l.state IN('AUTHORITY_PENDING','RECOVERY_REQUIRED')
-           )))
-         ORDER BY e.election_id LIMIT ?2",
-    )?;
-    query
-        .query_map(params![after, limit], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(OperationsError::from)
-}
-
-fn reconcile_legacy_election_v35(
-    tx: &Transaction<'_>,
-    election_id: Uuid,
-    created_at_ms: i64,
-    closed_at_ms: Option<i64>,
-) -> Result<(), OperationsError> {
-    let election = load_election(tx, election_id)?
-        .ok_or(OperationsError::Corrupt("leadership migration election"))?;
-    let row = load_leadership(tx, election.scope)?;
-    let pointer_owns_election = row
-        .as_ref()
-        .is_some_and(|row| row.current_election_id == Some(election_id));
-    let recoverable_pointer = row.as_ref().is_some_and(|row| {
-        pointer_owns_election
-            && matches!(
-                row.state,
-                LeadershipState::AuthorityPending | LeadershipState::RecoveryRequired
-            )
-    });
-
-    match election.state {
-        ElectionState::Electing => {}
-        ElectionState::ClosedElected if recoverable_pointer => {}
-        ElectionState::ClosedElected
-        | ElectionState::ClosedNoMajority
-        | ElectionState::Cancelled => return Ok(()),
-    }
-
-    let transition_at_ms = row.as_ref().map_or(created_at_ms, |row| {
-        if election.state == ElectionState::Electing {
-            created_at_ms.max(row.updated_at_ms)
-        } else {
-            row.updated_at_ms.max(closed_at_ms.unwrap_or(created_at_ms))
-        }
-    });
-    let cancelled_closed_at_ms =
-        (election.state == ElectionState::Electing).then_some(transition_at_ms);
-
-    if pointer_owns_election && committed_confirm_intent_exists(tx, election.scope, election_id)? {
-        return Err(OperationsError::Corrupt(
-            "committed leadership intent has unresolved election pointer",
-        ));
-    }
-
-    cancel_legacy_election_v35(tx, election_id, election.state, cancelled_closed_at_ms)?;
-    if pointer_owns_election {
-        let row = row
-            .as_ref()
-            .ok_or(OperationsError::Corrupt("leadership migration pointer"))?;
-        reconcile_cancelled_election_pointer_v35(
-            tx,
-            election.scope,
-            election_id,
-            row,
-            transition_at_ms,
-        )?;
-    }
-    Ok(())
-}
-
-fn cancel_legacy_election_v35(
-    tx: &Transaction<'_>,
-    election_id: Uuid,
-    state: ElectionState,
-    closed_at_ms: Option<i64>,
-) -> Result<(), OperationsError> {
-    let changed = match state {
-        ElectionState::Electing => tx.execute(
-            "UPDATE ops_leadership_elections SET state='CANCELLED',closed_at_ms=?2 WHERE election_id=?1 AND state='ELECTING'",
-            params![election_id.as_bytes(), closed_at_ms],
-        )?,
-        ElectionState::ClosedElected => tx.execute(
-            "UPDATE ops_leadership_elections SET state='CANCELLED' WHERE election_id=?1 AND state='CLOSED_ELECTED'",
-            params![election_id.as_bytes()],
-        )?,
-        ElectionState::ClosedNoMajority | ElectionState::Cancelled => return Ok(()),
-    };
-    if changed != 1 {
-        return Err(OperationsError::Corrupt(
-            "leadership migration election state",
-        ));
-    }
-    Ok(())
-}
-
-fn reconcile_cancelled_election_pointer_v35(
-    tx: &Transaction<'_>,
-    scope: LeadershipScope,
-    election_id: Uuid,
-    row: &LeadershipRow,
-    now_ms: i64,
-) -> Result<(), OperationsError> {
-    let has_live_intent = has_live_confirm_intent(tx, scope, None)?;
-    let (state, current_election_id, receipt_kind) = if has_live_intent {
-        (
-            LeadershipState::RecoveryRequired,
-            Some(election_id),
-            ReceiptKind::Recovery,
-        )
-    } else if row.leader_participant_id.is_some() {
-        (
-            LeadershipState::FailoverRequired,
-            None,
-            ReceiptKind::Failover,
-        )
-    } else {
-        (LeadershipState::Vacant, None, ReceiptKind::Vacated)
-    };
-    let updated = cas_leadership(
-        tx,
-        scope,
-        row.leadership_revision,
-        LeadershipUpdate {
-            state,
-            leader_participant_id: row.leader_participant_id,
-            stabilization_until_ms: None,
-            current_election_id,
-            now_ms,
-        },
-    )?
-    .ok_or(OperationsError::Conflict("leadership migration revision"))?;
-    append_receipt(
-        tx,
-        scope,
-        &ReceiptRow {
-            kind: receipt_kind,
-            provenance_activity: None,
-            work_assignment_id: None,
-            election_id: Some(election_id),
-            participant_id: row.leader_participant_id,
-            leadership_revision: updated.leadership_revision,
-            recorded_at_ms: now_ms,
-        },
-    )
-}
-
-fn committed_confirm_intent_exists(
-    tx: &Transaction<'_>,
-    scope: LeadershipScope,
-    election_id: Uuid,
-) -> Result<bool, OperationsError> {
-    tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM ops_leadership_confirm_intents
-         WHERE workspace_id=?1 AND scope_kind=?2 AND activity_id IS ?3 AND team_id IS ?4
-           AND election_id=?5 AND state='committed')",
-        params![
-            scope.workspace_id().into_uuid().as_bytes(),
-            scope.scope_kind(),
-            election_activity_param(scope),
-            election_team_param(scope),
-            election_id.as_bytes(),
-        ],
-        |row| row.get(0),
-    )
-    .map_err(OperationsError::from)
-}
-/// Rebuild the Team-aware leadership tables from catalog v31. The catalog
-/// migration owner temporarily disables foreign-key enforcement outside its
-/// transaction while this helper replaces the parent election table; it runs
-/// `foreign_key_check` before committing and restores enforcement on every
-/// path. This helper itself never toggles that connection-wide pragma.
-pub(crate) fn migrate_v31_to_v32(tx: &Transaction<'_>) -> Result<(), OperationsError> {
-    if !table_has_column(tx, "ops_leadership", "team_id")? {
-        rebuild_scope_table(
-            tx,
-            LEADERSHIP_SQL,
-            "ops_leadership",
-            "workspace_id,scope_kind,activity_id,team_id,state,leader_participant_id,leadership_revision,stabilization_until_ms,current_election_id,updated_at_ms",
-            "workspace_id,scope_kind,activity_id,NULL,state,leader_participant_id,leadership_revision,stabilization_until_ms,current_election_id,updated_at_ms",
-        )?;
-    }
-    if !table_has_column(tx, "ops_leadership_elections", "team_id")? {
-        rebuild_scope_table(
-            tx,
-            ELECTIONS_SQL,
-            "ops_leadership_elections",
-            "election_id,workspace_id,scope_kind,activity_id,team_id,kind,state,incumbent_participant_id,candidate_participant_id,ballot_deadline_ms,elected_participant_id,tally_yes,tally_no,tally_abstain,created_at_ms,closed_at_ms",
-            "election_id,workspace_id,scope_kind,activity_id,NULL,kind,state,incumbent_participant_id,candidate_participant_id,ballot_deadline_ms,elected_participant_id,tally_yes,tally_no,tally_abstain,created_at_ms,closed_at_ms",
-        )?;
-    }
-    if !table_has_column(tx, "ops_leadership_receipts", "team_id")? {
-        rebuild_scope_table(
-            tx,
-            RECEIPTS_SQL,
-            "ops_leadership_receipts",
-            "workspace_id,scope_kind,activity_id,team_id,receipt_ordinal,receipt_kind,work_assignment_id,election_id,participant_id,leadership_revision,recorded_at_ms",
-            "workspace_id,scope_kind,activity_id,zeroblob(16),receipt_ordinal,receipt_kind,work_assignment_id,election_id,participant_id,leadership_revision,recorded_at_ms",
-        )?;
-    }
-    if !table_has_column(tx, "ops_leadership_confirm_intents", "team_id")? {
-        rebuild_scope_table(
-            tx,
-            CONFIRM_INTENTS_SQL,
-            "ops_leadership_confirm_intents",
-            "request_id,kind,workspace_id,scope_kind,activity_id,team_id,election_id,elected_participant_id,expected_local_revision,requested_fence_revision,owner_instance_id,remote_recorded_revision,confirmed_at_ms,state,created_at_ms,resolved_at_ms",
-            "request_id,kind,workspace_id,scope_kind,activity_id,NULL,election_id,elected_participant_id,expected_local_revision,requested_fence_revision,owner_instance_id,remote_recorded_revision,confirmed_at_ms,state,created_at_ms,resolved_at_ms",
-        )?;
-    }
-    tx.execute_batch("DROP INDEX IF EXISTS ops_leadership_scope_idx")?;
-    tx.execute_batch(LEADERSHIP_SCOPE_INDEX)?;
-    Ok(())
-}
-
-fn rebuild_scope_table(
-    tx: &Transaction<'_>,
-    schema: &str,
-    table: &str,
-    target_columns: &str,
-    source_columns: &str,
-) -> Result<(), OperationsError> {
-    tx.execute_batch(&schema.replacen(
-        &format!("CREATE TABLE {table} "),
-        &format!("CREATE TABLE {table}_v32 "),
-        1,
-    ))?;
-    tx.execute(
-        &format!("INSERT INTO {table}_v32({target_columns}) SELECT {source_columns} FROM {table}"),
-        [],
-    )?;
-    if table == "ops_leadership" {
-        tx.execute_batch("DROP INDEX IF EXISTS ops_leadership_scope_idx")?;
-    }
-    tx.execute(&format!("DROP TABLE {table}"), [])?;
-    tx.execute_batch(&format!("ALTER TABLE {table}_v32 RENAME TO {table}"))?;
-    Ok(())
-}
-
-fn table_has_column(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-) -> Result<bool, OperationsError> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsError> {
     for (_, _, sql) in schema_objects() {
         connection.execute_batch(sql)?;
     }
-    Ok(())
-}
-
-/// Additive v14 -> v15 upgrade: create only the confirm-intent journal.
-pub(crate) fn create_confirm_intents_schema(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    connection.execute_batch(CONFIRM_INTENTS_SQL_V31)?;
     Ok(())
 }
 
@@ -1587,8 +1113,9 @@ struct LeadershipRow {
 
 /// Single SQL authority gate shared by exact leadership reads and election
 /// source queries. It intentionally references the enclosing `l` row alias.
-pub(crate) const CURRENT_LEADERSHIP_AUTHORITY_PREDICATE: &str =
-    "l.leader_participant_id IS NOT NULL
+macro_rules! current_leadership_authority_predicate {
+    () => {
+        "l.leader_participant_id IS NOT NULL
     AND EXISTS(SELECT 1
       FROM ops_current_effect_bindings AS b
       JOIN ops_logical_members AS lm
@@ -1621,7 +1148,10 @@ pub(crate) const CURRENT_LEADERSHIP_AUTHORITY_PREDICATE: &str =
               AND fr.team_id=COALESCE(l.team_id,zeroblob(16))
               AND (l.scope_kind!=1 OR fr.activity_id IS l.activity_id)
               AND fr.receipt_kind='FAILOVER'
-              AND fr.leadership_revision=c.source_leadership_revision)))";
+              AND fr.leadership_revision=c.source_leadership_revision)))"
+    };
+}
+pub(crate) use current_leadership_authority_predicate;
 
 #[derive(Debug, Clone, Copy)]
 struct ElectionRow {
@@ -3856,6 +3386,16 @@ fn load_leadership(
     .transpose()
 }
 
+const EXISTS_CURRENT_LEADERSHIP_AUTHORITY_SQL: &str = crate::static_sql::StaticSql::dml(concat!(
+    "SELECT EXISTS(SELECT 1 FROM ops_leadership AS l
+             WHERE l.workspace_id=?1 AND l.scope_kind=?2
+               AND l.activity_id IS ?3 AND l.team_id IS ?4
+               AND (",
+    current_leadership_authority_predicate!(),
+    "))"
+))
+.as_str();
+
 /// Connection-level form for callers already holding the exact read/write
 /// transaction, including message enqueue effects. Never opens a nested transaction.
 pub(crate) fn current_leadership_authority_in_transaction(
@@ -3866,12 +3406,7 @@ pub(crate) fn current_leadership_authority_in_transaction(
         return Ok(None);
     };
     let eligible = tx.query_row(
-        &format!(
-            "SELECT EXISTS(SELECT 1 FROM ops_leadership AS l
-             WHERE l.workspace_id=?1 AND l.scope_kind=?2
-               AND l.activity_id IS ?3 AND l.team_id IS ?4
-               AND ({CURRENT_LEADERSHIP_AUTHORITY_PREDICATE}))"
-        ),
+        EXISTS_CURRENT_LEADERSHIP_AUTHORITY_SQL,
         params![
             scope.workspace_id().into_uuid().as_bytes(),
             scope.scope_kind(),
@@ -5320,94 +4855,6 @@ mod tests {
     }
 
     const T0: i64 = 10_000_000;
-
-    #[test]
-    fn catalog_v11_migrates_additively_without_fabricating_leadership()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = fixture("v11-migration", 0x1E00)?;
-        let path = fixture.root.join("catalog.sqlite3");
-        let destination = fixture.destination;
-        let workspace = fixture.workspace;
-        drop(fixture.catalog);
-        std::fs::remove_file(&path)?;
-
-        // Rebuild at v12 then downgrade by dropping the newest objects only.
-        let catalog = OperationsCatalog::open(&path, destination)?;
-        drop(catalog);
-        let connection = Connection::open(&path)?;
-        crate::workspace_participation::drop_schema_for_legacy_fixture(&connection)?;
-        // The downgraded catalog must keep the exact v11 change-set shape:
-        // SQLite's ADD COLUMN rewrite places the producer columns before the
-        // table constraints, so a v14-created table text already carries them.
-        connection.execute_batch(&format!(
-            "DROP TABLE ops_admission_records; DROP TABLE ops_approval_requests; DROP TABLE ops_approval_policy; DROP TABLE ops_issuer_config; DROP TABLE ops_leadership_confirm_intents; DROP TABLE ops_ballots; DROP TABLE ops_election_electorate; DROP TABLE ops_leadership_elections; DROP TABLE ops_leadership_receipts; DROP TABLE ops_leadership; DROP TABLE ops_assignment_submit_source_refs; DROP TABLE ops_assignment_submit_projection; DROP TABLE ops_assignment_offer_projection; DROP TABLE ops_change_set_projection; {}; PRAGMA user_version=11;",
-            crate::effect_fact::change_sets_sql_v13()
-        ))?;
-        drop(connection);
-
-        let migrated = OperationsCatalog::open(&path, destination)?;
-        let version: i64 = migrated
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, crate::catalog::VERSION);
-        assert!(
-            migrated.leadership_view(workspace, None, T0)?.is_none(),
-            "v11 -> v12 must not fabricate a workspace leadership row"
-        );
-        drop(migrated);
-        std::fs::remove_dir_all(fixture.root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn v19_handoff_pending_migrates_fail_closed_to_failover()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let fixture = fixture("v19-handoff-retirement", 0x1E08)?;
-        let path = fixture.root.join("catalog.sqlite3");
-        let destination = fixture.destination;
-        let workspace = fixture.workspace;
-        let leader = Uuid::from_u128(0x1E09);
-        drop(fixture.catalog);
-
-        let connection = Connection::open(&path)?;
-        crate::workspace_participation::drop_schema_for_legacy_fixture(&connection)?;
-        connection.execute("DROP TABLE ops_leadership", [])?;
-        connection.execute_batch(LEADERSHIP_SQL_V19)?;
-        connection.execute_batch(LEADERSHIP_SCOPE_INDEX_V31)?;
-        connection.execute(
-            "INSERT INTO ops_leadership(workspace_id,scope_kind,activity_id,state,leader_participant_id,leadership_revision,stabilization_until_ms,current_election_id,updated_at_ms) VALUES(?1,0,NULL,'HANDOFF_PENDING',?2,7,NULL,NULL,?3)",
-            params![workspace.into_uuid().as_bytes(), leader.as_bytes(), T0],
-        )?;
-        connection.pragma_update(None, "user_version", 19_i64)?;
-        drop(connection);
-
-        let migrated = OperationsCatalog::open(&path, destination)?;
-        let version: i64 = migrated
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, crate::catalog::VERSION);
-        let view = migrated
-            .leadership_view(workspace, None, T0)?
-            .ok_or("migrated leadership missing")?;
-        assert_eq!(view.state(), LeadershipState::FailoverRequired);
-        assert_eq!(view.leader_participant_id(), None);
-        assert_eq!(view.leadership_revision(), 8);
-        let schema: String = migrated.connection.query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='ops_leadership'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert!(!schema.contains("HANDOFF_PENDING"));
-        let failover_receipts: i64 = migrated.connection.query_row(
-            "SELECT COUNT(*) FROM ops_leadership_receipts WHERE workspace_id=?1 AND scope_kind=0 AND receipt_kind='FAILOVER' AND leadership_revision=8",
-            params![workspace.into_uuid().as_bytes()],
-            |row| row.get(0),
-        )?;
-        assert_eq!(failover_receipts, 1);
-        drop(migrated);
-        std::fs::remove_dir_all(fixture.root)?;
-        Ok(())
-    }
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -7746,72 +7193,6 @@ mod tests {
                 )
                 .is_err()
         );
-        Ok(())
-    }
-
-    #[test]
-    fn v39_reopen_adds_empty_work_exchange_journal_without_backfill()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (mut fixture, scope, _, candidate) =
-            seeded_workspace_fixture("work-exchange-v39-migration", 0x8C00)?;
-        let (election_id, deadline) = run_majority_election(
-            &mut fixture,
-            scope,
-            candidate,
-            T0 + STABILIZATION_WINDOW_MS + 1,
-        )?;
-        let request_id = Uuid::from_u128(0x8C01);
-        let prepared = prepare_confirm(&mut fixture, scope, election_id, request_id, deadline + 1)?;
-        let _committed = fixture.catalog.commit_leadership_confirm(
-            &prepared,
-            ok_fence(&prepared),
-            deadline + 2,
-        )?;
-        assert!(
-            fixture
-                .catalog
-                .leadership_work_exchange(scope, request_id)?
-                .is_some()
-        );
-
-        let path = fixture.root.join("catalog.sqlite3");
-        crate::binding_rejection::drop_schema_for_legacy_fixture(&fixture.catalog.connection)?;
-        work_roster::drop_schema_for_legacy_fixture(&fixture.catalog.connection)?;
-        fixture.catalog.connection.execute_batch(
-            "DROP TABLE ops_agent_provision_uncertainty_retirements;
-             DROP TABLE ops_registration_profile_scopes;
-             DROP INDEX ops_leadership_work_exchanges_pending;
-             DROP TABLE ops_leadership_work_exchanges;",
-        )?;
-        crate::catalog::restore_v46_message_schema_for_legacy_fixture(&fixture.catalog.connection)?;
-        crate::catalog::restore_v47_assignment_schema_for_legacy_fixture(
-            &fixture.catalog.connection,
-        )?;
-        fixture
-            .catalog
-            .connection
-            .pragma_update(None, "user_version", 39_i64)?;
-        drop(fixture.catalog);
-
-        let migrated = OperationsCatalog::open(&path, fixture.destination)?;
-        let version: i64 = migrated
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, crate::catalog::VERSION);
-        let rows: i64 = migrated.connection.query_row(
-            "SELECT COUNT(*) FROM ops_leadership_work_exchanges",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(rows, 0);
-        assert!(
-            migrated
-                .leadership_work_exchange(scope, request_id)?
-                .is_none()
-        );
-
-        drop(migrated);
-        std::fs::remove_dir_all(fixture.root)?;
         Ok(())
     }
 

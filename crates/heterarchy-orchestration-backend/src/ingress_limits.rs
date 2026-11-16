@@ -74,10 +74,6 @@ fn is_control_path(path: &str) -> bool {
         || (path.starts_with("/internal/v1/approval-requests/") && path.ends_with("/decision"))
         || (path.starts_with("/internal/v1/workspaces/")
             && path.ends_with("/approval-requests/decision"))
-        || (path.starts_with("/internal/v1/workspaces/")
-            && path.ends_with("/provision-operations/cancel"))
-        || (path.starts_with("/internal/v1/workspaces/")
-            && path.ends_with("/provision-operations/retire-unobserved"))
 }
 
 /// Body adapter that bounds only the time spent waiting for request-body
@@ -176,8 +172,6 @@ mod tests {
             "/internal/v1/workspaces/00000000-0000-0000-0000-000000000001/approval-requests/decision",
             "/internal/v1/approval-automatic/disable",
             "/internal/v1/approval-expiry/reconcile",
-            "/internal/v1/workspaces/00000000-0000-0000-0000-000000000001/provision-operations/cancel",
-            "/internal/v1/workspaces/00000000-0000-0000-0000-000000000001/provision-operations/retire-unobserved",
         ] {
             assert!(is_control_path(path), "expected reserved path: {path}");
         }

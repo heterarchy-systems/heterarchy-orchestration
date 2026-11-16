@@ -16,49 +16,20 @@ use super::{
     validate_schema_sql,
 };
 
+mod sql;
+
+use sql::{
+    CLOSE_FROZEN_RUNTIME_ENTRIES_SQL, FREEZE_RUNTIME_ENTRIES_SQL, FROZEN_RUNTIME_STATS_SQL,
+    HAS_MAX_REVISION_RUNTIME_ENTRY_SQL, HAS_RUNTIME_TARGETS_SQL, INSERT_DELETION_REQUEST_SQL,
+    INSERT_MANIFEST_SQL, MARK_MANIFEST_COMPLETED_SQL, PROFILE_DELETION_MANIFESTS_TABLE_SQL,
+    PROFILE_DELETION_REQUESTS_TABLE_SQL, PROFILE_DELETION_RUNTIME_ENTRIES_TABLE_SQL,
+    RUNTIME_ENTRY_STATS_SQL, SELECT_INTENT_BY_PROFILE_SQL, SELECT_INTENT_BY_REQUEST_SQL,
+    SELECT_INTENTS_PAGE_SQL, SELECT_MANIFEST_BY_REQUEST_SQL, SELECT_RUNTIME_ENTRIES_PAGE_SQL,
+    SELECT_RUNTIME_ENTRY_SQL, UPDATE_PROFILE_LIFECYCLE_CAS_SQL, VALIDATE_MANIFEST_INVENTORY_SQL,
+};
+
 const MAX_PROFILE_DELETION_INTENTS_PER_PAGE: usize = 32;
 const MAX_PROFILE_DELETION_RUNTIME_ENTRIES_PER_PAGE: usize = 32;
-
-pub(super) const PROFILE_DELETION_REQUESTS_TABLE_SQL: &str = r"
-CREATE TABLE agent_profile_deletion_requests (
-    request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id) = 16 AND request_id != zeroblob(16)),
-    profile_id BLOB NOT NULL UNIQUE CHECK(length(profile_id) = 16 AND profile_id != zeroblob(16)),
-    expected_profile_revision INTEGER NOT NULL CHECK(expected_profile_revision > 0),
-    barrier_profile_revision INTEGER NOT NULL CHECK(barrier_profile_revision > 0),
-    requested_at_ms INTEGER NOT NULL CHECK(requested_at_ms >= 0),
-    FOREIGN KEY(profile_id) REFERENCES agent_profiles(profile_id)
-);
-";
-
-pub(super) const PROFILE_DELETION_MANIFESTS_TABLE_SQL: &str = r"
-CREATE TABLE agent_profile_deletion_manifests (
-    request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id) = 16 AND request_id != zeroblob(16)),
-    profile_id BLOB NOT NULL UNIQUE CHECK(length(profile_id) = 16 AND profile_id != zeroblob(16)),
-    profile_revision_at_freeze INTEGER NOT NULL CHECK(profile_revision_at_freeze > 0),
-    frozen_at_ms INTEGER NOT NULL CHECK(frozen_at_ms >= 0),
-    completed_at_ms INTEGER CHECK(completed_at_ms IS NULL OR completed_at_ms >= frozen_at_ms),
-    runtime_entry_count INTEGER NOT NULL CHECK(runtime_entry_count >= 0),
-    linked_target_count INTEGER NOT NULL CHECK(linked_target_count >= 0),
-    no_linked_target_count INTEGER NOT NULL CHECK(no_linked_target_count >= 0),
-    FOREIGN KEY(request_id) REFERENCES agent_profile_deletion_requests(request_id),
-    FOREIGN KEY(profile_id) REFERENCES agent_profiles(profile_id),
-    CHECK(runtime_entry_count = linked_target_count + no_linked_target_count)
-);
-";
-
-pub(super) const PROFILE_DELETION_RUNTIME_ENTRIES_TABLE_SQL: &str = r"
-CREATE TABLE agent_profile_deletion_runtime_entries (
-    request_id BLOB NOT NULL CHECK(length(request_id) = 16 AND request_id != zeroblob(16)),
-    runtime_session_id BLOB NOT NULL CHECK(length(runtime_session_id) = 16 AND runtime_session_id != zeroblob(16)),
-    provider_family INTEGER NOT NULL CHECK(provider_family = 1),
-    provider_conversation_id TEXT CHECK(provider_conversation_id IS NULL OR length(CAST(provider_conversation_id AS BLOB)) BETWEEN 1 AND 512),
-    original_state INTEGER NOT NULL CHECK(original_state BETWEEN 1 AND 8),
-    original_revision INTEGER NOT NULL CHECK(original_revision > 0),
-    PRIMARY KEY(request_id,runtime_session_id),
-    FOREIGN KEY(request_id) REFERENCES agent_profile_deletion_manifests(request_id),
-    FOREIGN KEY(runtime_session_id) REFERENCES agent_profile_runtime_sessions(runtime_session_id)
-);
-";
 
 /// Exact request to stop new local admissions for one Profile before its
 /// provider-side deletion saga begins.
@@ -305,16 +276,12 @@ pub(super) fn create_manifest_schema(
     Ok(())
 }
 
-pub(super) fn validate_v4_schema(connection: &Connection) -> Result<(), AgentProfileError> {
+pub(super) fn validate_schema(connection: &Connection) -> Result<(), AgentProfileError> {
     validate_schema_sql(
         connection,
         "agent_profile_deletion_requests",
         PROFILE_DELETION_REQUESTS_TABLE_SQL,
-    )
-}
-
-pub(super) fn validate_schema(connection: &Connection) -> Result<(), AgentProfileError> {
-    validate_v4_schema(connection)?;
+    )?;
     validate_schema_sql(
         connection,
         "agent_profile_deletion_manifests",
@@ -344,7 +311,8 @@ impl AgentProfileCatalog {
     /// # Errors
     /// Rejects missing Profiles, stale revisions, a regressed timestamp,
     /// conflicting request replay, an existing deletion request under another
-    /// identity, path-integrity failures, or SQLite errors.
+    /// identity, retired provider metadata/runtime targets, path-integrity
+    /// failures, or SQLite errors.
     pub fn begin_profile_deletion(
         &mut self,
         command: &AgentProfileDeletionCommand,
@@ -373,6 +341,7 @@ impl AgentProfileCatalog {
         }
         let profile = load_profile(&transaction, command.profile_id)?
             .ok_or(AgentProfileError::ProfileMissing(command.profile_id))?;
+        ensure_local_providerless_deletion_target(&transaction, &profile)?;
         super::home_acceptance::ensure_unpinned(&transaction, profile.id())?;
         if profile.revision() != command.expected_profile_revision {
             return Err(AgentProfileError::ProfileRevisionConflict {
@@ -399,9 +368,7 @@ impl AgentProfileCatalog {
                         .ok_or(AgentProfileError::InvalidRevision(i64::MAX))?,
                 )?;
                 let changed = transaction.execute(
-                    "UPDATE agent_profiles
-                     SET lifecycle_state=?1,updated_at_ms=?2,revision=?3
-                     WHERE profile_id=?4 AND revision=?5 AND lifecycle_state=?6",
+                    UPDATE_PROFILE_LIFECYCLE_CAS_SQL,
                     params![
                         super::encode_lifecycle(AgentProfileLifecycleState::Disabled),
                         command.requested_at.get(),
@@ -430,10 +397,7 @@ impl AgentProfileCatalog {
             requested_at: command.requested_at,
         };
         transaction.execute(
-            "INSERT INTO agent_profile_deletion_requests(
-                request_id,profile_id,expected_profile_revision,
-                barrier_profile_revision,requested_at_ms
-             ) VALUES(?1,?2,?3,?4,?5)",
+            INSERT_DELETION_REQUEST_SQL,
             params![
                 intent.request_id.as_bytes(),
                 intent.profile_id.into_uuid().as_bytes(),
@@ -515,7 +479,8 @@ impl AgentProfileCatalog {
     ///
     /// # Errors
     /// Rejects missing intent/Profile, an Active Profile, stale revisions,
-    /// clock regression, replay conflict, or persistence errors.
+    /// provider-bound Profiles/runtime targets, clock regression, replay
+    /// conflict, or persistence errors.
     pub fn freeze_profile_deletion_targets(
         &mut self,
         request_id: Uuid,
@@ -600,10 +565,7 @@ impl AgentProfileCatalog {
         let raw = self
             .connection
             .query_row(
-                "SELECT runtime_session_id,provider_family,provider_conversation_id,
-                    original_state,original_revision
-             FROM agent_profile_deletion_runtime_entries
-             WHERE request_id=?1 AND runtime_session_id=?2",
+                SELECT_RUNTIME_ENTRY_SQL,
                 params![
                     request_id.as_bytes(),
                     runtime_session_id.into_uuid().as_bytes()
@@ -657,14 +619,9 @@ impl AgentProfileCatalog {
         deletion_runtime_entries_page(&self.connection, manifest, after_runtime_id, page_size)
     }
 
-    /// Finalize the local deletion manifest after the host has verified a
-    /// positive Operations deletion receipt for every linked provider target.
-    /// The host must also reconcile operations represented by `NoLinkedTarget`;
-    /// a null Sessions conversation ID does not prove no remote operation exists.
-    /// This method accepts no receipt list or boolean proof; that authority
-    /// remains with the host/Operations boundary. It preserves Runtime IDs,
-    /// conversation identity, logical Session history, and already-closed row
-    /// timestamps/revisions.
+    /// Finalize local deletion for an Unbound Profile with an empty Runtime
+    /// inventory. Historical provider entries require positive external deletion
+    /// evidence that this catalog does not own, so they cannot be finalized here.
     ///
     /// Exact replay returns the first completed timestamp. After uncertain
     /// commit/post-commit outcomes, read back by request ID or retry this
@@ -672,7 +629,8 @@ impl AgentProfileCatalog {
     ///
     /// # Errors
     /// Rejects missing manifests/Profiles, an Active Profile, a regressed
-    /// completion clock, revision overflow, or persistence errors.
+    /// completion clock, legacy provider targets, revision overflow, or
+    /// persistence errors.
     pub fn finish_profile_deletion(
         &mut self,
         request_id: Uuid,
@@ -696,6 +654,13 @@ impl AgentProfileCatalog {
             self.ensure_live_binding()?;
             return Ok(manifest);
         }
+        let profile = load_profile(&transaction, manifest.profile_id)?
+            .ok_or(AgentProfileError::ProfileMissing(manifest.profile_id))?;
+        if profile.provider_family() != AgentProfileProviderFamily::Unbound
+            || manifest.runtime_entry_count() != 0
+        {
+            return Err(AgentProfileError::ProviderRetired);
+        }
         let completed = finish_manifest_in_transaction(&transaction, manifest, completed_at)?;
         transaction.commit()?;
         self.ensure_live_binding()?;
@@ -717,14 +682,7 @@ fn validate_manifest_inventory(
             "frozen deletion intent fence changed",
         ));
     }
-    let mut statement = connection.prepare(
-        "SELECT e.runtime_session_id,e.provider_family,e.provider_conversation_id,
-                e.original_state,e.original_revision,r.profile_id,r.provider_family,
-                r.provider_conversation_id,r.revision
-         FROM agent_profile_deletion_runtime_entries e
-         LEFT JOIN agent_profile_runtime_sessions r ON r.runtime_session_id=e.runtime_session_id
-         WHERE e.request_id=?1 ORDER BY e.runtime_session_id",
-    )?;
+    let mut statement = connection.prepare(VALIDATE_MANIFEST_INVENTORY_SQL)?;
     let mut rows = statement.query(params![manifest.request_id.as_bytes()])?;
     let mut counts = [0_u64; 3];
     while let Some(row) = rows.next()? {
@@ -778,6 +736,24 @@ fn validate_manifest_inventory(
     Ok(())
 }
 
+fn ensure_local_providerless_deletion_target(
+    connection: &Connection,
+    profile: &super::AgentProfile,
+) -> Result<(), AgentProfileError> {
+    if profile.provider_family() != AgentProfileProviderFamily::Unbound {
+        return Err(AgentProfileError::ProviderRetired);
+    }
+    let has_runtime_targets: bool = connection.query_row(
+        HAS_RUNTIME_TARGETS_SQL,
+        params![profile.id().into_uuid().as_bytes()],
+        |row| row.get(0),
+    )?;
+    if has_runtime_targets {
+        return Err(AgentProfileError::ProviderRetired);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct RawProfileDeletionIntent {
     request_id: Vec<u8>,
@@ -807,16 +783,8 @@ fn load_intent(
     key: &[u8],
 ) -> Result<Option<AgentProfileDeletionIntent>, AgentProfileError> {
     let sql = match key_column {
-        "request_id" => {
-            "SELECT request_id,profile_id,expected_profile_revision,
-                    barrier_profile_revision,requested_at_ms
-             FROM agent_profile_deletion_requests WHERE request_id=?1"
-        }
-        "profile_id" => {
-            "SELECT request_id,profile_id,expected_profile_revision,
-                    barrier_profile_revision,requested_at_ms
-             FROM agent_profile_deletion_requests WHERE profile_id=?1"
-        }
+        "request_id" => SELECT_INTENT_BY_REQUEST_SQL,
+        "profile_id" => SELECT_INTENT_BY_PROFILE_SQL,
         _ => return Err(AgentProfileError::Corrupt("deletion intent lookup key")),
     };
     let raw = connection
@@ -841,13 +809,7 @@ fn profile_deletion_intents_page(
     let lookahead_limit = i64::try_from(page_size + 1)
         .map_err(|_| AgentProfileError::Corrupt("Profile deletion intent page bound"))?;
     let after_request_id = after_request_id.map(|id| id.as_bytes().to_vec());
-    let mut statement = connection.prepare(
-        "SELECT request_id,profile_id,expected_profile_revision,
-                barrier_profile_revision,requested_at_ms
-         FROM agent_profile_deletion_requests
-         WHERE (?1 IS NULL OR request_id>?1)
-         ORDER BY request_id ASC LIMIT ?2",
-    )?;
+    let mut statement = connection.prepare(SELECT_INTENTS_PAGE_SQL)?;
     let mut rows = statement
         .query_map(params![after_request_id, lookahead_limit], |row| {
             Ok(RawProfileDeletionIntent {
@@ -924,10 +886,7 @@ fn load_manifest_by_request(
 ) -> Result<Option<AgentProfileDeletionManifest>, AgentProfileError> {
     let raw = connection
         .query_row(
-            "SELECT request_id,profile_id,profile_revision_at_freeze,frozen_at_ms,
-                    completed_at_ms,runtime_entry_count,linked_target_count,
-                    no_linked_target_count
-             FROM agent_profile_deletion_manifests WHERE request_id=?1",
+            SELECT_MANIFEST_BY_REQUEST_SQL,
             params![request_id.as_bytes()],
             |row| {
                 Ok(RawDeletionManifest {
@@ -986,19 +945,6 @@ fn decode_entry_count(value: i64) -> Result<u64, AgentProfileError> {
     u64::try_from(value).map_err(|_| AgentProfileError::Corrupt("negative deletion entry count"))
 }
 
-pub(super) fn manifest_exists_for_profile(
-    connection: &Connection,
-    profile_id: AgentProfileId,
-) -> Result<bool, AgentProfileError> {
-    Ok(connection.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM agent_profile_deletion_manifests WHERE profile_id=?1
-         )",
-        params![profile_id.into_uuid().as_bytes()],
-        |row| row.get(0),
-    )?)
-}
-
 #[derive(Debug)]
 struct RuntimeEntryStats {
     total: i64,
@@ -1012,11 +958,7 @@ fn runtime_entry_stats(
     profile_id: AgentProfileId,
 ) -> Result<RuntimeEntryStats, AgentProfileError> {
     let stats = connection.query_row(
-        "SELECT COUNT(*),
-                COALESCE(SUM(CASE WHEN provider_conversation_id IS NOT NULL THEN 1 ELSE 0 END),0),
-                COALESCE(SUM(CASE WHEN provider_conversation_id IS NULL THEN 1 ELSE 0 END),0),
-                COALESCE(MAX(last_seen_at_ms),0)
-         FROM agent_profile_runtime_sessions WHERE profile_id=?1",
+        RUNTIME_ENTRY_STATS_SQL,
         params![profile_id.into_uuid().as_bytes()],
         |row| {
             Ok(RuntimeEntryStats {
@@ -1049,6 +991,7 @@ fn freeze_manifest_in_transaction(
         .ok_or(AgentProfileError::ProfileDeletionIntentMissing(request_id))?;
     let profile = load_profile(transaction, intent.profile_id)?
         .ok_or(AgentProfileError::ProfileMissing(intent.profile_id))?;
+    ensure_local_providerless_deletion_target(transaction, &profile)?;
     if profile.revision() != expected_profile_revision {
         return Err(AgentProfileError::ProfileRevisionConflict {
             profile_id: intent.profile_id,
@@ -1085,10 +1028,7 @@ fn freeze_manifest_in_transaction(
         no_linked_target_count: decode_entry_count(stats.unlinked)?,
     };
     transaction.execute(
-        "INSERT INTO agent_profile_deletion_manifests(
-            request_id,profile_id,profile_revision_at_freeze,frozen_at_ms,
-            completed_at_ms,runtime_entry_count,linked_target_count,no_linked_target_count
-         ) VALUES(?1,?2,?3,?4,NULL,?5,?6,?7)",
+        INSERT_MANIFEST_SQL,
         params![
             manifest.request_id.as_bytes(),
             manifest.profile_id.into_uuid().as_bytes(),
@@ -1100,12 +1040,7 @@ fn freeze_manifest_in_transaction(
         ],
     )?;
     let inserted = transaction.execute(
-        "INSERT INTO agent_profile_deletion_runtime_entries(
-            request_id,runtime_session_id,provider_family,provider_conversation_id,
-            original_state,original_revision
-         )
-         SELECT ?1,runtime_session_id,provider_family,provider_conversation_id,state,revision
-         FROM agent_profile_runtime_sessions WHERE profile_id=?2",
+        FREEZE_RUNTIME_ENTRIES_SQL,
         params![
             manifest.request_id.as_bytes(),
             manifest.profile_id.into_uuid().as_bytes(),
@@ -1166,13 +1101,7 @@ fn deletion_runtime_entries_page(
     let limit = i64::try_from(page_size + 1)
         .map_err(|_| AgentProfileError::Corrupt("deletion Runtime entry page bound"))?;
     let after = after_runtime_id.map(|id| id.into_uuid().as_bytes().to_vec());
-    let mut statement = connection.prepare(
-        "SELECT runtime_session_id,provider_family,provider_conversation_id,
-                original_state,original_revision
-         FROM agent_profile_deletion_runtime_entries
-         WHERE request_id=?1 AND (?2 IS NULL OR runtime_session_id>?2)
-         ORDER BY runtime_session_id ASC LIMIT ?3",
-    )?;
+    let mut statement = connection.prepare(SELECT_RUNTIME_ENTRIES_PAGE_SQL)?;
     let mut rows = statement
         .query_map(
             params![manifest.request_id.as_bytes(), after, limit],
@@ -1220,12 +1149,7 @@ fn frozen_runtime_stats(
 ) -> Result<FrozenRuntimeStats, AgentProfileError> {
     let closed_state = encode_runtime_state(AgentProfileRuntimeSessionState::Closed);
     let stats = transaction.query_row(
-        "SELECT COUNT(*),COALESCE(MAX(r.last_seen_at_ms),0),
-                COALESCE(SUM(CASE WHEN r.state!=?2 THEN 1 ELSE 0 END),0)
-         FROM agent_profile_deletion_runtime_entries e
-         JOIN agent_profile_runtime_sessions r
-           ON r.runtime_session_id=e.runtime_session_id
-         WHERE e.request_id=?1 AND r.profile_id=?3",
+        FROZEN_RUNTIME_STATS_SQL,
         params![
             manifest.request_id.as_bytes(),
             closed_state,
@@ -1262,6 +1186,7 @@ fn finish_manifest_in_transaction(
     }
     let profile = load_profile(transaction, manifest.profile_id)?
         .ok_or(AgentProfileError::ProfileMissing(manifest.profile_id))?;
+    ensure_local_providerless_deletion_target(transaction, &profile)?;
     if profile.lifecycle_state() == AgentProfileLifecycleState::Active {
         return Err(AgentProfileError::Corrupt(
             "deletion completion requires inactive Profile",
@@ -1302,13 +1227,7 @@ fn ensure_frozen_runtime_revision_capacity(
 ) -> Result<(), AgentProfileError> {
     let closed_state = encode_runtime_state(AgentProfileRuntimeSessionState::Closed);
     let revision_maxed: bool = transaction.query_row(
-        "SELECT EXISTS(
-            SELECT 1 FROM agent_profile_deletion_runtime_entries e
-            JOIN agent_profile_runtime_sessions r
-              ON r.runtime_session_id=e.runtime_session_id
-            WHERE e.request_id=?1 AND r.profile_id=?2
-              AND r.state!=?3 AND r.revision>=?4
-         )",
+        HAS_MAX_REVISION_RUNTIME_ENTRY_SQL,
         params![
             manifest.request_id.as_bytes(),
             manifest.profile_id.into_uuid().as_bytes(),
@@ -1331,14 +1250,7 @@ fn close_frozen_runtime_entries(
 ) -> Result<(), AgentProfileError> {
     let closed_state = encode_runtime_state(AgentProfileRuntimeSessionState::Closed);
     let changed = transaction.execute(
-        "UPDATE agent_profile_runtime_sessions
-         SET state=?1,closed_at_ms=?2,last_seen_at_ms=?2,revision=revision+1
-         WHERE state!=?1 AND runtime_session_id IN (
-             SELECT e.runtime_session_id
-             FROM agent_profile_deletion_runtime_entries e
-             JOIN agent_profile_deletion_manifests m ON m.request_id=e.request_id
-             WHERE e.request_id=?3 AND m.profile_id=?4
-         )",
+        CLOSE_FROZEN_RUNTIME_ENTRIES_SQL,
         params![
             closed_state,
             completed_at.get(),
@@ -1370,9 +1282,7 @@ fn retire_manifest_profile(
             .ok_or(AgentProfileError::InvalidRevision(i64::MAX))?,
     )?;
     let changed = transaction.execute(
-        "UPDATE agent_profiles
-         SET lifecycle_state=?1,updated_at_ms=?2,revision=?3
-         WHERE profile_id=?4 AND revision=?5 AND lifecycle_state=?6",
+        UPDATE_PROFILE_LIFECYCLE_CAS_SQL,
         params![
             encode_lifecycle(AgentProfileLifecycleState::Retired),
             completed_at.get(),
@@ -1396,8 +1306,7 @@ fn mark_manifest_completed(
     completed_at: TimestampMillis,
 ) -> Result<(), AgentProfileError> {
     let changed = transaction.execute(
-        "UPDATE agent_profile_deletion_manifests SET completed_at_ms=?1
-         WHERE request_id=?2 AND completed_at_ms IS NULL",
+        MARK_MANIFEST_COMPLETED_SQL,
         params![completed_at.get(), request_id.as_bytes()],
     )?;
     if changed != 1 {

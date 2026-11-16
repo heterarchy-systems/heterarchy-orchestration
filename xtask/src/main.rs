@@ -398,6 +398,7 @@ fn rules() -> Result<(), String> {
     verify_declared_toolchain_available(&root, &toolchain)?;
     verify_cargo_baseline(&root, &policy)?;
     verify_removed_packages_absent(&root)?;
+    verify_sql_hygiene(&root)?;
     verify_workspace_members(&root, &toolchain, &policy)?;
     println!("xtask rules: PASS");
     Ok(())
@@ -708,6 +709,127 @@ fn verify_removed_packages_absent(root: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+const FORBIDDEN_SQL_DIRS: &[&str] = &[
+    "crates/heterarchy-orchestration-auth/sql",
+    "crates/heterarchy-orchestration-sessions/sql",
+    "crates/heterarchy-orchestration-operations/sql",
+];
+
+const DYNAMIC_SQL_PATTERNS: &[&str] = &[
+    "SELECT ",
+    "INSERT INTO ",
+    "UPDATE ",
+    "DELETE FROM ",
+    "DROP TABLE ",
+    "ALTER TABLE ",
+];
+
+fn verify_sql_hygiene(root: &Path) -> Result<(), String> {
+    for relative in FORBIDDEN_SQL_DIRS {
+        let dir = root.join(relative);
+        if dir.exists() {
+            return Err(format!(
+                "forbidden legacy .sql directory exists (consolidate into domain sql.rs modules): {}",
+                dir.display()
+            ));
+        }
+    }
+
+    let crates_dir = root.join("crates");
+    if !crates_dir.is_dir() {
+        return Ok(());
+    }
+
+    let mut crate_dirs = fs::read_dir(&crates_dir)
+        .map_err(|error| format!("failed to read {}: {error}", crates_dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to iterate {}: {error}", crates_dir.display()))?;
+    crate_dirs.sort_by_key(fs::DirEntry::path);
+
+    for entry in crate_dirs {
+        let src_dir = entry.path().join("src");
+        if src_dir.is_dir() {
+            verify_sql_hygiene_dir(&src_dir)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_sql_hygiene_dir(dir: &Path) -> Result<(), String> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|error| format!("failed to read {}: {error}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to iterate {}: {error}", dir.display()))?;
+    entries.sort_by_key(fs::DirEntry::path);
+
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name() == Some(OsStr::new("tests")) {
+                continue;
+            }
+            verify_sql_hygiene_dir(&path)?;
+        } else if path.extension() == Some(OsStr::new("rs")) {
+            if path.file_name() == Some(OsStr::new("tests.rs")) {
+                continue;
+            }
+            verify_production_rs_sql_hygiene(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_production_rs_sql_hygiene(path: &Path) -> Result<(), String> {
+    let source = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    for (index, line) in source.lines().enumerate() {
+        if line.trim_start().starts_with("#[cfg(test)]") {
+            break;
+        }
+        if contains_dynamic_format_sql(line) {
+            return Err(format!(
+                "dynamic format! SQL is forbidden in production code at {}:{}",
+                path.display(),
+                index + 1
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn contains_dynamic_format_sql(line: &str) -> bool {
+    let prefix = "format!(\"";
+    let mut rest = line;
+    while let Some(pos) = rest.find(prefix) {
+        let after_prefix = &rest[pos + prefix.len()..];
+        let literal = extract_string_literal_prefix(after_prefix);
+        if DYNAMIC_SQL_PATTERNS
+            .iter()
+            .any(|pattern| literal.starts_with(pattern) || literal.contains(pattern))
+        {
+            return true;
+        }
+        rest = after_prefix;
+    }
+    false
+}
+
+fn extract_string_literal_prefix(after_quote: &str) -> &str {
+    let bytes = after_quote.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'"' {
+            return &after_quote[..index];
+        }
+        index += 1;
+    }
+    after_quote
 }
 
 fn cargo_metadata(root: &Path, policy: &ToolchainPolicy) -> Result<serde_json::Value, String> {
@@ -1212,5 +1334,52 @@ mod tests {
         let bench = serde_json::json!({"packages":[{"targets":[{"kind":["bench"]}]}]});
         assert!(!has_benchmark_target(&none));
         assert!(has_benchmark_target(&bench));
+    }
+
+    #[test]
+    fn sql_hygiene_rejects_production_format_sql_and_legacy_sql_dirs_while_allowing_static_sql_and_test_helpers()
+    -> Result<(), String> {
+        let temp = TempDir::new("sql-hygiene")?;
+        let crate_src = temp.path().join("crates/synthetic-crate/src");
+
+        write(
+            &crate_src.join("sql.rs"),
+            "pub(crate) const SELECT_ITEM_SQL: StaticSql = StaticSql::dml(\"SELECT id FROM items WHERE id = ?1\");\n",
+        )?;
+        write(
+            &crate_src.join("lib.rs"),
+            "mod sql;\n\npub fn run() -> &'static str {\n    sql::SELECT_ITEM_SQL.as_str()\n}\n\n#[cfg(test)]\nmod tests {\n    fn helper(table: &str) -> String {\n        format!(\"SELECT * FROM {table}\")\n    }\n}\n",
+        )?;
+        write(
+            &crate_src.join("tests.rs"),
+            "fn allowed_in_tests_file(table: &str) -> String {\n    format!(\"DELETE FROM {table}\")\n}\n",
+        )?;
+        write(
+            &crate_src.join("tests/mod.rs"),
+            "fn allowed_in_tests_dir(table: &str) -> String {\n    format!(\"UPDATE {table} SET a = 1\")\n}\n",
+        )?;
+        verify_sql_hygiene(temp.path())?;
+
+        write(
+            &crate_src.join("bad.rs"),
+            "pub fn bad(table: &str) -> String {\n    format!(\"SELECT * FROM {table}\")\n}\n",
+        )?;
+        let err = verify_sql_hygiene(temp.path())
+            .err()
+            .ok_or_else(|| "production format! SQL unexpectedly passed".to_owned())?;
+        assert!(err.contains("bad.rs:2"));
+
+        fs::remove_file(crate_src.join("bad.rs"))
+            .map_err(|error| format!("failed to remove bad.rs: {error}"))?;
+        verify_sql_hygiene(temp.path())?;
+
+        let legacy_sql_dir = temp.path().join("crates/heterarchy-orchestration-auth/sql");
+        fs::create_dir_all(&legacy_sql_dir)
+            .map_err(|error| format!("failed to create legacy sql dir: {error}"))?;
+        let dir_err = verify_sql_hygiene(temp.path())
+            .err()
+            .ok_or_else(|| "legacy sql directory unexpectedly passed".to_owned())?;
+        assert!(dir_err.contains("crates/heterarchy-orchestration-auth/sql"));
+        Ok(())
     }
 }

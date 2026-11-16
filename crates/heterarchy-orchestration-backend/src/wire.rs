@@ -37,13 +37,14 @@ pub use teams::{
 };
 pub mod agent_request_admission;
 pub mod agent_requests;
+pub mod autonomy_loop;
 pub mod forge_reads;
 pub mod profiles;
-pub mod provider_worker;
 pub mod provisioning_operations;
-pub mod provisioning_participation;
+pub mod swarm;
 pub mod work_credit;
 pub mod workspace_chat;
+pub use autonomy_loop::ExecutionPreferenceWire;
 pub use forge_reads::{
     DagCurrentQueryRequest, DagCurrentQueryResponse, DagCurrentWire, DagEdgeWire, DagLifecycleWire,
     DagNodeWire, DagStatusWire, DiscoveryDispositionWire, DiscoveryKindWire, DiscoveryReasonWire,
@@ -76,6 +77,7 @@ pub use leadership::{
     LeadershipWire, ReviewHistoryEntryWire, ReviewHistoryWire, WorkspaceQueryScope,
 };
 pub mod approval;
+pub mod broker_config;
 pub use approval::{
     ApprovalAdmissionWire, ApprovalAutoScopeWire, ApprovalDecideRequest, ApprovalDecideResponse,
     ApprovalListQueryRequest, ApprovalPermissionWire, ApprovalPolicyQueryRequest,
@@ -83,10 +85,14 @@ pub use approval::{
     ApprovalRequestGetResponse, ApprovalRequestWire, ApprovalSubmitRequest, ApprovalSubmitResponse,
     ListQueryResponse, PolicyQueryResponse, SetResponse,
 };
+pub use broker_config::{
+    BrokerClusterProbeWire, BrokerConfigResponse, BrokerConfigUpdateRequest, BrokerNodeAddressWire,
+    BrokerNodeConfigWire, BrokerNodeProbeWire,
+};
 
 pub use crate::profile_sessions::{ProfileSessionBindRequest, ProfileSessionBindResponse};
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// Profile creation intent; caller authority comes from the HTTP credential.
 pub struct AgentProfileCreateRequest {
@@ -96,6 +102,8 @@ pub struct AgentProfileCreateRequest {
     pub preferred_model: Option<String>,
     pub preferred_reasoning: Option<String>,
     pub base_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_preference: Option<ExecutionPreferenceWire>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -116,6 +124,8 @@ pub struct AgentProfileResponse {
     pub updated_at_ms: i64,
     pub last_used_at_ms: Option<i64>,
     pub revision: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_preference: Option<ExecutionPreferenceWire>,
 }
 
 impl From<AgentProfileSummary> for AgentProfileResponse {
@@ -135,6 +145,10 @@ impl From<AgentProfileSummary> for AgentProfileResponse {
             updated_at_ms: value.updated_at_ms,
             last_used_at_ms: value.last_used_at_ms,
             revision: value.revision,
+            execution_preference: value
+                .execution_preference
+                .as_ref()
+                .map(ExecutionPreferenceWire::from_summary),
         }
     }
 }

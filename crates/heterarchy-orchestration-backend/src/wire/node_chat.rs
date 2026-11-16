@@ -30,8 +30,7 @@ pub struct ChatQueryWire {
     pub before_sequence: Option<u64>,
 }
 
-/// Exact caller-owned Chat intent. The query and target fence are frozen for
-/// both send and recovery so recovery never substitutes current provider state.
+/// Exact historical Chat intent used for read-only recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeChatSendRequest {
@@ -52,7 +51,7 @@ pub struct ChatMessageRequest {
     pub target_fence: ChatTargetFenceWire,
 }
 
-/// Native Workbench Chat destination observation, retained as a send fence.
+/// Historical Native Workbench Chat destination observation retained in an intent.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChatTargetFenceWire {
@@ -106,9 +105,6 @@ pub struct ChatSnapshotWire {
     pub workspace_id: Uuid,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub agent_profile_id: Option<Uuid>,
-    pub targets: Vec<ChatTargetFenceWire>,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub target: Option<ChatTargetFenceWire>,
     pub messages: Vec<ChatEntryWire>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub node_scope: Option<NodeTeamScopeWire>,
@@ -166,7 +162,7 @@ pub enum ChatDeliveryWire {
     Failed,
 }
 
-/// Closed Provider outbox state returned by native Chat read/send/recovery.
+/// Closed Provider state stored with native Chat history or recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatProviderStateWire {
@@ -175,14 +171,6 @@ pub enum ChatProviderStateWire {
     Delivered,
     Failed,
     Unknown,
-}
-
-/// Exact send-intent echo and resulting durable receipt.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct NodeChatSendResponse {
-    pub request: NodeChatSendRequest,
-    pub receipt: ChatReceiptWire,
 }
 
 /// Read-only recovery result for the original full send intent.
@@ -194,7 +182,7 @@ pub struct NodeChatRecoverResponse {
     pub receipt: Option<ChatReceiptWire>,
 }
 
-/// Durable message identity and current Provider state.
+/// Durable message identity and stored Provider state.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChatReceiptWire {
@@ -298,17 +286,16 @@ mod tests {
     }
 
     fn snapshot() -> ChatSnapshotWire {
-        let fence = target_fence();
         ChatSnapshotWire {
             workspace_id: Uuid::from_u128(7),
             agent_profile_id: None,
-            targets: vec![fence.clone()],
-            target: Some(fence),
             messages: vec![entry()],
             node_scope: Some(node_scope()),
             before_sequence: None,
             next_before_sequence: None,
-            unavailable_reason: None,
+            unavailable_reason: Some(
+                "Provider-backed chat is retired; stored history remains available.".to_owned(),
+            ),
         }
     }
 
@@ -391,9 +378,10 @@ mod tests {
         }
 
         let snapshot_value = serde_json::to_value(snapshot())?;
+        assert!(snapshot_value.get("target").is_none());
+        assert!(snapshot_value.get("targets").is_none());
         for field in [
             "agentProfileId",
-            "target",
             "nodeScope",
             "beforeSequence",
             "nextBeforeSequence",

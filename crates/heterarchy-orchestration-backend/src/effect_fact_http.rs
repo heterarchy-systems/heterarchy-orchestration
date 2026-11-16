@@ -9,13 +9,17 @@ use forge_backend::ops::effect_facts::wire::{
 use forge_domain::{
     ActivityId, AgentAssignmentId, AgentInstanceId, AgentSessionId, ChangeSetId, ChangeSetState,
     DagNodeId, DiffEvidenceState, DiffId, ExecutionId, ExecutionState, FileMutationFailureCode,
-    GoalEvidenceRef, GoalId, RuntimeInstanceId, WorkCreditBudget, WorkspaceId,
+    GoalEvidenceRef, GoalId, RuntimeInstanceId, SwarmRunId, WorkCreditBudget, WorkspaceId,
 };
 use heterarchy_orchestration_operations::AssignmentSubmittedSourceRef;
 use heterarchy_orchestration_operations::{
     AssignmentOfferedFact, AssignmentReviewedFact, AssignmentSubmittedFact, ChangeSetTerminalFact,
-    EffectFactConsumerProgress, EffectFactInput, ExecutionTerminalFact, OperationsCatalog,
-    OperationsError,
+    DagSettledFact, EffectFactConsumerProgress, EffectFactInput, ExecutionTerminalFact,
+    OperationsCatalog, OperationsError,
+};
+use heterarchy_orchestration_runtime::{
+    AutonomyOutboxApplyReport, AutonomyOutboxBridge, AutonomySettlementOutboxFact,
+    SwarmDispatchError, SwarmSettledFact,
 };
 use uuid::Uuid;
 
@@ -45,6 +49,45 @@ pub fn apply_runtime_page(
     with_inputs(page, |migration, inputs| {
         runtime.apply_coordination_effect_inputs(migration, inputs)
     })
+}
+
+/// Apply wire observations (including `SWARM_SETTLED_KIND = 6`) through [`AutonomyOutboxBridge`].
+///
+/// # Errors
+/// Rejects invalid bounds, mismatched workspace identities, or bridge fence/persistence failures.
+pub fn apply_autonomy_outbox_page(
+    bridge: &AutonomyOutboxBridge,
+    page: &EffectFactOutboxResponse,
+) -> Result<AutonomyOutboxApplyReport, Box<SwarmDispatchError>> {
+    if page.entries.len() > MAX_PAGE_SIZE {
+        return Err(Box::new(OperationsError::Bounds("effect fact page").into()));
+    }
+    let owned_source_refs = page
+        .entries
+        .iter()
+        .map(owned_source_refs)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| Box::new(err.into()))?;
+    let facts = page
+        .entries
+        .iter()
+        .zip(owned_source_refs.iter())
+        .map(|(entry, source_refs)| autonomy_fact_from_entry(entry, source_refs.as_deref()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| Box::new(err.into()))?;
+    bridge
+        .apply_outbox_facts(page.migration_id, &facts)
+        .map_err(Box::new)
+}
+
+fn autonomy_fact_from_entry<'a>(
+    entry: &'a EffectFactOutboxEntryWire,
+    submitted_source_refs: Option<&'a [AssignmentSubmittedSourceRef]>,
+) -> Result<AutonomySettlementOutboxFact<'a>, OperationsError> {
+    if matches!(&entry.fact, EffectFactWire::SwarmSettled { .. }) {
+        return swarm_settled_fact_input(entry).map(AutonomySettlementOutboxFact::SwarmSettled);
+    }
+    input_from_entry(entry, submitted_source_refs).map(AutonomySettlementOutboxFact::CoreEffect)
 }
 
 fn with_inputs<F, E>(
@@ -84,6 +127,10 @@ fn input_from_entry<'a>(
         EffectFactWire::AssignmentSubmitted { .. } => {
             submitted_fact_input(entry, submitted_source_refs)
         }
+        EffectFactWire::DagSettled { .. } => dag_settled_fact_input(entry),
+        EffectFactWire::SwarmSettled { .. } => Err(OperationsError::Conflict(
+            "swarm settled outbox fact is unsupported in core effect fact input",
+        )),
     }
 }
 
@@ -320,6 +367,86 @@ fn submitted_fact_input<'a>(
             submitted_at_ms: *submitted_at_ms,
         },
     ))
+}
+
+fn dag_settled_fact_input(
+    entry: &EffectFactOutboxEntryWire,
+) -> Result<EffectFactInput<'_>, OperationsError> {
+    let EffectFactWire::DagSettled {
+        settlement_id,
+        workspace_id: payload_workspace_id,
+        activity_id,
+        goal_id,
+        goal_revision,
+        dag_revision,
+        settled_file_count,
+        settled_tree_digest,
+        coordinator_agent_id,
+        coordinator_session_id,
+        settled_at_ms,
+    } = &entry.fact
+    else {
+        return Err(OperationsError::Conflict("effect fact kind"));
+    };
+    if *payload_workspace_id != entry.workspace_id {
+        return Err(OperationsError::Conflict("effect fact workspace"));
+    }
+    let (sequence, migration_id, destination_id, workspace_id) = shared_fact_headers(entry);
+    Ok(EffectFactInput::DagSettled(DagSettledFact {
+        sequence,
+        migration_id,
+        destination_id,
+        settlement_id: *settlement_id,
+        workspace_id,
+        activity_id: ActivityId::from_uuid(*activity_id),
+        goal_id: GoalId::from_uuid(*goal_id),
+        goal_revision: *goal_revision,
+        dag_revision: *dag_revision,
+        settled_file_count: *settled_file_count,
+        settled_tree_digest: decode_digest(settled_tree_digest)?,
+        coordinator_agent_id: AgentInstanceId::from_uuid(*coordinator_agent_id),
+        coordinator_session_id: coordinator_session_id.map(AgentSessionId::from_uuid),
+        settled_at_ms: *settled_at_ms,
+    }))
+}
+
+fn swarm_settled_fact_input(
+    entry: &EffectFactOutboxEntryWire,
+) -> Result<SwarmSettledFact, OperationsError> {
+    let EffectFactWire::SwarmSettled {
+        settlement_id,
+        workspace_id: payload_workspace_id,
+        activity_id,
+        swarm_run_id,
+        settled_file_count,
+        settled_tree_digest,
+        converged_diff_digest,
+        coordinator_agent_id,
+        coordinator_session_id,
+        settled_at_ms,
+    } = &entry.fact
+    else {
+        return Err(OperationsError::Conflict("effect fact kind"));
+    };
+    if *payload_workspace_id != entry.workspace_id {
+        return Err(OperationsError::Conflict("effect fact workspace"));
+    }
+    let (sequence, migration_id, destination_id, workspace_id) = shared_fact_headers(entry);
+    Ok(SwarmSettledFact {
+        sequence,
+        migration_id,
+        destination_id,
+        settlement_id: *settlement_id,
+        workspace_id,
+        activity_id: activity_id.map(ActivityId::from_uuid),
+        swarm_run_id: SwarmRunId::from_uuid(*swarm_run_id),
+        settled_file_count: *settled_file_count,
+        settled_tree_digest: decode_digest(settled_tree_digest)?,
+        converged_diff_digest: decode_digest(converged_diff_digest)?,
+        coordinator_agent_id: AgentInstanceId::from_uuid(*coordinator_agent_id),
+        coordinator_session_id: coordinator_session_id.map(AgentSessionId::from_uuid),
+        settled_at_ms: *settled_at_ms,
+    })
 }
 
 fn owned_source_refs(

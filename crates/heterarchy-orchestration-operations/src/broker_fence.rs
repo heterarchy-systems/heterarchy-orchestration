@@ -25,7 +25,8 @@ use std::time::Duration;
 
 use agent_broker_application::BrokerErrorCode;
 use agent_broker_client::{
-    AsyncStaticClusterRouter, ClientError, StaticClusterNode, StaticClusterRoutingError,
+    AsyncBrokerClient, AsyncStaticClusterRouter, ClientError, StaticClusterNode,
+    StaticClusterRoutingError,
 };
 use agent_broker_domain::{AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision};
 use agent_broker_protocol::RequestId;
@@ -84,21 +85,36 @@ pub enum LeadershipFenceError {
     Unconfirmed,
 }
 
-/// Production fence executor over the native async fixed-three-node Broker
-/// router. No catalog lock is held across its network work.
+enum BrokerFenceTransport {
+    SingleNode(AsyncBrokerClient),
+    Cluster(AsyncStaticClusterRouter),
+}
+
+/// Production fence executor over either a single Broker node or the native
+/// async fixed-three-node Broker router. No catalog lock is held across its
+/// network work.
 pub struct BrokerAuthorityFence {
-    router: AsyncStaticClusterRouter,
+    transport: BrokerFenceTransport,
 }
 
 impl BrokerAuthorityFence {
-    /// Compose the production fixed-three-node fence executor.
+    /// Compose the production fence executor for either a single Broker node
+    /// or a fixed-three-node cluster.
     ///
     /// # Errors
     /// Rejects invalid cluster topology, endpoint, timeout, or frame bounds.
     pub fn new(config: impl Into<BrokerClusterConfig>) -> Result<Self, OperationsError> {
-        let router = AsyncStaticClusterRouter::new(config.into().router_config())
-            .map_err(|_| OperationsError::Conflict("leadership fence cluster"))?;
-        Ok(Self { router })
+        let cluster = config.into();
+        let transport = if cluster.is_single_node() {
+            let client = AsyncBrokerClient::new(cluster.client_config())
+                .map_err(|_| OperationsError::Conflict("leadership fence cluster"))?;
+            BrokerFenceTransport::SingleNode(client)
+        } else {
+            let router = AsyncStaticClusterRouter::new(cluster.router_config())
+                .map_err(|_| OperationsError::Conflict("leadership fence cluster"))?;
+            BrokerFenceTransport::Cluster(router)
+        };
+        Ok(Self { transport })
     }
 
     /// Perform one `authority.record` fence for the exact prepared request.
@@ -126,17 +142,28 @@ impl BrokerAuthorityFence {
         let owner_instance_id = AuthorityOwnerId::new(request.owner_instance_id().to_owned())
             .map_err(|_| LeadershipFenceError::Unconfirmed)?;
 
-        let recorded = self
-            .router
-            .authority_record_with_request_id(
-                request_id,
-                key,
-                revision,
-                authority_id,
-                owner_instance_id,
-            )
-            .await
-            .map_err(|error| classify_routing_error(error, request))?;
+        let recorded = match &self.transport {
+            BrokerFenceTransport::SingleNode(client) => client
+                .authority_record_with_request_id(
+                    request_id,
+                    key,
+                    revision,
+                    authority_id,
+                    owner_instance_id,
+                )
+                .await
+                .map_err(|error| classify_client_error(error, request))?,
+            BrokerFenceTransport::Cluster(router) => router
+                .authority_record_with_request_id(
+                    request_id,
+                    key,
+                    revision,
+                    authority_id,
+                    owner_instance_id,
+                )
+                .await
+                .map_err(|error| classify_routing_error(error, request))?,
+        };
         let recorded_revision =
             i64::try_from(recorded.get()).map_err(|_| LeadershipFenceError::Unconfirmed)?;
         Ok(LeadershipFenceOutcome::from_request(

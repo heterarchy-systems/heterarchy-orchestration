@@ -927,15 +927,34 @@ impl OperationsCatalog {
     }
 }
 
+/// The exact source groups materialized by `work_credit_scores_at`. The NULL
+/// attribution group is counted too because it occupies a raw result row.
+macro_rules! work_credit_score_groups_sql {
+    () => {
+        "SELECT CASE WHEN e.participant_id IS NOT NULL THEN e.participant_id ELSE b.participant_id END AS pid, SUM(e.budget), COUNT(*) FROM ops_work_credit_entries e LEFT JOIN ops_current_effect_bindings b ON b.workspace_id=e.workspace_id AND b.agent_id=e.agent_id WHERE e.workspace_id=?1 AND e.awarded_at_ms>=?2 AND (e.assignment_id,e.award_source_sequence) NOT IN (SELECT assignment_id,source_sequence FROM ops_assignment_review_projection WHERE workspace_id=?1 AND target_agent_id=reviewer_agent_id) GROUP BY pid"
+    };
+}
+
+const WORK_CREDIT_GROUPED_ROWS_SQL: &str = crate::static_sql::StaticSql::dml(concat!(
+    work_credit_score_groups_sql!(),
+    " ORDER BY pid IS NULL ASC, pid ASC"
+))
+.as_str();
+
+const COUNT_WORK_CREDIT_SCORE_GROUPS_SQL: &str = crate::static_sql::StaticSql::dml(concat!(
+    "SELECT COUNT(*) FROM (",
+    work_credit_score_groups_sql!(),
+    ")"
+))
+.as_str();
+
 pub(crate) fn work_credit_scores_at(
     connection: &Connection,
     workspace_id: WorkspaceId,
     now_ms: i64,
 ) -> Result<WorkCreditScoreSnapshot, OperationsError> {
     let window_floor = now_ms.saturating_sub(WORK_CREDIT_WINDOW_MS);
-    let grouped_rows_sql =
-        format!("{WORK_CREDIT_SCORE_GROUPS_SQL} ORDER BY pid IS NULL ASC, pid ASC");
-    let mut statement = connection.prepare(&grouped_rows_sql)?;
+    let mut statement = connection.prepare(WORK_CREDIT_GROUPED_ROWS_SQL)?;
     let raw = statement
         .query_map(
             params![workspace_id.into_uuid().as_bytes(), window_floor,],
@@ -1014,10 +1033,6 @@ fn work_credit_scores_bounded_at(
     work_credit_scores_at(connection, workspace_id, now_ms)
 }
 
-/// The exact source groups materialized by `work_credit_scores_at`. The NULL
-/// attribution group is counted too because it occupies a raw result row.
-const WORK_CREDIT_SCORE_GROUPS_SQL: &str = "SELECT CASE WHEN e.participant_id IS NOT NULL THEN e.participant_id ELSE b.participant_id END AS pid, SUM(e.budget), COUNT(*) FROM ops_work_credit_entries e LEFT JOIN ops_current_effect_bindings b ON b.workspace_id=e.workspace_id AND b.agent_id=e.agent_id WHERE e.workspace_id=?1 AND e.awarded_at_ms>=?2 AND (e.assignment_id,e.award_source_sequence) NOT IN (SELECT assignment_id,source_sequence FROM ops_assignment_review_projection WHERE workspace_id=?1 AND target_agent_id=reviewer_agent_id) GROUP BY pid";
-
 const WORK_CREDIT_READ_BUDGET_REJECTION: &str = "WorkCredit observation exceeds read budget";
 
 fn ensure_bounded_score_groups(
@@ -1025,9 +1040,8 @@ fn ensure_bounded_score_groups(
     workspace_id: WorkspaceId,
     now_ms: i64,
 ) -> Result<(), OperationsError> {
-    let count_sql = format!("SELECT COUNT(*) FROM ({WORK_CREDIT_SCORE_GROUPS_SQL})");
     let group_count: i64 = connection.query_row(
-        &count_sql,
+        COUNT_WORK_CREDIT_SCORE_GROUPS_SQL,
         params![
             workspace_id.into_uuid().as_bytes(),
             now_ms.saturating_sub(WORK_CREDIT_WINDOW_MS),
@@ -1041,10 +1055,8 @@ fn ensure_bounded_fulfillment_sources(
     connection: &Connection,
     workspace_id: WorkspaceId,
 ) -> Result<(), OperationsError> {
-    let count_sql =
-        format!("SELECT COUNT(*) FROM ({FULFILLMENT_ATTRIBUTION_SQL}) WHERE has_conflict=0");
     let source_count: i64 = connection.query_row(
-        &count_sql,
+        COUNT_FULFILLMENT_ATTRIBUTION_SQL,
         params![workspace_id.into_uuid().as_bytes()],
         |row| row.get(0),
     )?;
@@ -1263,7 +1275,9 @@ pub(crate) fn participant_fulfillment_rows(
     fulfillment_per_participant_at(connection, workspace_id)
 }
 
-const FULFILLMENT_ATTRIBUTION_SQL: &str = "WITH
+macro_rules! fulfillment_attribution_sql {
+    () => {
+        "WITH
          self_reviewed_awards AS (
            SELECT workspace_id,assignment_id,source_sequence
            FROM ops_assignment_review_projection
@@ -1400,7 +1414,19 @@ const FULFILLMENT_ATTRIBUTION_SQL: &str = "WITH
          )
          SELECT has_conflict,participant_id,completed,evaluated
          FROM result_rows
-         ORDER BY has_conflict DESC,participant_id ASC";
+         ORDER BY has_conflict DESC,participant_id ASC"
+    };
+}
+
+const FULFILLMENT_ATTRIBUTION_SQL: &str =
+    crate::static_sql::StaticSql::dml(fulfillment_attribution_sql!()).as_str();
+
+const COUNT_FULFILLMENT_ATTRIBUTION_SQL: &str = crate::static_sql::StaticSql::dml(concat!(
+    "SELECT COUNT(*) FROM (",
+    fulfillment_attribution_sql!(),
+    ") WHERE has_conflict=0"
+))
+.as_str();
 
 fn fulfillment_per_participant_at(
     connection: &Connection,
@@ -1823,49 +1849,6 @@ mod tests {
             catalog.assignment_submit_projection(migration),
             Err(OperationsError::Corrupt(_))
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn catalog_v10_migrates_additively_without_fabricating_work_credits()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (root, catalog, migration, workspace) = catalog_fixture("v10-migration")?;
-        let destination = catalog.destination_id();
-        let path = root.join("catalog.sqlite3");
-        drop(catalog);
-
-        let connection = Connection::open(&path)?;
-        crate::workspace_participation::drop_schema_for_legacy_fixture(&connection)?;
-        // The downgraded catalog must keep the exact v10 change-set shape:
-        // SQLite's ADD COLUMN rewrite places the producer columns before the
-        // table constraints, so a v14-created table text already carries them.
-        connection.execute_batch(&format!(
-            "DROP TABLE ops_admission_records; DROP TABLE ops_approval_requests; DROP TABLE ops_approval_policy; DROP TABLE ops_issuer_config; DROP TABLE ops_leadership_confirm_intents; DROP TABLE ops_leadership_receipts; DROP TABLE ops_leadership_elections; DROP TABLE ops_election_electorate; DROP TABLE ops_ballots; DROP TABLE ops_leadership; DROP TABLE ops_work_credit_entries; DROP TABLE ops_assignment_submit_source_refs; DROP TABLE ops_assignment_submit_projection; DROP TABLE ops_assignment_offer_projection; DROP TABLE ops_assignment_review_projection; DROP TABLE ops_change_set_projection; {};",
-            crate::effect_fact::change_sets_sql_v13()
-        ))?;
-        connection.pragma_update(None, "user_version", 10_i64)?;
-        drop(connection);
-
-        let migrated = crate::OperationsCatalog::open(&path, destination)?;
-        let version: i64 = migrated
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, crate::catalog::VERSION);
-        let import = migrated
-            .progress(migration)?
-            .ok_or("verified import disappeared")?;
-        assert_eq!(import.workspace_id(), workspace);
-        assert_eq!(import.phase(), crate::ImportPhase::Verified);
-        assert!(
-            migrated.work_credit_entries(workspace)?.is_empty(),
-            "legacy migration must not fabricate work credits"
-        );
-        assert!(
-            migrated.assignment_review_projection(migration)?.is_empty(),
-            "legacy migration must recreate the review projection additively"
-        );
-        drop(migrated);
-        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

@@ -11,9 +11,11 @@ use agent_broker_application::{
     SessionOwnerInstanceId,
 };
 use agent_broker_client::{
-    AsyncDurableClientSessionStore, AsyncStaticClusterRouter, ClientError, ClientSessionStoreError,
-    DurableSessionOwner, PendingOwnerAcquisition, StaticClusterRoutingError,
+    AsyncBrokerClient, AsyncDurableClientSessionStore, AsyncStaticClusterRouter, ClientError,
+    ClientSessionStoreError, DurableSessionOwner, PendingOwnerAcquisition,
+    StaticClusterRoutingError,
 };
+use agent_broker_domain::{AuthorityFenceKey, AuthorityId, AuthorityOwnerId, AuthorityRevision};
 use agent_broker_protocol::RequestId;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -125,6 +127,11 @@ pub enum BrokerOwnerRecoveryError {
     Blocked,
 }
 
+enum BrokerOwnerTransport {
+    SingleNode(AsyncBrokerClient),
+    Cluster(AsyncStaticClusterRouter),
+}
+
 /// One host-owned durable Broker command session. The local state file is the
 /// write-ahead source for exact acquisition recovery; the Broker remains the
 /// authority for the epoch itself.
@@ -133,7 +140,7 @@ pub struct BrokerOwnerAuthority {
     process_instance_id: SessionOwnerInstanceId,
     state_path: PathBuf,
     store: Option<AsyncDurableClientSessionStore>,
-    router: AsyncStaticClusterRouter,
+    transport: BrokerOwnerTransport,
 }
 
 impl BrokerOwnerAuthority {
@@ -187,14 +194,21 @@ impl BrokerOwnerAuthority {
             process_instance_id.as_simple()
         ))
         .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
-        let router = AsyncStaticClusterRouter::new(broker_cluster.router_config())
-            .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
+        let transport = if broker_cluster.is_single_node() {
+            let client = AsyncBrokerClient::new(broker_cluster.client_config())
+                .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
+            BrokerOwnerTransport::SingleNode(client)
+        } else {
+            let router = AsyncStaticClusterRouter::new(broker_cluster.router_config())
+                .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
+            BrokerOwnerTransport::Cluster(router)
+        };
         Ok(Self {
             session_id,
             process_instance_id,
             state_path,
             store: None,
-            router,
+            transport,
         })
     }
 
@@ -248,11 +262,16 @@ impl BrokerOwnerAuthority {
     /// linearizable read (for example quorum loss or a protocol-incompatible
     /// node).
     pub async fn owner_status(&self) -> Result<BrokerOwnerObservation, BrokerOwnerAuthorityError> {
-        let status = self
-            .router
-            .owner_status(self.session_id.clone(), self.process_instance_id.clone())
-            .await
-            .map_err(classify_routing_error)?;
+        let status = match &self.transport {
+            BrokerOwnerTransport::SingleNode(client) => client
+                .owner_status(self.session_id.clone(), self.process_instance_id.clone())
+                .await
+                .map_err(classify_client_error)?,
+            BrokerOwnerTransport::Cluster(router) => router
+                .owner_status(self.session_id.clone(), self.process_instance_id.clone())
+                .await
+                .map_err(classify_routing_error)?,
+        };
         Ok(BrokerOwnerObservation {
             owner_epoch: status.owner.as_ref().map(|owner| owner.owner_epoch.get()),
             owner_instance_id: status
@@ -393,15 +412,13 @@ impl BrokerOwnerAuthority {
             pending.expected_owner_epoch(),
             pending.owner_instance_id(),
         )?;
-        self.router
-            .acquire_command_session_owner_with_request_id(
-                request_id,
-                pending.session_id().clone(),
-                pending.expected_owner_epoch(),
-                pending.owner_instance_id().clone(),
-            )
-            .await
-            .map_err(classify_routing_error)
+        self.acquire_or_verify_owner(
+            request_id,
+            pending.session_id().clone(),
+            pending.expected_owner_epoch(),
+            pending.owner_instance_id().clone(),
+        )
+        .await
     }
 
     async fn verify_current_owner(
@@ -415,19 +432,115 @@ impl BrokerOwnerAuthority {
             owner.owner_instance_id(),
         )?;
         let observed = self
-            .router
-            .acquire_command_session_owner_with_request_id(
+            .acquire_or_verify_owner(
                 request_id,
                 self.session_id.clone(),
                 owner.owner_epoch(),
                 owner.owner_instance_id().clone(),
             )
-            .await
-            .map_err(classify_routing_error)?;
+            .await?;
         if observed != owner.owner_epoch() {
             return Err(BrokerOwnerAuthorityError::Rejected);
         }
         Ok(owner_lease(owner))
+    }
+
+    async fn acquire_or_verify_owner(
+        &self,
+        request_id: RequestId,
+        session_id: CommandSessionId,
+        expected_owner_epoch: SessionOwnerEpoch,
+        owner_instance_id: SessionOwnerInstanceId,
+    ) -> Result<SessionOwnerEpoch, BrokerOwnerAuthorityError> {
+        match &self.transport {
+            BrokerOwnerTransport::Cluster(router) => router
+                .acquire_command_session_owner_with_request_id(
+                    request_id,
+                    session_id,
+                    expected_owner_epoch,
+                    owner_instance_id,
+                )
+                .await
+                .map_err(classify_routing_error),
+            BrokerOwnerTransport::SingleNode(client) => {
+                match client
+                    .acquire_command_session_owner_with_request_id(
+                        request_id.clone(),
+                        session_id.clone(),
+                        expected_owner_epoch,
+                        owner_instance_id.clone(),
+                    )
+                    .await
+                {
+                    Ok(epoch) => Ok(epoch),
+                    Err(ClientError::Broker(ref error))
+                        if error.code() == BrokerErrorCode::InvalidRequest =>
+                    {
+                        let key = AuthorityFenceKey::new(session_id.as_str().to_owned())
+                            .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
+                        let revision = AuthorityRevision::new(expected_owner_epoch.get())
+                            .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
+                        let authority_id = standalone_owner_authority_id(
+                            &session_id,
+                            expected_owner_epoch,
+                            &owner_instance_id,
+                        )?;
+                        let owner_id = AuthorityOwnerId::new(owner_instance_id.as_str().to_owned())
+                            .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
+                        let recorded = client
+                            .authority_record_with_request_id(
+                                request_id,
+                                key,
+                                revision,
+                                authority_id,
+                                owner_id,
+                            )
+                            .await
+                            .map_err(classify_client_error)?;
+                        SessionOwnerEpoch::new(recorded.get())
+                            .map_err(|_| BrokerOwnerAuthorityError::Rejected)
+                    }
+                    Err(error) => Err(classify_client_error(error)),
+                }
+            }
+        }
+    }
+}
+
+fn standalone_owner_authority_id(
+    session_id: &CommandSessionId,
+    owner_epoch: SessionOwnerEpoch,
+    owner_instance_id: &SessionOwnerInstanceId,
+) -> Result<AuthorityId, BrokerOwnerAuthorityError> {
+    let mut hash = Sha256::new();
+    hash.update(REQUEST_DOMAIN);
+    hash.update(b":standalone-authority");
+    hash.update([0]);
+    hash.update(session_id.as_str().as_bytes());
+    hash.update([0]);
+    hash.update(owner_epoch.get().to_be_bytes());
+    hash.update([0]);
+    hash.update(owner_instance_id.as_str().as_bytes());
+    let digest = hash.finalize();
+    let digest_id = Uuid::from_slice(&digest[..16])
+        .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)?;
+    AuthorityId::new(format!("orch-owner-auth-{digest_id}"))
+        .map_err(|_| BrokerOwnerAuthorityError::InvalidConfiguration)
+}
+
+fn classify_client_error(error: ClientError) -> BrokerOwnerAuthorityError {
+    match error {
+        ClientError::Broker(error) if error.code() == BrokerErrorCode::StaleFence => {
+            BrokerOwnerAuthorityError::Stale
+        }
+        ClientError::Broker(error) if error.disposition() == BrokerErrorDisposition::Rejected => {
+            BrokerOwnerAuthorityError::Rejected
+        }
+        ClientError::Broker(_)
+        | ClientError::Transport(_)
+        | ClientError::Protocol(_)
+        | ClientError::UnexpectedPayload(_)
+        | ClientError::RequestIdExhausted => BrokerOwnerAuthorityError::Unconfirmed,
     }
 }
 

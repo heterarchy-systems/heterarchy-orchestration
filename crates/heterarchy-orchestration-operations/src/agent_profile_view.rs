@@ -402,8 +402,8 @@ mod tests {
     use super::*;
     use forge_domain::{AgentSessionOpenRequestId, AuthenticatedPrincipal, OpenAgentSession};
     use heterarchy_orchestration_sessions::{
-        AgentProfileCreationOrigin, AgentProfileProviderFamily, AgentSessionCatalog,
-        CreateAgentProfile, link_existing_logical_session,
+        AgentProfileCreationOrigin, AgentSessionCatalog, CreateAgentProfile,
+        link_existing_logical_session,
     };
     use rusqlite::params;
     use std::error::Error;
@@ -443,7 +443,6 @@ mod tests {
             Uuid::from_u128(0xC003),
             "luna-rust-01".to_owned(),
             "Luna Rust 01".to_owned(),
-            AgentProfileProviderFamily::ChatGpt,
             Some("gpt-5.6-luna".to_owned()),
             Some("max".to_owned()),
             vec!["backend".to_owned(), "rust".to_owned()],

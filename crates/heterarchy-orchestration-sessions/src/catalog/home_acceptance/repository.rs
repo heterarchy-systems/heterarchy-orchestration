@@ -16,6 +16,14 @@ use super::{
     HomeAcceptanceSessionAcquireOutcome, HomeAcceptanceSessionError as Error,
     HomeAcceptanceSessionPendingPage, schema,
 };
+use crate::catalog::sql::{
+    HOME_ACCEPTANCE_ACTIVE_ID_FOR_SESSION_SQL as ACTIVE_ID_FOR_SESSION_SQL,
+    HOME_ACCEPTANCE_INSERT_HELD_SQL as INSERT_HELD_SQL,
+    HOME_ACCEPTANCE_INSERT_RESOLVED_ABSENT_SQL as INSERT_RESOLVED_ABSENT_SQL,
+    HOME_ACCEPTANCE_LOAD_PIN_ROW_SQL as LOAD_PIN_ROW_SQL,
+    HOME_ACCEPTANCE_PENDING_IDS_SQL as PENDING_IDS_SQL,
+    HOME_ACCEPTANCE_UPDATE_RESOLUTION_SQL as UPDATE_RESOLUTION_SQL,
+};
 use crate::catalog::{
     self, AgentSessionCatalog, AgentSessionCatalogError, decode_principal, decode_session_id,
     encode_principal,
@@ -26,7 +34,6 @@ mod tests;
 
 const DIGEST_BYTES: usize = 32;
 const REQUEST_SNAPSHOT_MAX_BYTES: usize = 320;
-const SESSION_SCHEMA_VERSION_V1: i64 = 1;
 
 #[derive(Debug)]
 struct RawPin {
@@ -61,12 +68,6 @@ struct RawPin {
     operations_admission_digest_length: Option<i64>,
     operations_held_at_ms: Option<i64>,
     resolved_at_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum CatalogVersion {
-    LegacyV1,
-    CurrentV2,
 }
 
 pub(super) fn acquire<C>(
@@ -262,11 +263,8 @@ pub(super) fn get(
         return Err(Error::InvalidIntent("acceptance selector"));
     }
     let transaction = owner.connection.unchecked_transaction()?;
-    let version = validate_owner(&transaction)?;
-    let record = match version {
-        CatalogVersion::LegacyV1 => None,
-        CatalogVersion::CurrentV2 => load_record(&transaction, acceptance_id)?,
-    };
+    validate_current(&transaction)?;
+    let record = load_record(&transaction, acceptance_id)?;
     if let Some(record) = record {
         if record.intent().issuer() != configured_issuer {
             return Err(Error::Conflict);
@@ -299,18 +297,8 @@ pub(super) fn pending(
         return Err(Error::InvalidIntent("pending page cursor"));
     }
     let transaction = owner.connection.unchecked_transaction()?;
-    if matches!(validate_owner(&transaction)?, CatalogVersion::LegacyV1) {
-        transaction.commit()?;
-        return Ok(HomeAcceptanceSessionPendingPage {
-            records: Vec::new(),
-            next_after: None,
-        });
-    }
-    let mut statement = transaction.prepare(
-        "SELECT acceptance_id FROM home_acceptance_session_pins
-         WHERE issuer_id=?1 AND state=0 AND (?2 IS NULL OR acceptance_id>?2)
-         ORDER BY acceptance_id LIMIT ?3",
-    )?;
+    validate_current(&transaction)?;
+    let mut statement = transaction.prepare(PENDING_IDS_SQL)?;
     let ids = statement
         .query_map(
             params![
@@ -355,9 +343,7 @@ pub(super) fn ensure_unpinned(
         .map_err(|error| AgentSessionCatalogError::HomeAcceptance(Box::new(error)))?;
     let active_id: Option<Vec<u8>> = transaction
         .query_row(
-            "SELECT substr(acceptance_id,1,17)
-             FROM home_acceptance_session_pins
-             WHERE session_id=?1 AND state=0 ORDER BY acceptance_id LIMIT 1",
+            ACTIVE_ID_FOR_SESSION_SQL,
             params![session_id.into_uuid().as_bytes()],
             |row| row.get(0),
         )
@@ -369,26 +355,11 @@ pub(super) fn ensure_unpinned(
 }
 
 fn validate_current(connection: &Connection) -> Result<(), Error> {
-    match validate_owner(connection)? {
-        CatalogVersion::CurrentV2 => Ok(()),
-        CatalogVersion::LegacyV1 => Err(Error::Catalog(Box::new(
-            AgentSessionCatalogError::Ownership {
-                application_id: super::super::AGENT_SESSION_APPLICATION_ID,
-                user_version: SESSION_SCHEMA_VERSION_V1,
-                object_count: 2,
-            },
-        ))),
-    }
-}
-
-fn require_current(connection: &Connection) -> Result<(), Error> {
-    validate_current(connection)
-}
-
-fn validate_owner(connection: &Connection) -> Result<CatalogVersion, Error> {
     let (application_id, user_version, object_count) =
         catalog::catalog_ownership(connection).map_err(catalog_error)?;
-    if application_id != super::super::AGENT_SESSION_APPLICATION_ID {
+    if application_id != super::super::AGENT_SESSION_APPLICATION_ID
+        || user_version != super::super::AGENT_SESSION_SCHEMA_VERSION
+    {
         return Err(Error::Catalog(Box::new(
             AgentSessionCatalogError::Ownership {
                 application_id,
@@ -397,23 +368,11 @@ fn validate_owner(connection: &Connection) -> Result<CatalogVersion, Error> {
             },
         )));
     }
-    match user_version {
-        SESSION_SCHEMA_VERSION_V1 => {
-            catalog::validate_legacy_schema(connection).map_err(catalog_error)?;
-            Ok(CatalogVersion::LegacyV1)
-        }
-        super::super::AGENT_SESSION_SCHEMA_VERSION => {
-            catalog::validate_schema(connection).map_err(catalog_error)?;
-            Ok(CatalogVersion::CurrentV2)
-        }
-        _ => Err(Error::Catalog(Box::new(
-            AgentSessionCatalogError::Ownership {
-                application_id,
-                user_version,
-                object_count,
-            },
-        ))),
-    }
+    catalog::validate_schema(connection).map_err(catalog_error)
+}
+
+fn require_current(connection: &Connection) -> Result<(), Error> {
+    validate_current(connection)
 }
 
 fn load_record(
@@ -612,13 +571,7 @@ fn insert_held(
     let request_digest = intent.request_digest();
     let snapshot = intent.canonical_request_snapshot();
     let changed = transaction.execute(
-        "INSERT INTO home_acceptance_session_pins(
-             acceptance_id,issuer_id,session_id,held_session_id,
-             principal_kind,principal_id,session_revision,request_digest,request_snapshot,
-             state,created_at_ms,held_at_ms,source_outcome_kind,source_payload_digest,
-             source_observed_at_ms,operations_resolution_digest,operations_admission_id,
-             operations_admission_digest,operations_held_at_ms,resolved_at_ms
-         ) VALUES(?1,?2,?3,?3,?4,?5,?6,?7,?8,0,?9,?9,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)",
+        INSERT_HELD_SQL,
         params![
             acceptance_id.as_slice(),
             issuer_id.as_slice(),
@@ -660,13 +613,7 @@ fn insert_resolved_absent(
     let snapshot = intent.canonical_request_snapshot();
     let operations_digest = operations.resolution_digest();
     let changed = transaction.execute(
-        "INSERT INTO home_acceptance_session_pins(
-             acceptance_id,issuer_id,session_id,held_session_id,
-             principal_kind,principal_id,session_revision,request_digest,request_snapshot,
-             state,created_at_ms,held_at_ms,source_outcome_kind,source_payload_digest,
-             source_observed_at_ms,operations_resolution_digest,operations_admission_id,
-             operations_admission_digest,operations_held_at_ms,resolved_at_ms
-         ) VALUES(?1,?2,?3,NULL,?4,?5,?6,?7,?8,2,?9,NULL,2,?10,?11,?12,?13,?14,?15,?16)",
+        INSERT_RESOLVED_ABSENT_SQL,
         params![
             acceptance_id.as_slice(),
             issuer_id.as_slice(),
@@ -717,12 +664,7 @@ fn update_resolution(
         return Err(Error::Conflict);
     }
     let changed = transaction.execute(
-        "UPDATE home_acceptance_session_pins SET
-             state=?1, source_outcome_kind=?2, source_payload_digest=?3,
-             source_observed_at_ms=?4, operations_resolution_digest=?5,
-             operations_admission_id=?6, operations_admission_digest=?7,
-             operations_held_at_ms=?8, resolved_at_ms=?9
-         WHERE acceptance_id=?10 AND state=0 AND request_digest=?11",
+        UPDATE_RESOLUTION_SQL,
         params![
             state,
             source_outcome,
@@ -850,59 +792,41 @@ fn decode_uuid(bytes: &[u8], field: &'static str) -> Result<Uuid, Error> {
 
 fn load_pin_row(connection: &Connection, acceptance_id: Uuid) -> Result<Option<RawPin>, Error> {
     let raw = connection
-        .query_row(
-            "SELECT substr(acceptance_id,1,17),length(acceptance_id),
-                    substr(issuer_id,1,17),length(issuer_id),
-                    substr(session_id,1,17),length(session_id),
-                    substr(held_session_id,1,17),length(held_session_id),
-                    principal_kind,substr(principal_id,1,17),length(principal_id),
-                    session_revision,substr(request_digest,1,33),length(request_digest),
-                    substr(request_snapshot,1,321),length(request_snapshot),state,
-                    created_at_ms,held_at_ms,source_outcome_kind,
-                    substr(source_payload_digest,1,33),length(source_payload_digest),
-                    source_observed_at_ms,
-                    substr(operations_resolution_digest,1,33),length(operations_resolution_digest),
-                    substr(operations_admission_id,1,17),length(operations_admission_id),
-                    substr(operations_admission_digest,1,33),length(operations_admission_digest),
-                    operations_held_at_ms,resolved_at_ms
-             FROM home_acceptance_session_pins WHERE acceptance_id=?1",
-            params![acceptance_id.as_bytes()],
-            |row| {
-                Ok(RawPin {
-                    acceptance_id: row.get(0)?,
-                    acceptance_id_length: row.get(1)?,
-                    issuer_id: row.get(2)?,
-                    issuer_id_length: row.get(3)?,
-                    session_id: row.get(4)?,
-                    session_id_length: row.get(5)?,
-                    held_session_id: row.get(6)?,
-                    held_session_id_length: row.get(7)?,
-                    principal_kind: row.get(8)?,
-                    principal_id: row.get(9)?,
-                    principal_id_length: row.get(10)?,
-                    session_revision: row.get(11)?,
-                    request_digest: row.get(12)?,
-                    request_digest_length: row.get(13)?,
-                    request_snapshot: row.get(14)?,
-                    request_snapshot_length: row.get(15)?,
-                    state: row.get(16)?,
-                    created_at_ms: row.get(17)?,
-                    held_at_ms: row.get(18)?,
-                    source_outcome_kind: row.get(19)?,
-                    source_payload_digest: row.get(20)?,
-                    source_payload_digest_length: row.get(21)?,
-                    source_observed_at_ms: row.get(22)?,
-                    operations_resolution_digest: row.get(23)?,
-                    operations_resolution_digest_length: row.get(24)?,
-                    operations_admission_id: row.get(25)?,
-                    operations_admission_id_length: row.get(26)?,
-                    operations_admission_digest: row.get(27)?,
-                    operations_admission_digest_length: row.get(28)?,
-                    operations_held_at_ms: row.get(29)?,
-                    resolved_at_ms: row.get(30)?,
-                })
-            },
-        )
+        .query_row(LOAD_PIN_ROW_SQL, params![acceptance_id.as_bytes()], |row| {
+            Ok(RawPin {
+                acceptance_id: row.get(0)?,
+                acceptance_id_length: row.get(1)?,
+                issuer_id: row.get(2)?,
+                issuer_id_length: row.get(3)?,
+                session_id: row.get(4)?,
+                session_id_length: row.get(5)?,
+                held_session_id: row.get(6)?,
+                held_session_id_length: row.get(7)?,
+                principal_kind: row.get(8)?,
+                principal_id: row.get(9)?,
+                principal_id_length: row.get(10)?,
+                session_revision: row.get(11)?,
+                request_digest: row.get(12)?,
+                request_digest_length: row.get(13)?,
+                request_snapshot: row.get(14)?,
+                request_snapshot_length: row.get(15)?,
+                state: row.get(16)?,
+                created_at_ms: row.get(17)?,
+                held_at_ms: row.get(18)?,
+                source_outcome_kind: row.get(19)?,
+                source_payload_digest: row.get(20)?,
+                source_payload_digest_length: row.get(21)?,
+                source_observed_at_ms: row.get(22)?,
+                operations_resolution_digest: row.get(23)?,
+                operations_resolution_digest_length: row.get(24)?,
+                operations_admission_id: row.get(25)?,
+                operations_admission_id_length: row.get(26)?,
+                operations_admission_digest: row.get(27)?,
+                operations_admission_digest_length: row.get(28)?,
+                operations_held_at_ms: row.get(29)?,
+                resolved_at_ms: row.get(30)?,
+            })
+        })
         .optional()?;
     Ok(raw)
 }

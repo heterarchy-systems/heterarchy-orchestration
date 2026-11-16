@@ -40,7 +40,7 @@ pub struct AgentRequestAdmissionRequest {
     pub reason: String,
 }
 
-/// Durable `AgentRequest` lifecycle returned by admission and recovery.
+/// Durable `AgentRequest` state preserved in admission recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionRequestStateWire {
@@ -60,14 +60,6 @@ pub struct AgentRequestAdmissionReceiptWire {
     pub count: u8,
     pub created: bool,
     pub revision: u64,
-}
-
-/// Completed admission result with the exact caller intent echoed.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AgentRequestAdmissionResponse {
-    pub request: AgentRequestAdmissionRequest,
-    pub receipt: AgentRequestAdmissionReceiptWire,
 }
 
 /// Read-only recovery result. `snapshot: null` means the exact request is absent.

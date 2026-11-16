@@ -596,50 +596,6 @@ pub(crate) fn committed_progress_at(
     assemble_progress(&raw, request, RegistrationPhase::MembershipCommitted).map(Some)
 }
 
-pub(crate) fn session_is_ready(
-    connection: &Connection,
-    workspace_id: WorkspaceId,
-    activity_id: ActivityId,
-    session_id: AgentSessionId,
-    participant_id: Uuid,
-) -> Result<bool, OperationsError> {
-    let mut statement = connection.prepare(
-        "SELECT substr(request_id,1,17)
-         FROM ops_registration_requests
-         WHERE workspace_id=?1 AND activity_id=?2 AND session_id=?3 AND participant_id=?4
-         ORDER BY request_id
-         LIMIT 2",
-    )?;
-    let mut rows = statement.query(params![
-        workspace_id.into_uuid().as_bytes(),
-        activity_id.into_uuid().as_bytes(),
-        session_id.into_uuid().as_bytes(),
-        participant_id.as_bytes(),
-    ])?;
-    let Some(row) = rows.next()? else {
-        return Ok(false);
-    };
-    let request_id = Uuid::from_bytes(import_wire::id(row.get::<_, Vec<u8>>(0)?)?);
-    if rows.next()?.is_some() {
-        return Err(OperationsError::Corrupt(
-            "duplicate registration for Session participation",
-        ));
-    }
-    let progress = progress_at(connection, request_id)?.ok_or(OperationsError::Corrupt(
-        "registration disappeared during readiness read",
-    ))?;
-    if progress.workspace_id() != workspace_id
-        || progress.participant_id() != participant_id
-        || progress.request().binding().activity_id() != activity_id
-        || progress.request().binding().session_id() != session_id
-    {
-        return Err(OperationsError::Corrupt(
-            "registration readiness scope mismatch",
-        ));
-    }
-    Ok(progress.phase() == RegistrationPhase::Ready)
-}
-
 #[derive(Debug)]
 struct RawRegistration {
     request_id: Uuid,

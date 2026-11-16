@@ -26,11 +26,6 @@ const LEGACY_RECOVERIES: &str = "CREATE TABLE ops_team_expansion_legacy_slot_rec
 const LEGACY_RECOVERIES_NO_UPDATE: &str = "CREATE TRIGGER ops_team_expansion_legacy_slot_recoveries_no_update BEFORE UPDATE ON ops_team_expansion_legacy_slot_recoveries BEGIN SELECT RAISE(ABORT,'legacy Team expansion slot recoveries are immutable'); END";
 const LEGACY_RECOVERIES_NO_DELETE: &str = "CREATE TRIGGER ops_team_expansion_legacy_slot_recoveries_no_delete BEFORE DELETE ON ops_team_expansion_legacy_slot_recoveries BEGIN SELECT RAISE(ABORT,'legacy Team expansion slot recoveries are retained'); END";
 
-/// Migration-only classification for decisions that predate Workspace hold
-/// admission. It claims no particular catalog source version and records no
-/// target, slot hold, occupancy or target authority.
-pub(crate) const PRE_HOLD_DECISION_BACKFILL_SQL: &str = "INSERT INTO ops_team_expansion_workspace_hold_pre_hold_decisions(decision_id,request_id,workspace_id,team_id,decision_state,classification) SELECT decision_id,request_id,workspace_id,team_id,state,'PRE_HOLD' FROM ops_team_expansion_decisions";
-
 pub(crate) const fn schema_objects() -> &'static [(&'static str, &'static str, &'static str)] {
     &[
         (

@@ -21,7 +21,6 @@ pub(super) fn create(
             Uuid::from_u128(0xAC30),
             "native-home-recipient".to_owned(),
             "Native Home recipient".to_owned(),
-            AgentProfileProviderFamily::ChatGpt,
             None,
             None,
             vec!["backend".to_owned()],

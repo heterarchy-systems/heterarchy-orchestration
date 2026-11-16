@@ -1515,13 +1515,6 @@ pub(crate) const fn workspace_hold_schema_objects()
     workspace_hold::workspace_hold_schema_objects()
 }
 
-pub(crate) fn classify_pre_hold_decisions(
-    transaction: &Transaction<'_>,
-) -> Result<(), OperationsError> {
-    transaction.execute(workspace_hold::PRE_HOLD_DECISION_BACKFILL_SQL, [])?;
-    Ok(())
-}
-
 pub(crate) fn create_legacy_slot_recovery_schema(
     transaction: &Transaction<'_>,
 ) -> Result<(), OperationsError> {

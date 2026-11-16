@@ -114,6 +114,7 @@ async fn oversized_serialization_is_rejected_before_network_and_releases_admissi
         preferred_model: None,
         preferred_reasoning: None,
         base_capabilities: Vec::new(),
+        execution_preference: None,
     };
     assert_eq!(
         client
@@ -154,6 +155,49 @@ async fn profile_read_rejects_malformed_snapshot_time_and_origin()
             Some(ClientError::Protocol)
         );
         let _request = server.await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn profile_create_accepts_new_unbound_and_exact_legacy_replay()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = crate::wire::AgentProfileCreateRequest {
+        request_id: Uuid::from_u128(3).to_string(),
+        stable_name: "profile-create-replay".to_owned(),
+        display_name: "Profile create replay".to_owned(),
+        preferred_model: None,
+        preferred_reasoning: None,
+        base_capabilities: vec!["verification".to_owned()],
+        execution_preference: None,
+    };
+    for (provider_family, created) in [("unbound", true), ("chatgpt", false)] {
+        let payload = serde_json::json!({
+            "profile": {
+                "profileId": Uuid::from_u128(4),
+                "requestId": Uuid::from_u128(3),
+                "stableName": request.stable_name.clone(),
+                "displayName": request.display_name.clone(),
+                "providerFamily": provider_family,
+                "preferredModel": null,
+                "preferredReasoning": null,
+                "baseCapabilities": ["verification"],
+                "lifecycleState": "active",
+                "creationOrigin": "user_manual",
+                "createdAtMs": 10,
+                "updatedAtMs": 10,
+                "lastUsedAtMs": null,
+                "revision": 1
+            },
+            "created": created
+        });
+        let (client, server) = fixture(Some(reply("200 OK", &payload))).await?;
+        let response = client
+            .create_profile(&HeaderValue::from_static(CREDENTIAL), &request)
+            .await?;
+        assert_eq!(response.created, created);
+        assert_eq!(response.profile.provider_family, provider_family);
+        let _captured = server.await??;
     }
     Ok(())
 }
@@ -409,4 +453,20 @@ async fn held_exchanges_cannot_expand_client_concurrency() -> Result<(), Box<dyn
     drop(permits);
     assert_eq!(client.slots.available_permits(), CLIENT_CONCURRENCY);
     Ok(())
+}
+
+#[test]
+fn provider_retired_410_is_a_typed_service_rejection_even_with_readback() {
+    let error = super::service_error(
+        hyper::StatusCode::GONE,
+        br#"{"code":"PROVIDER_RETIRED"}"#,
+        Some(ReadbackTarget::Session(Uuid::from_u128(1))),
+    );
+    assert_eq!(
+        error,
+        ClientError::Rejected {
+            status: hyper::StatusCode::GONE.as_u16(),
+            code: ServiceCode::ProviderRetired,
+        }
+    );
 }

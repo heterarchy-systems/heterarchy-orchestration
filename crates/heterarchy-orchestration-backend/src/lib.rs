@@ -6,8 +6,12 @@
 pub mod app_support;
 pub mod approval;
 pub mod auth;
+pub mod autonomy_cli;
+pub mod autonomy_loop;
 pub mod binding_rejection_trust;
+mod broker_config;
 mod catalog_execution;
+pub mod cli_support;
 pub mod client;
 mod connections;
 pub mod coordination;
@@ -39,13 +43,15 @@ pub mod leadership;
 pub mod member_list;
 mod membership;
 mod participation;
+pub mod profile_cli;
 mod profile_config;
 mod profile_sessions;
-mod provider_worker;
 pub mod provisioning;
 pub mod realtime;
 pub mod session_process;
 mod sessions;
+pub mod swarm_cli;
+pub mod swarm_http;
 pub mod teams;
 pub mod token_cli;
 pub mod wire;
@@ -69,12 +75,16 @@ use heterarchy_orchestration_auth::{
     McpTokenBootstrapMode, McpTokenClient, McpTokenRuntime, McpTokenRuntimeError,
 };
 use heterarchy_orchestration_operations::{
-    ConfigureAdmissionIssuerCommand, MAX_ADMISSION_TTL_MS, MIN_ADMISSION_TTL_MS,
-    TrustedLegacyBindingRejectionDeployment,
+    BrokerClusterConfig, ConfigureAdmissionIssuerCommand, MAX_ADMISSION_TTL_MS,
+    MIN_ADMISSION_TTL_MS, TrustedLegacyBindingRejectionDeployment,
+};
+use heterarchy_orchestration_runtime::execution_supervisor::{
+    LocalProcessRunner, LocalProcessRunnerConfig,
 };
 use heterarchy_orchestration_runtime::{
     AgentProfileCreateCommand, AgentProfileCreateSummary, AgentRequestSummary,
-    ApprovalPolicySummary, OrchestrationRuntime, RuntimeError, TeamPage, TeamSummary,
+    ApprovalPolicySummary, OrchestrationRuntime, RuntimeError, SwarmRuntimeDispatcher, TeamPage,
+    TeamSummary,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -114,6 +124,56 @@ impl ScopedMutationAuthority {
     }
 }
 
+/// Shared Swarm dispatcher host options (`worker_bearer_file` + `LocalProcessRunnerConfig`).
+#[derive(Clone, Default)]
+pub struct SwarmHostOptions {
+    worker_bearer_file: Option<std::path::PathBuf>,
+    process_runner_config: LocalProcessRunnerConfig,
+}
+
+impl std::fmt::Debug for SwarmHostOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SwarmHostOptions")
+            .field(
+                "worker_bearer_file",
+                &self.worker_bearer_file.as_ref().map(|_| "[REDACTED_PATH]"),
+            )
+            .field("process_runner_config", &self.process_runner_config)
+            .finish()
+    }
+}
+
+impl SwarmHostOptions {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_worker_bearer_file(mut self, path: std::path::PathBuf) -> Self {
+        self.worker_bearer_file = Some(path);
+        self
+    }
+
+    #[must_use]
+    pub fn with_optional_worker_bearer_file(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.worker_bearer_file = path;
+        self
+    }
+
+    #[must_use]
+    pub fn worker_bearer_file(&self) -> Option<&Path> {
+        self.worker_bearer_file.as_deref()
+    }
+
+    #[must_use]
+    pub fn with_process_runner_config(mut self, config: LocalProcessRunnerConfig) -> Self {
+        self.process_runner_config = config;
+        self
+    }
+}
+
 #[derive(Debug)]
 pub struct BackendConfig {
     listen: SocketAddr,
@@ -123,6 +183,9 @@ pub struct BackendConfig {
     coordinator_authority: Option<coordinator_authority::CoordinatorAuthority>,
     admission_issuer: Option<AdmissionIssuerBootstrap>,
     trusted_binding_rejection_legacy_deployments: Vec<TrustedLegacyBindingRejectionDeployment>,
+    broker_cluster: Option<BrokerClusterConfig>,
+    embedded_session_authority: Option<session_process::EmbeddedSessionAuthorityConfig>,
+    swarm_options: SwarmHostOptions,
 }
 
 /// Explicit host identity used to initialize the Forge admission issuer.
@@ -224,7 +287,62 @@ impl BackendConfig {
             coordinator_authority: None,
             admission_issuer: None,
             trusted_binding_rejection_legacy_deployments: Vec::new(),
+            broker_cluster: None,
+            embedded_session_authority: None,
+            swarm_options: SwarmHostOptions::default(),
         })
+    }
+
+    /// Configure a bearer-token file path injected as `HETERARCHY_ORCHESTRATION_BEARER_FILE`
+    /// into Swarm worker processes supervised by the shared [`SwarmRuntimeDispatcher`].
+    #[must_use]
+    pub fn with_worker_bearer_file(mut self, path: std::path::PathBuf) -> Self {
+        self.swarm_options = self.swarm_options.with_worker_bearer_file(path);
+        self
+    }
+
+    /// Optionally configure the Swarm worker bearer-token file path.
+    #[must_use]
+    pub fn with_optional_worker_bearer_file(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.swarm_options = self.swarm_options.with_optional_worker_bearer_file(path);
+        self
+    }
+
+    #[must_use]
+    pub fn worker_bearer_file(&self) -> Option<&Path> {
+        self.swarm_options.worker_bearer_file()
+    }
+
+    /// Override the [`LocalProcessRunnerConfig`] used by the shared [`SwarmRuntimeDispatcher`].
+    #[must_use]
+    pub fn with_process_runner_config(mut self, config: LocalProcessRunnerConfig) -> Self {
+        self.swarm_options = self.swarm_options.with_process_runner_config(config);
+        self
+    }
+
+    /// Supervise the read-only loopback Session Authority in-process alongside
+    /// the main HTTP backend, draining main HTTP before Session Authority stops.
+    #[must_use]
+    pub fn with_embedded_session_authority(
+        mut self,
+        session_authority: session_process::EmbeddedSessionAuthorityConfig,
+    ) -> Self {
+        self.embedded_session_authority = Some(session_authority);
+        self
+    }
+
+    #[must_use]
+    pub const fn embedded_session_authority(
+        &self,
+    ) -> Option<&session_process::EmbeddedSessionAuthorityConfig> {
+        self.embedded_session_authority.as_ref()
+    }
+
+    /// Override the initial Broker connection topology (single-node or three-node cluster).
+    #[must_use]
+    pub fn with_broker_cluster(mut self, broker_cluster: BrokerClusterConfig) -> Self {
+        self.broker_cluster = Some(broker_cluster);
+        self
     }
 
     /// Override how the bearer token authority is obtained.
@@ -307,6 +425,7 @@ struct BackendState {
     realtime: Arc<RealtimeHub>,
     coordinator_authority: Option<coordinator_authority::CoordinatorAuthority>,
     forge_query_slots: Arc<Semaphore>,
+    swarm_dispatcher: Arc<SwarmRuntimeDispatcher<LocalProcessRunner>>,
 }
 
 impl BackendState {
@@ -316,12 +435,17 @@ impl BackendState {
     }
 
     fn new_shared(runtime: Arc<OrchestrationRuntime>, realtime: Arc<RealtimeHub>) -> Self {
+        let swarm_dispatcher = Arc::new(SwarmRuntimeDispatcher::from_runtime(
+            runtime.as_ref(),
+            LocalProcessRunner::default(),
+        ));
         Self {
             runtime,
             catalog_execution: CatalogExecution::new(),
             realtime,
             coordinator_authority: None,
             forge_query_slots: Arc::new(Semaphore::new(4)),
+            swarm_dispatcher,
         }
     }
 
@@ -368,12 +492,14 @@ impl BackendState {
     fn profile_creation_job(
         &self,
         command: AgentProfileCreateCommand,
+        execution_preference: Option<heterarchy_orchestration_sessions::ExecutionPreference>,
     ) -> impl FnOnce(&OrchestrationRuntime) -> Result<AgentProfileCreateSummary, RuntimeError>
     + Send
     + 'static {
         let publisher = self.clone();
         move |runtime| {
-            let outcome = runtime.create_agent_profile(command)?;
+            let outcome = runtime
+                .create_agent_profile_with_execution_preference(command, execution_preference)?;
             if outcome.created {
                 publisher.publish_state_changed(
                     RealtimeEventKind::AgentProfileStateChanged,
@@ -636,6 +762,31 @@ impl BackendState {
         self.run_mutation(operation).await
     }
 
+    /// Authorize an operator + Broker owner and supervise a `SwarmRuntimeDispatcher`
+    /// turn inside `catalog_execution.tasks` (for drain safety) while releasing
+    /// `admitted_slots` before child spawn so re-entrant worker CLI calls never starve.
+    pub(crate) async fn run_swarm_dispatch(
+        &self,
+        principal: forge_domain::AuthenticatedPrincipal,
+        request: heterarchy_orchestration_runtime::SwarmDispatchTurnRequest,
+    ) -> Result<
+        Result<
+            heterarchy_orchestration_runtime::SwarmDispatchedTurnOutcome,
+            heterarchy_orchestration_runtime::SwarmDispatchError,
+        >,
+        ApiError,
+    > {
+        self.run_operator_mutation(principal, move |runtime| {
+            runtime.require_operator(principal)
+        })
+        .await?;
+        let dispatcher = Arc::clone(&self.swarm_dispatcher);
+        let receiver = self.catalog_execution.spawn_swarm_dispatch(async move {
+            Ok(dispatcher.dispatch_member_turn(request).await)
+        })?;
+        receiver.await.map_err(|_| ApiError::Unavailable)?
+    }
+
     async fn run_operator_control_mutation<T, F>(
         &self,
         principal: forge_domain::AuthenticatedPrincipal,
@@ -887,8 +1038,11 @@ pub async fn serve(
     let data_root = config.data_root().to_path_buf();
     let admission_issuer = config.admission_issuer;
     let token_runtime = start_authorities(config.token_authority)?;
-    let mut runtime =
-        OrchestrationRuntime::open(&data_root)?.with_operator_policy(config.operator_policy);
+    let mut runtime = match config.broker_cluster {
+        Some(cluster) => OrchestrationRuntime::open_with_broker_cluster(&data_root, cluster)?,
+        None => OrchestrationRuntime::open(&data_root)?,
+    }
+    .with_operator_policy(config.operator_policy);
     if !config
         .trusted_binding_rejection_legacy_deployments
         .is_empty()
@@ -908,17 +1062,98 @@ pub async fn serve(
             })
             .map(|_| ())?;
     }
-    let result = serve_with_runtime(
+    let embedded_session =
+        start_embedded_session_authority(&data_root, listen, config.embedded_session_authority)
+            .await?;
+    let result = supervise_http_and_session_authority(
         Arc::new(runtime),
         listen,
         token_runtime.client(),
         config.coordinator_authority,
+        config.swarm_options,
         cancellation,
+        embedded_session,
     )
     .await;
     // Worker owners outlive every admitted authentication/catalog operation.
     let _owned_token_worker = token_runtime;
     result
+}
+
+async fn start_embedded_session_authority(
+    data_root: &Path,
+    backend_listen: SocketAddr,
+    config: Option<session_process::EmbeddedSessionAuthorityConfig>,
+) -> Result<Option<session_process::EmbeddedSessionAuthorityHandle>, BackendError> {
+    let Some(session_cfg) = config else {
+        return Ok(None);
+    };
+    if backend_listen.port() != 0 && session_cfg.listen() == backend_listen {
+        return Err(BackendError::SessionAuthority(
+            session_process::SessionAuthorityProcessError::InvalidConfiguration,
+        ));
+    }
+    let default_session_catalog = data_root.join("agent-sessions.sqlite3");
+    if session_cfg.catalog_path() == default_session_catalog {
+        let init_path = default_session_catalog;
+        tokio::task::spawn_blocking(move || {
+            heterarchy_orchestration_sessions::AgentSessionCatalog::open(init_path).map(|_| ())
+        })
+        .await
+        .map_err(session_process::SessionAuthorityProcessError::PreparationJoin)?
+        .map_err(session_process::SessionAuthorityProcessError::Catalog)?;
+    }
+    session_process::EmbeddedSessionAuthorityHandle::start(session_cfg)
+        .await
+        .map(Some)
+        .map_err(BackendError::SessionAuthority)
+}
+
+async fn supervise_http_and_session_authority(
+    runtime: Arc<OrchestrationRuntime>,
+    listen: SocketAddr,
+    token_client: McpTokenClient,
+    coordinator_authority: Option<coordinator_authority::CoordinatorAuthority>,
+    swarm_options: SwarmHostOptions,
+    cancellation: CancellationToken,
+    embedded_session: Option<session_process::EmbeddedSessionAuthorityHandle>,
+) -> Result<(), BackendError> {
+    let Some(mut session_handle) = embedded_session else {
+        return serve_with_runtime_and_swarm_options(
+            runtime,
+            listen,
+            token_client,
+            coordinator_authority,
+            swarm_options,
+            cancellation,
+        )
+        .await;
+    };
+    let http_cancellation = cancellation.child_token();
+    let http_future = serve_with_runtime_and_swarm_options(
+        runtime,
+        listen,
+        token_client,
+        coordinator_authority,
+        swarm_options,
+        http_cancellation.clone(),
+    );
+    tokio::pin!(http_future);
+    tokio::select! {
+        http_result = &mut http_future => {
+            let shutdown_result = session_handle
+                .shutdown()
+                .await
+                .map_err(BackendError::SessionAuthority);
+            http_result?;
+            shutdown_result
+        }
+        unexpected = session_handle.wait_for_unexpected_exit() => {
+            http_cancellation.cancel();
+            let _ = http_future.await;
+            Err(BackendError::SessionAuthority(unexpected))
+        }
+    }
 }
 
 /// Serve one host's existing Runtime without reacquiring its root or replacing
@@ -935,16 +1170,62 @@ pub async fn serve_with_runtime(
     coordinator_authority: Option<coordinator_authority::CoordinatorAuthority>,
     cancellation: CancellationToken,
 ) -> Result<(), BackendError> {
+    serve_with_runtime_and_swarm_options(
+        runtime,
+        listen,
+        token_client,
+        coordinator_authority,
+        SwarmHostOptions::default(),
+        cancellation,
+    )
+    .await
+}
+
+/// Serve one host's existing [`OrchestrationRuntime`] with explicit shared
+/// [`SwarmRuntimeDispatcher`] host options.
+///
+/// # Errors
+/// Rejects non-loopback listeners, invalid worker bearer-file paths, or server failures.
+pub async fn serve_with_runtime_and_swarm_options(
+    runtime: Arc<OrchestrationRuntime>,
+    listen: SocketAddr,
+    token_client: McpTokenClient,
+    coordinator_authority: Option<coordinator_authority::CoordinatorAuthority>,
+    swarm_options: SwarmHostOptions,
+    cancellation: CancellationToken,
+) -> Result<(), BackendError> {
     if !listen.ip().is_loopback() {
         return Err(BackendError::NonLoopbackListener);
     }
+    let coordinator_authority = match coordinator_authority {
+        Some(authority) => {
+            let configured_scopes = authority
+                .configured_project_scopes()
+                .map_err(|_| BackendError::InvalidWorkspaceScopeBootstrap)?;
+            if !configured_scopes.is_empty() {
+                let now_ms = startup_timestamp_millis()?;
+                runtime.seed_workspace_scopes_if_absent(&configured_scopes, now_ms)?;
+            }
+            Some(authority.with_scope_registry(runtime.operations_catalog()))
+        }
+        None => None,
+    };
+    let listener = TcpListener::bind(listen).await?;
+    let address = listener.local_addr()?;
+    let swarm_dispatcher = SwarmRuntimeDispatcher::from_runtime(
+        runtime.as_ref(),
+        LocalProcessRunner::new(swarm_options.process_runner_config),
+    )
+    .with_orchestration_backend_addr(address)
+    .map_err(|_| BackendError::SwarmDispatcherBootstrap)?
+    .with_optional_worker_bearer_file(swarm_options.worker_bearer_file)
+    .map_err(|_| BackendError::SwarmDispatcherBootstrap)?;
     let destination_id = runtime.destination_id();
     let mut state = BackendState::new_shared(runtime, Arc::new(RealtimeHub::new()));
     state.coordinator_authority = coordinator_authority;
+    state.swarm_dispatcher = Arc::new(swarm_dispatcher);
     let authorizer = auth::BearerAuthorizer::new(token_client);
     let router = router(state.clone(), authorizer.clone());
-    let listener = TcpListener::bind(listen).await?;
-    let address = listener.local_addr()?;
     info!(
         %address,
         %destination_id,
@@ -997,10 +1278,10 @@ fn router(state: BackendState, authorizer: auth::BearerAuthorizer) -> Router {
         )
         .merge(profile_config::routes())
         .merge(profile_sessions::routes())
+        .merge(broker_config::routes())
         .merge(approval::routes())
         .merge(leadership::routes())
         .merge(provisioning::routes())
-        .merge(provider_worker::routes())
         .merge(teams::routes())
         .merge(mission_evaluation::routes())
         .merge(mission_t2_checkpoint::routes())
@@ -1020,6 +1301,8 @@ fn router(state: BackendState, authorizer: auth::BearerAuthorizer) -> Router {
         .merge(work_credit::routes())
         .merge(workspace_chat::routes())
         .merge(forge_read_api::routes())
+        .merge(autonomy_loop::routes())
+        .merge(swarm_http::routes())
         .route_layer(axum::middleware::from_fn_with_state(
             ingress_limits::RequestAdmission::new(),
             ingress_limits::middleware,
@@ -1160,16 +1443,26 @@ async fn agent_profile_create(
     Json(request): Json<AgentProfileCreateRequest>,
 ) -> Result<(StatusCode, Json<AgentProfileCreateResponse>), ApiError> {
     let request_id = canonical_uuid(&request.request_id)?;
+    let execution_preference = request
+        .execution_preference
+        .as_ref()
+        .map(wire::ExecutionPreferenceWire::to_execution_preference)
+        .transpose()
+        .map_err(RuntimeError::from)
+        .map_err(ApiError::Runtime)?;
     let created_at_ms = current_timestamp_millis()?;
-    let job = state.profile_creation_job(AgentProfileCreateCommand {
-        request_id,
-        stable_name: request.stable_name,
-        display_name: request.display_name,
-        preferred_model: request.preferred_model,
-        preferred_reasoning: request.preferred_reasoning,
-        base_capabilities: request.base_capabilities,
-        created_at_ms,
-    });
+    let job = state.profile_creation_job(
+        AgentProfileCreateCommand {
+            request_id,
+            stable_name: request.stable_name,
+            display_name: request.display_name,
+            preferred_model: request.preferred_model,
+            preferred_reasoning: request.preferred_reasoning,
+            base_capabilities: request.base_capabilities,
+            created_at_ms,
+        },
+        execution_preference,
+    );
     let outcome = state.run_operator_mutation(principal, job).await?;
     let status = if outcome.created {
         StatusCode::CREATED
@@ -1439,6 +1732,12 @@ pub enum BackendError {
     TokenAuthority(#[source] McpTokenRuntimeError),
     #[error("admission issuer startup configuration is invalid")]
     InvalidAdmissionIssuer,
+    #[error("Workspace scope bootstrap configuration is invalid")]
+    InvalidWorkspaceScopeBootstrap,
+    #[error("Swarm runtime dispatcher bootstrap configuration is invalid")]
+    SwarmDispatcherBootstrap,
+    #[error("embedded Session Authority supervision failed: {0}")]
+    SessionAuthority(#[from] session_process::SessionAuthorityProcessError),
     #[error("Orchestration startup clock is unavailable")]
     StartupClock,
     #[error("Orchestration runtime bootstrap failed")]
@@ -1811,11 +2110,11 @@ mod tests {
             created_at_ms: 1,
         };
         let created = state
-            .run_catalog(state.profile_creation_job(command()))
+            .run_catalog(state.profile_creation_job(command(), None))
             .await
             .map_err(|_| "create failed")?;
         let replayed = state
-            .run_catalog(state.profile_creation_job(command()))
+            .run_catalog(state.profile_creation_job(command(), None))
             .await
             .map_err(|_| "replay failed")?;
         assert!(created.created);
@@ -1870,7 +2169,7 @@ mod tests {
         };
         let caller = tokio::spawn(async move {
             caller_state
-                .run_catalog(caller_state.profile_creation_job(command))
+                .run_catalog(caller_state.profile_creation_job(command, None))
                 .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), async {

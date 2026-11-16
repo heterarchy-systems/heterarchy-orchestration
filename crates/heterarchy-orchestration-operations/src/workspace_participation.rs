@@ -231,28 +231,6 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsErr
     Ok(())
 }
 
-/// Remove post-v20 additions when a unit test reconstructs an exact legacy
-/// catalog shape. The composed drops refuse durable isolation/handoff receipts.
-/// Production migrations never call this helper.
-#[cfg(test)]
-pub(crate) fn drop_schema_for_legacy_fixture(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    crate::catalog::drop_v49_project_schema_for_legacy_fixture(connection)?;
-    crate::work_credit_subject::drop_schema_for_legacy_fixture(connection)?;
-    connection.execute_batch(
-        "DROP TABLE IF EXISTS ops_election_subject_ballots; \
-         DROP TABLE IF EXISTS ops_election_voter_sources; \
-         DROP TABLE IF EXISTS ops_election_voter_subjects; \
-         DROP TABLE IF EXISTS ops_election_subject_cutovers; \
-         DROP TABLE IF EXISTS ops_workspace_participation_replacement_registrations; \
-         DROP TABLE IF EXISTS ops_workspace_participation_session_rebinds; \
-         DROP TABLE IF EXISTS ops_workspace_participation_mappings; \
-         DROP TABLE IF EXISTS ops_workspace_participations;",
-    )?;
-    Ok(())
-}
-
 impl OperationsCatalog {
     /// Attach one verified Profile/logical-Session mapping to the single shadow
     /// `WorkspaceParticipation` anchor for `(workspace, profile)`.
@@ -742,8 +720,8 @@ mod tests {
         AgentSessionOpenRequestId, AuthenticatedPrincipal, OpenAgentSession, TimestampMillis,
     };
     use heterarchy_orchestration_sessions::{
-        AgentProfileCatalog, AgentProfileCreationOrigin, AgentProfileProviderFamily,
-        AgentSessionCatalog, CreateAgentProfile, link_existing_logical_session,
+        AgentProfileCatalog, AgentProfileCreationOrigin, AgentSessionCatalog, CreateAgentProfile,
+        link_existing_logical_session,
     };
     use std::error::Error;
 
@@ -771,7 +749,6 @@ mod tests {
             Uuid::from_u128(0xF102),
             "luna-rust-global".to_owned(),
             "Luna Rust Global".to_owned(),
-            AgentProfileProviderFamily::ChatGpt,
             Some("gpt-5.6-luna".to_owned()),
             Some("max".to_owned()),
             vec!["rust".to_owned()],
@@ -844,14 +821,6 @@ mod tests {
     fn table_count(catalog: &OperationsCatalog, table: &str) -> Result<i64, Box<dyn Error>> {
         let sql = format!("SELECT COUNT(*) FROM {table}");
         Ok(catalog.connection.query_row(&sql, [], |row| row.get(0))?)
-    }
-
-    fn table_schema(connection: &Connection, table: &str) -> Result<String, Box<dyn Error>> {
-        Ok(connection.query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
-            params![table],
-            |row| row.get(0),
-        )?)
     }
 
     #[test]
@@ -1012,57 +981,6 @@ mod tests {
         drop(fixture.sessions);
         drop(fixture.profiles);
         std::fs::remove_dir_all(fixture.root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn v20_upgrade_preserves_legacy_authority_and_restores_shadow_participation()
-    -> Result<(), Box<dyn Error>> {
-        let root = std::env::temp_dir().join(format!(
-            "orchestration-workspace-participation-v20-{}",
-            Uuid::now_v7()
-        ));
-        std::fs::create_dir(&root)?;
-        let path = root.join("operations.sqlite3");
-        let destination = Uuid::from_u128(0xF301);
-        let catalog = OperationsCatalog::open(&path, destination)?;
-        drop(catalog);
-
-        let connection = Connection::open(&path)?;
-        let leadership_schema_before = table_schema(&connection, "ops_leadership")?;
-        drop_schema_for_legacy_fixture(&connection)?;
-        let member_schema_before = table_schema(&connection, "ops_logical_members")?;
-        let credit_schema_before = table_schema(&connection, "ops_work_credit_entries")?;
-        connection.pragma_update(None, "user_version", 20_i64)?;
-        drop(connection);
-
-        let migrated = OperationsCatalog::open(&path, destination)?;
-        let version: i64 = migrated
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, crate::catalog::VERSION);
-        assert_eq!(
-            table_schema(&migrated.connection, "ops_logical_members")?,
-            member_schema_before
-        );
-        crate::catalog::assert_fixture_table_schema(
-            &migrated.connection,
-            "ops_leadership",
-            &leadership_schema_before,
-        )?;
-        assert_eq!(
-            table_schema(&migrated.connection, "ops_work_credit_entries")?,
-            credit_schema_before
-        );
-        let shadow_objects: i64 = migrated.connection.query_row(
-            "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('ops_workspace_participations','ops_workspace_participation_mappings')",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(shadow_objects, 2);
-
-        drop(migrated);
-        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

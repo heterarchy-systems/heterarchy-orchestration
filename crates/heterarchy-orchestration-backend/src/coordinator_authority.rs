@@ -42,12 +42,30 @@ pub enum CoordinatorAuthorityError {
 /// Workspace request sent to Forge. They are not permission caches or bearer
 /// credentials; every resolution is delegated to the supplied Forge control
 /// client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CoordinatorAuthority {
     transport: SourceTransport,
     scopes: Vec<ResolvedWorkspaceScope>,
+    scope_registry: Option<
+        heterarchy_orchestration_runtime::CatalogHandle<
+            heterarchy_orchestration_operations::OperationsCatalog,
+        >,
+    >,
     effect_facts: Option<forge_backend::ForgeHttpClient>,
     home_transfer_source: Option<ConfiguredHomeTransferSource>,
+}
+
+impl std::fmt::Debug for CoordinatorAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoordinatorAuthority")
+            .field("transport", &self.transport)
+            .field("scopes", &self.scopes)
+            .field("scope_registry_attached", &self.scope_registry.is_some())
+            .field("effect_facts", &self.effect_facts)
+            .field("home_transfer_source", &self.home_transfer_source)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +194,7 @@ impl CoordinatorAuthority {
         Ok(Self {
             transport: SourceTransport::Control { client: control },
             scopes,
+            scope_registry: None,
             effect_facts: None,
             home_transfer_source: None,
         })
@@ -194,9 +213,48 @@ impl CoordinatorAuthority {
         Ok(Self {
             transport: SourceTransport::Http(client),
             scopes,
+            scope_registry: None,
             effect_facts: None,
             home_transfer_source: None,
         })
+    }
+
+    /// Attach the durable `Workspace` scope registry for fail-closed scope resolution.
+    #[must_use]
+    pub fn with_scope_registry(
+        mut self,
+        registry: heterarchy_orchestration_runtime::CatalogHandle<
+            heterarchy_orchestration_operations::OperationsCatalog,
+        >,
+    ) -> Self {
+        self.scope_registry = Some(registry);
+        self
+    }
+
+    /// Convert configured host `Workspace` references into durable registry seed scopes.
+    ///
+    /// # Errors
+    /// Returns [`CoordinatorAuthorityError::Unavailable`] if a configured scope
+    /// fails domain bounds.
+    pub fn configured_project_scopes(
+        &self,
+    ) -> Result<
+        Vec<heterarchy_orchestration_operations::WorkspaceProjectScope>,
+        CoordinatorAuthorityError,
+    > {
+        self.scopes
+            .iter()
+            .map(|scope| {
+                heterarchy_orchestration_operations::WorkspaceProjectScope::new(
+                    scope.workspace_id().into_uuid(),
+                    scope.locator().location_id().into_uuid(),
+                    scope.locator().expected_revision().get(),
+                    scope.workspace_revision().get(),
+                    scope.locator().encode(),
+                )
+                .map_err(|_| CoordinatorAuthorityError::Unavailable)
+            })
+            .collect()
     }
 
     fn control(&self) -> Result<&ForgeControlClient, CoordinatorAuthorityError> {
@@ -339,50 +397,87 @@ impl CoordinatorAuthority {
             .map_err(map_operations_source_error)
     }
 
-    /// Select an exact host-configured reference for a persisted Workspace ID.
-    /// This selection is not a fresh source observation or execution authority.
-    pub(crate) fn workspace_reference(
-        &self,
-        workspace_id: uuid::Uuid,
-    ) -> Result<crate::wire::WorkspaceQueryScope, CoordinatorAuthorityError> {
-        let scope = self.trusted_workspace_scope(workspace_id)?;
-        Ok(workspace_scope_wire(&scope))
-    }
-
     fn trusted_scope(
         &self,
         request: &crate::wire::WorkspaceQueryScope,
     ) -> Result<ResolvedWorkspaceScope, CoordinatorAuthorityError> {
+        self.resolve_scope_with_generation(request, None)
+            .map(|(scope, _)| scope)
+    }
+
+    fn resolve_scope_with_generation(
+        &self,
+        request: &crate::wire::WorkspaceQueryScope,
+        expected_generation: Option<u64>,
+    ) -> Result<(ResolvedWorkspaceScope, u64), CoordinatorAuthorityError> {
+        if let Some(registry) = &self.scope_registry {
+            return resolve_registered_scope(registry, request, expected_generation);
+        }
         let expected = self.trusted_workspace_scope(request.workspace_id)?;
         let locator = expected.locator();
         if locator.location_id().into_uuid() != request.location_id
             || locator.expected_revision().get() != request.location_revision
             || expected.workspace_revision().get() != request.workspace_revision
             || locator.encode() != request.locator
+            || expected_generation.is_some_and(|generation| generation != 1)
         {
             return Err(CoordinatorAuthorityError::Stale);
         }
-        Ok(expected)
+        Ok((expected, 1))
     }
 
     fn trusted_workspace_scope(
         &self,
         workspace_id: uuid::Uuid,
     ) -> Result<ResolvedWorkspaceScope, CoordinatorAuthorityError> {
+        if let Some(registry) = &self.scope_registry {
+            let active = {
+                let catalog = registry
+                    .lock()
+                    .map_err(|_| CoordinatorAuthorityError::Unavailable)?;
+                catalog
+                    .list_active_workspace_scopes()
+                    .map_err(|_| CoordinatorAuthorityError::Unavailable)?
+            };
+            let record = active
+                .into_iter()
+                .find(|entry| entry.scope().workspace_id() == workspace_id)
+                .ok_or(CoordinatorAuthorityError::Denied)?;
+            return resolved_scope_from_project_scope(record.scope());
+        }
+        if self.scopes.is_empty() {
+            return Err(CoordinatorAuthorityError::Denied);
+        }
         self.scopes
             .iter()
             .find(|scope| scope.workspace_id().into_uuid() == workspace_id)
             .cloned()
-            .ok_or(CoordinatorAuthorityError::Unavailable)
+            .ok_or(CoordinatorAuthorityError::Denied)
     }
 
-    /// Validate one caller-supplied scope against the exact host-configured
-    /// reference without contacting Forge.
+    /// Validate one caller-supplied scope against the exact configured or
+    /// registered `Workspace` reference without contacting Forge.
     pub(crate) fn validate_scope(
         &self,
         request: &crate::wire::WorkspaceQueryScope,
     ) -> Result<(), CoordinatorAuthorityError> {
         self.trusted_scope(request).map(|_| ())
+    }
+
+    /// Validate one caller-supplied scope and optional monotonic registry
+    /// generation fence without contacting Forge, returning the active generation.
+    ///
+    /// # Errors
+    /// Returns [`CoordinatorAuthorityError::Denied`] when no active scope matches,
+    /// [`CoordinatorAuthorityError::Stale`] on scope or generation fence mismatch,
+    /// and [`CoordinatorAuthorityError::Unavailable`] on catalog failure.
+    pub fn validate_scope_with_generation(
+        &self,
+        request: &crate::wire::WorkspaceQueryScope,
+        expected_generation: Option<u64>,
+    ) -> Result<u64, CoordinatorAuthorityError> {
+        self.resolve_scope_with_generation(request, expected_generation)
+            .map(|(_, generation)| generation)
     }
 
     pub(crate) async fn coordinator_observation(
@@ -610,9 +705,9 @@ impl CoordinatorAuthority {
     /// the Activity, Session, Agent and principal against durable state.
     ///
     /// # Errors
-    /// Returns `Unavailable` for an unconfigured/unknown Workspace or transport
-    /// failure, `Denied` for missing/foreign actor identity, and `Stale` for
-    /// scope or Coordinator revision fences.
+    /// Returns `Denied` for an unconfigured/unregistered `Workspace` or
+    /// missing/foreign actor identity, `Unavailable` for transport failure, and
+    /// `Stale` for scope or Coordinator revision fences.
     pub fn resolve(
         &self,
         command: &AgentRequestSubmit,
@@ -631,6 +726,106 @@ impl CoordinatorAuthority {
             .ok_or(CoordinatorAuthorityError::Denied)?;
         validate_actor(command, principal, actor)
     }
+}
+
+fn parse_candidate_scope(
+    request: &crate::wire::WorkspaceQueryScope,
+) -> Option<(
+    heterarchy_orchestration_operations::WorkspaceProjectScope,
+    forge_control::WorkspaceLocator,
+)> {
+    let candidate = heterarchy_orchestration_operations::WorkspaceProjectScope::new(
+        request.workspace_id,
+        request.location_id,
+        request.location_revision,
+        request.workspace_revision,
+        request.locator.clone(),
+    )
+    .ok()?;
+    let locator = forge_control::WorkspaceLocator::decode(candidate.locator()).ok()?;
+    if locator.location_id().into_uuid() != candidate.location_id()
+        || locator.expected_revision().get() != candidate.location_revision()
+    {
+        return None;
+    }
+    Some((candidate, locator))
+}
+
+fn resolved_scope_from_project_scope(
+    scope: &heterarchy_orchestration_operations::WorkspaceProjectScope,
+) -> Result<ResolvedWorkspaceScope, CoordinatorAuthorityError> {
+    let workspace_revision = forge_domain::WorkspaceRevision::new(scope.workspace_revision())
+        .map_err(|_| CoordinatorAuthorityError::Unavailable)?;
+    let locator = forge_control::WorkspaceLocator::decode(scope.locator())
+        .map_err(|_| CoordinatorAuthorityError::Unavailable)?;
+    if locator.location_id().into_uuid() != scope.location_id()
+        || locator.expected_revision().get() != scope.location_revision()
+    {
+        return Err(CoordinatorAuthorityError::Unavailable);
+    }
+    Ok(ResolvedWorkspaceScope::from_observation(
+        forge_domain::WorkspaceId::from_uuid(scope.workspace_id()),
+        workspace_revision,
+        locator,
+    ))
+}
+
+fn resolve_registered_scope(
+    registry: &heterarchy_orchestration_runtime::CatalogHandle<
+        heterarchy_orchestration_operations::OperationsCatalog,
+    >,
+    request: &crate::wire::WorkspaceQueryScope,
+    expected_generation: Option<u64>,
+) -> Result<(ResolvedWorkspaceScope, u64), CoordinatorAuthorityError> {
+    use heterarchy_orchestration_operations::ScopeResolutionError;
+
+    let Some((candidate, locator)) = parse_candidate_scope(request) else {
+        let active = {
+            let catalog = registry
+                .lock()
+                .map_err(|_| CoordinatorAuthorityError::Unavailable)?;
+            catalog
+                .list_active_workspace_scopes()
+                .map_err(|_| CoordinatorAuthorityError::Unavailable)?
+        };
+        if active
+            .iter()
+            .any(|record| record.scope().workspace_id() == request.workspace_id)
+        {
+            return Err(CoordinatorAuthorityError::Stale);
+        }
+        return Err(CoordinatorAuthorityError::Denied);
+    };
+
+    let resolution = {
+        let catalog = registry
+            .lock()
+            .map_err(|_| CoordinatorAuthorityError::Unavailable)?;
+        catalog
+            .resolve_registered_workspace_scope(&candidate, expected_generation)
+            .map_err(|_| CoordinatorAuthorityError::Unavailable)?
+    };
+    let record = match resolution {
+        Ok(record) => record,
+        Err(ScopeResolutionError::EmptyRegistry | ScopeResolutionError::Unregistered { .. }) => {
+            return Err(CoordinatorAuthorityError::Denied);
+        }
+        Err(
+            ScopeResolutionError::StaleScope { .. }
+            | ScopeResolutionError::GenerationFenceMismatch { .. },
+        ) => {
+            return Err(CoordinatorAuthorityError::Stale);
+        }
+    };
+    let workspace_revision =
+        forge_domain::WorkspaceRevision::new(record.scope().workspace_revision())
+            .map_err(|_| CoordinatorAuthorityError::Unavailable)?;
+    let resolved = ResolvedWorkspaceScope::from_observation(
+        forge_domain::WorkspaceId::from_uuid(record.scope().workspace_id()),
+        workspace_revision,
+        locator,
+    );
+    Ok((resolved, record.generation()))
 }
 
 fn validate_actor(
@@ -670,16 +865,6 @@ fn validate_scopes(scopes: &[ResolvedWorkspaceScope]) -> Result<(), CoordinatorA
         workspace_ids.push(workspace);
     }
     Ok(())
-}
-
-fn workspace_scope_wire(scope: &ResolvedWorkspaceScope) -> crate::wire::WorkspaceQueryScope {
-    crate::wire::WorkspaceQueryScope {
-        workspace_id: scope.workspace_id().into_uuid(),
-        workspace_revision: scope.workspace_revision().get(),
-        location_id: scope.locator().location_id().into_uuid(),
-        location_revision: scope.locator().expected_revision().get(),
-        locator: scope.locator().encode(),
-    }
 }
 
 async fn control_job<T, F>(
@@ -893,6 +1078,260 @@ mod tests {
         .await??;
         drop(recovered);
         assert_eq!(slots.available_permits(), 1);
+        Ok(())
+    }
+
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct RegistryFixture {
+        runtime: heterarchy_orchestration_runtime::OrchestrationRuntime,
+        _dir: TempDir,
+    }
+
+    impl RegistryFixture {
+        fn open() -> Result<Self, Box<dyn std::error::Error>> {
+            let path = std::env::temp_dir().join(format!(
+                "coordinator-authority-registry-{}",
+                uuid::Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&path)?;
+            let dir = TempDir(path);
+            let runtime = heterarchy_orchestration_runtime::OrchestrationRuntime::open(&dir.0)?;
+            Ok(Self { runtime, _dir: dir })
+        }
+    }
+
+    fn test_http_authority(
+        scopes: Vec<ResolvedWorkspaceScope>,
+    ) -> Result<CoordinatorAuthority, Box<dyn std::error::Error>> {
+        let commands = crate::forge_commands::ForgeCommandHttpClient::new(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 1)),
+            "test-bearer-secret",
+            std::time::Duration::from_secs(1),
+        )?;
+        let source = crate::forge_source::ForgeSourceHttpClient::new(commands);
+        Ok(CoordinatorAuthority::from_http(source, scopes)?)
+    }
+
+    fn sample_scope(
+        workspace_id: uuid::Uuid,
+        location_id: uuid::Uuid,
+        location_revision: i64,
+        workspace_revision: i64,
+    ) -> Result<
+        (ResolvedWorkspaceScope, crate::wire::WorkspaceQueryScope),
+        Box<dyn std::error::Error>,
+    > {
+        let workspace_rev = forge_domain::WorkspaceRevision::new(workspace_revision)?;
+        let location_rev = forge_domain::LocationRevision::new(location_revision)?;
+        let locator = forge_control::WorkspaceLocator::new(
+            forge_domain::LocationId::from_uuid(location_id),
+            location_rev,
+            std::path::Path::new("."),
+        )?;
+        let query = crate::wire::WorkspaceQueryScope {
+            workspace_id,
+            location_id,
+            location_revision,
+            workspace_revision,
+            locator: locator.encode(),
+        };
+        let resolved = ResolvedWorkspaceScope::from_observation(
+            forge_domain::WorkspaceId::from_uuid(workspace_id),
+            workspace_rev,
+            locator,
+        );
+        Ok((resolved, query))
+    }
+
+    #[test]
+    fn http_authority_with_empty_scopes_fails_closed_with_or_without_registry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, query) = sample_scope(uuid::Uuid::from_u128(11), uuid::Uuid::from_u128(21), 1, 1)?;
+        let standalone = test_http_authority(Vec::new())?;
+        assert!(standalone.configured_project_scopes()?.is_empty());
+        assert_eq!(
+            standalone.validate_scope(&query),
+            Err(CoordinatorAuthorityError::Denied)
+        );
+        assert_eq!(
+            standalone.trusted_workspace_scope(query.workspace_id),
+            Err(CoordinatorAuthorityError::Denied)
+        );
+
+        let fixture = RegistryFixture::open()?;
+        let attached = test_http_authority(Vec::new())?
+            .with_scope_registry(fixture.runtime.operations_catalog());
+        assert_eq!(
+            attached.validate_scope(&query),
+            Err(CoordinatorAuthorityError::Denied)
+        );
+        assert_eq!(
+            attached.trusted_workspace_scope(query.workspace_id),
+            Err(CoordinatorAuthorityError::Denied)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scope_registry_enforces_active_membership_and_revision_fences()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = RegistryFixture::open()?;
+        let catalog_handle = fixture.runtime.operations_catalog();
+        let (scope_a, query_a) =
+            sample_scope(uuid::Uuid::from_u128(101), uuid::Uuid::from_u128(201), 1, 1)?;
+        let (_, query_b) =
+            sample_scope(uuid::Uuid::from_u128(102), uuid::Uuid::from_u128(202), 1, 1)?;
+
+        let authority =
+            test_http_authority(vec![scope_a.clone()])?.with_scope_registry(catalog_handle.clone());
+        assert_eq!(
+            authority.validate_scope(&query_a),
+            Err(CoordinatorAuthorityError::Denied)
+        );
+
+        let initial_scopes = authority.configured_project_scopes()?;
+        {
+            let mut catalog = catalog_handle
+                .lock()
+                .map_err(|_| "operations catalog mutex poisoned")?;
+            let seeded = catalog.seed_workspace_scopes_if_absent(&initial_scopes, 10)?;
+            assert_eq!(seeded.len(), 1);
+            assert_eq!(seeded[0].generation(), 1);
+        }
+
+        assert_eq!(authority.validate_scope(&query_a), Ok(()));
+        assert_eq!(
+            authority.trusted_workspace_scope(query_a.workspace_id)?,
+            scope_a
+        );
+        assert_eq!(
+            authority.validate_scope(&query_b),
+            Err(CoordinatorAuthorityError::Denied)
+        );
+        assert_eq!(
+            authority.trusted_workspace_scope(query_b.workspace_id),
+            Err(CoordinatorAuthorityError::Denied)
+        );
+
+        let mut stale_workspace = query_a.clone();
+        stale_workspace.workspace_revision = 2;
+        assert_eq!(
+            authority.validate_scope(&stale_workspace),
+            Err(CoordinatorAuthorityError::Stale)
+        );
+        let mut stale_location = query_a.clone();
+        stale_location.location_revision = 2;
+        assert_eq!(
+            authority.validate_scope(&stale_location),
+            Err(CoordinatorAuthorityError::Stale)
+        );
+        let mut invalid_active_locator = query_a;
+        invalid_active_locator.locator = "invalid-locator".to_owned();
+        assert_eq!(
+            authority.validate_scope(&invalid_active_locator),
+            Err(CoordinatorAuthorityError::Stale)
+        );
+        let mut invalid_unregistered_locator = query_b;
+        invalid_unregistered_locator.locator = "invalid-locator".to_owned();
+        assert_eq!(
+            authority.validate_scope(&invalid_unregistered_locator),
+            Err(CoordinatorAuthorityError::Denied)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scope_registry_unregistration_and_reregistration_advance_generation_fence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use heterarchy_orchestration_operations::{
+            ScopeRegistrationCommand, ScopeUnregisterCommand, WorkspaceProjectScope,
+        };
+
+        let fixture = RegistryFixture::open()?;
+        let catalog_handle = fixture.runtime.operations_catalog();
+        let (scope_a, query_a) =
+            sample_scope(uuid::Uuid::from_u128(103), uuid::Uuid::from_u128(203), 1, 1)?;
+        let authority =
+            test_http_authority(vec![scope_a])?.with_scope_registry(catalog_handle.clone());
+        let initial_scopes = authority.configured_project_scopes()?;
+        {
+            let mut catalog = catalog_handle
+                .lock()
+                .map_err(|_| "operations catalog mutex poisoned")?;
+            catalog.seed_workspace_scopes_if_absent(&initial_scopes, 10)?;
+        }
+        assert_eq!(
+            authority.validate_scope_with_generation(&query_a, Some(1)),
+            Ok(1)
+        );
+
+        {
+            let mut catalog = catalog_handle
+                .lock()
+                .map_err(|_| "operations catalog mutex poisoned")?;
+            let unregistered = catalog.unregister_workspace_scope(&ScopeUnregisterCommand::new(
+                uuid::Uuid::now_v7(),
+                forge_domain::WorkspaceId::from_uuid(query_a.workspace_id),
+                1,
+                20,
+            )?)?;
+            assert_eq!(unregistered.generation(), 2);
+        }
+        assert_eq!(
+            authority.validate_scope(&query_a),
+            Err(CoordinatorAuthorityError::Denied)
+        );
+        assert_eq!(
+            authority.trusted_workspace_scope(query_a.workspace_id),
+            Err(CoordinatorAuthorityError::Denied)
+        );
+        assert_eq!(
+            authority.validate_scope_with_generation(&query_a, Some(1)),
+            Err(CoordinatorAuthorityError::Denied)
+        );
+
+        let (_, query_a_v2) = sample_scope(query_a.workspace_id, query_a.location_id, 1, 2)?;
+        {
+            let mut catalog = catalog_handle
+                .lock()
+                .map_err(|_| "operations catalog mutex poisoned")?;
+            let reregistered = catalog.register_workspace_scope(&ScopeRegistrationCommand::new(
+                uuid::Uuid::now_v7(),
+                2,
+                WorkspaceProjectScope::new(
+                    query_a_v2.workspace_id,
+                    query_a_v2.location_id,
+                    query_a_v2.location_revision,
+                    query_a_v2.workspace_revision,
+                    query_a_v2.locator.clone(),
+                )?,
+                30,
+            )?)?;
+            assert_eq!(reregistered.generation(), 3);
+        }
+        assert_eq!(
+            authority.validate_scope_with_generation(&query_a_v2, Some(1)),
+            Err(CoordinatorAuthorityError::Stale)
+        );
+        assert_eq!(
+            authority.validate_scope_with_generation(&query_a_v2, Some(2)),
+            Err(CoordinatorAuthorityError::Stale)
+        );
+        assert_eq!(
+            authority.validate_scope_with_generation(&query_a_v2, Some(3)),
+            Ok(3)
+        );
+        assert_eq!(
+            authority.validate_scope_with_generation(&query_a_v2, None),
+            Ok(3)
+        );
         Ok(())
     }
 }

@@ -1,17 +1,16 @@
-//! Immutable operator acknowledgement for one uncertain provider message.
+//! Historical immutable operator acknowledgements for uncertain provider messages.
 
 use forge_domain::{AuthenticatedPrincipal, TimestampMillis, WorkspaceId};
 use heterarchy_orchestration_sessions::{AgentProfileId, AgentProfileRuntimeSessionId};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
-use crate::catalog::signed;
 use crate::{OperationsCatalog, OperationsError, WorkspaceParticipationId, registration};
 
 use super::{
-    ProviderMessageState, ProviderMessageTarget, catalog_commit_read, decode_counter,
-    decode_provider_family, decode_string, decode_uuid, encode_provider_family, load_outbox,
-    require_verified_workspace, to_sqlite_error, validate_message_id,
+    ProviderMessageTarget, catalog_commit_read, decode_counter, decode_provider_family,
+    decode_string, decode_uuid, load_outbox, require_verified_workspace, to_sqlite_error,
+    validate_message_id,
 };
 
 const RECEIPTS_SQL: &str = r"
@@ -49,7 +48,19 @@ BEGIN
 END;
 ";
 
-const SELECT_RECEIPT: &str = "SELECT substr(request_id,1,17),substr(message_id,1,17),expected_revision,substr(expected_workspace_id,1,17),substr(expected_profile_id,1,17),substr(expected_participation_id,1,17),expected_provider_family,substr(expected_runtime_session_id,1,17),substr(CAST(expected_provider_conversation_id AS BLOB),1,513),reason,operator_principal_kind,substr(operator_principal_id,1,17),acknowledged_at_ms FROM ops_provider_message_unknown_isolations";
+macro_rules! select_receipt_sql {
+    () => {
+        "SELECT substr(request_id,1,17),substr(message_id,1,17),expected_revision,substr(expected_workspace_id,1,17),substr(expected_profile_id,1,17),substr(expected_participation_id,1,17),expected_provider_family,substr(expected_runtime_session_id,1,17),substr(CAST(expected_provider_conversation_id AS BLOB),1,513),reason,operator_principal_kind,substr(operator_principal_id,1,17),acknowledged_at_ms FROM ops_provider_message_unknown_isolations"
+    };
+}
+
+const SELECT_RECEIPT_BY_REQUEST_ID_SQL: &str =
+    crate::static_sql::StaticSql::dml(concat!(select_receipt_sql!(), " WHERE request_id=?1"))
+        .as_str();
+
+const SELECT_RECEIPT_BY_MESSAGE_ID_SQL: &str =
+    crate::static_sql::StaticSql::dml(concat!(select_receipt_sql!(), " WHERE message_id=?1"))
+        .as_str();
 
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
@@ -202,14 +213,6 @@ impl ProviderMessageUnknownIsolationReceipt {
     pub const fn acknowledged_at(&self) -> TimestampMillis {
         self.acknowledged_at
     }
-
-    fn has_same_request(&self, command: &ProviderMessageUnknownIsolationCommand) -> bool {
-        self.request_id == command.request_id
-            && self.message_id == command.message_id
-            && self.expected_revision == command.expected_revision
-            && self.expected_target == command.expected_target
-            && self.reason == command.reason
-    }
 }
 
 struct RawReceipt {
@@ -229,85 +232,17 @@ struct RawReceipt {
 }
 
 impl OperationsCatalog {
-    /// Persist one exact operator acknowledgement without changing the UNKNOWN outbox row.
+    /// Retired provider UNKNOWN isolation acknowledgement entrypoint.
     ///
     /// # Errors
-    /// Rejects stale or changed message evidence, duplicate identities, invalid scope or storage failures.
+    /// Always returns [`OperationsError::ProviderRetired`] without reading or
+    /// writing the catalog. Existing isolation receipts remain readable.
     pub fn isolate_unknown_provider_message(
         &mut self,
         command: &ProviderMessageUnknownIsolationCommand,
     ) -> Result<ProviderMessageUnknownIsolationReceipt, OperationsError> {
-        validate_message_id(command.message_id)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        if let Some(existing) = load_by_request(&transaction, command.request_id)? {
-            if !existing.has_same_request(command) {
-                return Err(OperationsError::Conflict(
-                    "provider UNKNOWN isolation request identity",
-                ));
-            }
-            require_receipt_target(&transaction, &existing, self.destination)?;
-            catalog_commit_read(transaction, self.destination)?;
-            return Ok(existing);
-        }
-        if load_by_message(&transaction, command.message_id)?.is_some() {
-            return Err(OperationsError::Conflict(
-                "provider UNKNOWN isolation already exists",
-            ));
-        }
-
-        let existing = load_outbox(&transaction, command.message_id)?.ok_or(
-            OperationsError::Conflict("provider UNKNOWN isolation message"),
-        )?;
-        require_verified_workspace(
-            &transaction,
-            existing.target().workspace_id(),
-            self.destination,
-        )?;
-        if existing.state() != ProviderMessageState::Unknown
-            || existing.revision() != command.expected_revision
-            || existing.target() != &command.expected_target
-            || existing.receipt().is_some()
-            || command.acknowledged_at < existing.updated_at()
-        {
-            return Err(OperationsError::Conflict(
-                "provider UNKNOWN isolation fence",
-            ));
-        }
-
-        let (principal_kind, principal_id) = registration::encode_principal(command.principal);
-        let target = &command.expected_target;
-        transaction.execute(
-            "INSERT INTO ops_provider_message_unknown_isolations(request_id,message_id,expected_revision,expected_workspace_id,expected_profile_id,expected_participation_id,expected_provider_family,expected_runtime_session_id,expected_provider_conversation_id,reason,operator_principal_kind,operator_principal_id,acknowledged_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,0,?10,?11,?12)",
-            params![
-                command.request_id.as_bytes(),
-                command.message_id.as_bytes(),
-                signed(command.expected_revision)?,
-                target.workspace_id().into_uuid().as_bytes(),
-                target.profile_id().into_uuid().as_bytes(),
-                target.participation_id().into_uuid().as_bytes(),
-                encode_provider_family(target.provider_family()),
-                target.runtime_session_id().into_uuid().as_bytes(),
-                target.provider_conversation_id(),
-                principal_kind,
-                principal_id.as_deref(),
-                command.acknowledged_at.get(),
-            ],
-        )?;
-        let receipt = load_by_request(&transaction, command.request_id)?.ok_or(
-            OperationsError::Corrupt("provider UNKNOWN isolation insert"),
-        )?;
-        let workspace_id = target.workspace_id();
-        transaction
-            .commit()
-            .map_err(|source| OperationsError::OperationCommitUnconfirmed {
-                workspace_id,
-                request_id: command.request_id,
-                source,
-            })?;
-        Ok(receipt)
+        let _ = command;
+        Err(OperationsError::ProviderRetired)
     }
 
     /// Read an isolation receipt by exact request ID or discover it by exact message ID.
@@ -374,7 +309,7 @@ fn load_by_request(
     }
     connection
         .query_row(
-            &format!("{SELECT_RECEIPT} WHERE request_id=?1"),
+            SELECT_RECEIPT_BY_REQUEST_ID_SQL,
             params![request_id.as_bytes()],
             decode_receipt,
         )
@@ -388,7 +323,7 @@ fn load_by_message(
 ) -> Result<Option<ProviderMessageUnknownIsolationReceipt>, OperationsError> {
     connection
         .query_row(
-            &format!("{SELECT_RECEIPT} WHERE message_id=?1"),
+            SELECT_RECEIPT_BY_MESSAGE_ID_SQL,
             params![message_id.as_bytes()],
             decode_receipt,
         )

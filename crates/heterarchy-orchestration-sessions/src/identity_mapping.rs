@@ -61,7 +61,7 @@ pub enum AgentIdentityMappingError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentProfileCreationOrigin, AgentProfileProviderFamily, CreateAgentProfile};
+    use crate::{AgentProfileCreationOrigin, CreateAgentProfile};
     use forge_domain::{AgentSessionOpenRequestId, OpenAgentSession};
     use std::error::Error;
     use std::fs;
@@ -89,7 +89,6 @@ mod tests {
             Uuid::from_u128(0xD102),
             "luna-rust-01".to_owned(),
             "Luna Rust 01".to_owned(),
-            AgentProfileProviderFamily::ChatGpt,
             Some("gpt-5.6-luna".to_owned()),
             Some("max".to_owned()),
             vec!["rust".to_owned()],
@@ -199,7 +198,6 @@ mod tests {
             Uuid::from_u128(0xD10A),
             "luna-review-01".to_owned(),
             "Luna Review 01".to_owned(),
-            AgentProfileProviderFamily::ChatGpt,
             None,
             None,
             vec!["verification".to_owned()],

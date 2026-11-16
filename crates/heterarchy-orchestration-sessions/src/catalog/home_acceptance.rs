@@ -105,50 +105,6 @@ impl From<AgentSessionCatalogError> for HomeAcceptanceSessionError {
     }
 }
 
-#[cfg(test)]
-pub(super) fn downgrade_empty_v2_for_fixture(
-    connection: &mut rusqlite::Connection,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !connection.is_autocommit() {
-        return Err("fixture migration requires autocommit".into());
-    }
-    schema::validate_schema(connection)?;
-    let row_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM home_acceptance_session_pins",
-        [],
-        |row| row.get(0),
-    )?;
-    if row_count != 0 {
-        return Err("refusing to downgrade a populated Home acceptance fixture".into());
-    }
-    let previous_foreign_keys: i64 =
-        connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
-    connection.pragma_update(None, "foreign_keys", false)?;
-    let transition = (|| {
-        let transaction =
-            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for (kind, name, _) in schema::OBJECT_SQL.iter().rev() {
-            let exists: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name=?1)",
-                [name],
-                |row| row.get(0),
-            )?;
-            if exists {
-                transaction.execute_batch(&format!("DROP {kind} {name}"))?;
-            }
-        }
-        transaction.pragma_update(None, "user_version", super::AGENT_SESSION_SCHEMA_VERSION_V1)?;
-        transaction.commit()?;
-        Ok::<(), Box<dyn std::error::Error>>(())
-    })();
-    let restore = connection
-        .pragma_update(None, "foreign_keys", previous_foreign_keys)
-        .map_err(Box::<dyn std::error::Error>::from);
-    transition.and(restore)?;
-    crate::catalog::validate_legacy_schema(connection)?;
-    Ok(())
-}
-
 fn catalog_error(error: AgentSessionCatalogError) -> HomeAcceptanceSessionError {
     HomeAcceptanceSessionError::Catalog(Box::new(error))
 }

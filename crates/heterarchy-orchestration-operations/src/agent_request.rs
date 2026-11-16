@@ -17,7 +17,6 @@ use uuid::Uuid;
 use crate::teams::ensure_verified_workspace;
 use crate::{OperationsCatalog, OperationsError, wire};
 
-const AGENT_REQUESTS_V26_SQL: &str = "CREATE TABLE ops_agent_requests (request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id)=16 AND request_id != zeroblob(16)), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), activity_id BLOB NOT NULL CHECK(length(activity_id)=16 AND activity_id != zeroblob(16)), requester_agent_id BLOB NOT NULL CHECK(length(requester_agent_id)=16 AND requester_agent_id != zeroblob(16)), requester_session_id BLOB NOT NULL CHECK(length(requester_session_id)=16 AND requester_session_id != zeroblob(16)), coordinator_revision INTEGER NOT NULL CHECK(coordinator_revision>0), objective TEXT NOT NULL CHECK(length(CAST(objective AS BLOB)) BETWEEN 1 AND 4096), capability TEXT NOT NULL CHECK(length(CAST(capability AS BLOB)) BETWEEN 1 AND 128), requested_count INTEGER NOT NULL CHECK(requested_count BETWEEN 1 AND 4), effect_scope INTEGER NOT NULL CHECK(effect_scope IN(0,1)), independence_requirement INTEGER NOT NULL CHECK(independence_requirement IN(0,1)), reason TEXT NOT NULL CHECK(length(CAST(reason AS BLOB)) BETWEEN 1 AND 2048), state INTEGER NOT NULL CHECK(state=1), created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0), revision INTEGER NOT NULL CHECK(revision=1))";
 const AGENT_REQUESTS_SQL: &str = "CREATE TABLE ops_agent_requests (request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id)=16 AND request_id != zeroblob(16)), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), activity_id BLOB NOT NULL CHECK(length(activity_id)=16 AND activity_id != zeroblob(16)), requester_agent_id BLOB NOT NULL CHECK(length(requester_agent_id)=16 AND requester_agent_id != zeroblob(16)), requester_session_id BLOB NOT NULL CHECK(length(requester_session_id)=16 AND requester_session_id != zeroblob(16)), coordinator_revision INTEGER NOT NULL CHECK(coordinator_revision>0), objective TEXT NOT NULL CHECK(length(CAST(objective AS BLOB)) BETWEEN 1 AND 4096), capability TEXT NOT NULL CHECK(length(CAST(capability AS BLOB)) BETWEEN 1 AND 128), requested_count INTEGER NOT NULL CHECK(requested_count BETWEEN 1 AND 4), effect_scope INTEGER NOT NULL CHECK(effect_scope IN(0,1)), independence_requirement INTEGER NOT NULL CHECK(independence_requirement IN(0,1)), reason TEXT NOT NULL CHECK(length(CAST(reason AS BLOB)) BETWEEN 1 AND 2048), state INTEGER NOT NULL CHECK(state IN(1,2)), created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0), revision INTEGER NOT NULL CHECK(revision IN(1,2)), CHECK(state=revision))";
 const AGENT_REQUEST_FULFILLMENTS_SQL: &str = "CREATE TABLE ops_agent_request_fulfillments (request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id)=16 AND request_id != zeroblob(16)), fulfilled_at_ms INTEGER NOT NULL CHECK(fulfilled_at_ms>=0), ready_slot_count INTEGER NOT NULL CHECK(ready_slot_count BETWEEN 1 AND 4), FOREIGN KEY(request_id) REFERENCES ops_agent_requests(request_id))";
 
@@ -363,114 +362,19 @@ impl OperationsCatalog {
         load_request(&self.connection, request_id)
     }
 
-    /// Reconcile one reserved `AgentRequest` to Fulfilled when every resolver slot
-    /// has a durable Profile-to-Session participation mapping whose exact
-    /// registration is Ready in the requested Workspace/Activity.
-    ///
-    /// This method never creates or activates participation. It only observes
-    /// existing resolver/provider/Plan05 evidence and writes the terminal
-    /// fulfillment witness once all requested slots are ready.
+    /// Retired provider-based `AgentRequest` fulfillment entrypoint.
     ///
     /// # Errors
-    /// Rejects malformed/missing resolution evidence, provider slots without a
-    /// confirmed Profile target, time regression, storage corruption, or an
-    /// uncertain fulfillment commit.
+    /// Always returns [`OperationsError::ProviderRetired`] without reading or
+    /// writing the catalog. Existing request state remains available through
+    /// [`OperationsCatalog::agent_request`].
     pub fn reconcile_agent_request_fulfillment(
         &mut self,
         request_id: Uuid,
         observed_at: TimestampMillis,
     ) -> Result<AgentRequestRecord, OperationsError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let request = load_request(&transaction, request_id)?
-            .ok_or(OperationsError::Conflict("AgentRequest missing"))?;
-        if request.state() == AgentRequestState::Fulfilled {
-            transaction.commit()?;
-            return Ok(request);
-        }
-        if request.state() != AgentRequestState::ResolutionReserved {
-            return Err(OperationsError::Conflict(
-                "AgentRequest fulfillment requires reserved resolution",
-            ));
-        }
-        if observed_at.get() < request.created_at().get() {
-            return Err(OperationsError::Conflict(
-                "AgentRequest fulfillment time regression",
-            ));
-        }
-        let resolution = crate::agent_request_resolution::load_resolution(&transaction, &request)?
-            .ok_or(OperationsError::Conflict("AgentRequest resolution missing"))?;
-        if resolution.slots().len() != usize::from(request.count()) {
-            return Err(OperationsError::Corrupt(
-                "AgentRequest fulfillment resolution count",
-            ));
-        }
-        for slot in resolution.slots() {
-            let selection = slot.selection();
-            let profile_id = if let Some(profile_id) = selection.profile_id() {
-                profile_id
-            } else {
-                let operation = crate::agent_provision::operation_for_request_slot(
-                    &transaction,
-                    request_id,
-                    selection.slot_ordinal(),
-                )?
-                .ok_or(OperationsError::Conflict(
-                    "AgentRequest fulfillment provision missing",
-                ))?;
-                if operation.state() != crate::AgentProvisionState::Confirmed {
-                    transaction.commit()?;
-                    return Ok(request);
-                }
-                operation.profile_id().ok_or(OperationsError::Corrupt(
-                    "AgentRequest fulfillment provision Profile",
-                ))?
-            };
-            let Some(participation) = crate::workspace_participation::load_participation(
-                &transaction,
-                request.workspace_id(),
-                profile_id,
-            )?
-            else {
-                transaction.commit()?;
-                return Ok(request);
-            };
-            let mut ready = false;
-            for mapping in participation.session_mappings() {
-                if crate::registration::session_is_ready(
-                    &transaction,
-                    request.workspace_id(),
-                    request.activity_id(),
-                    mapping.session_id(),
-                    mapping.participant_id(),
-                )? {
-                    ready = true;
-                    break;
-                }
-            }
-            if !ready {
-                transaction.commit()?;
-                return Ok(request);
-            }
-        }
-        transaction.execute(
-            "INSERT INTO ops_agent_request_fulfillments(request_id,fulfilled_at_ms,ready_slot_count) VALUES(?1,?2,?3)",
-            params![
-                request_id.as_bytes(),
-                observed_at.get(),
-                i64::from(request.count()),
-            ],
-        )?;
-        let fulfilled = load_request(&transaction, request_id)?
-            .ok_or(OperationsError::Corrupt("AgentRequest fulfillment insert"))?;
-        transaction
-            .commit()
-            .map_err(|source| OperationsError::AgentRequestCommitUnconfirmed {
-                request_id,
-                source,
-            })?;
-        Ok(fulfilled)
+        let _ = (request_id, observed_at);
+        Err(OperationsError::ProviderRetired)
     }
 
     /// Read capability-independent Profile identities already attached to the
@@ -597,37 +501,6 @@ pub(crate) fn create_fulfillment_schema(
     Ok(())
 }
 
-pub(crate) fn migrate_v26_to_v27(
-    connection: &rusqlite::Transaction<'_>,
-) -> Result<(), OperationsError> {
-    connection.execute_batch("ALTER TABLE ops_agent_requests RENAME TO ops_agent_requests_v26;")?;
-    connection.execute_batch(AGENT_REQUESTS_SQL)?;
-    connection.execute_batch(
-        "INSERT INTO ops_agent_requests(
-            request_id,workspace_id,activity_id,requester_agent_id,requester_session_id,
-            coordinator_revision,objective,capability,requested_count,effect_scope,
-            independence_requirement,reason,state,created_at_ms,revision
-         )
-         SELECT request_id,workspace_id,activity_id,requester_agent_id,requester_session_id,
-                coordinator_revision,objective,capability,requested_count,effect_scope,
-                independence_requirement,reason,state,created_at_ms,revision
-         FROM ops_agent_requests_v26;
-         DROP TABLE ops_agent_requests_v26;",
-    )?;
-    Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn drop_schema_for_legacy_fixture(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    connection.execute_batch(
-        "DROP TABLE IF EXISTS ops_agent_request_fulfillments;
-         DROP TABLE IF EXISTS ops_agent_requests;",
-    )?;
-    Ok(())
-}
-
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         ("table", "ops_agent_requests", AGENT_REQUESTS_SQL),
@@ -637,38 +510,6 @@ pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)
             AGENT_REQUEST_FULFILLMENTS_SQL,
         ),
     ]
-}
-
-pub(crate) fn schema_objects_v28() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![("table", "ops_agent_requests", AGENT_REQUESTS_SQL)]
-}
-
-pub(crate) fn schema_objects_v26() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![("table", "ops_agent_requests", AGENT_REQUESTS_V26_SQL)]
-}
-
-#[cfg(test)]
-pub(crate) fn downgrade_schema_to_v26_fixture(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    crate::agent_request_resolution::drop_schema_for_legacy_fixture(connection)?;
-    connection.execute_batch("DROP TABLE IF EXISTS ops_agent_request_fulfillments;")?;
-    connection.execute_batch("ALTER TABLE ops_agent_requests RENAME TO ops_agent_requests_v27;")?;
-    connection.execute_batch(AGENT_REQUESTS_V26_SQL)?;
-    connection.execute_batch(
-        "INSERT INTO ops_agent_requests(
-            request_id,workspace_id,activity_id,requester_agent_id,requester_session_id,
-            coordinator_revision,objective,capability,requested_count,effect_scope,
-            independence_requirement,reason,state,created_at_ms,revision
-         )
-         SELECT request_id,workspace_id,activity_id,requester_agent_id,requester_session_id,
-                coordinator_revision,objective,capability,requested_count,effect_scope,
-                independence_requirement,reason,state,created_at_ms,revision
-         FROM ops_agent_requests_v27;
-         DROP TABLE ops_agent_requests_v27;",
-    )?;
-    connection.pragma_update(None, "user_version", 26_i64)?;
-    Ok(())
 }
 
 fn validate_text(field: &'static str, value: &str, maximum: usize) -> Result<(), OperationsError> {

@@ -1,9 +1,9 @@
-//! Durable Workspace conversation messages and provider delivery effects.
+//! Durable Workspace conversation history and historical provider delivery records.
 //!
 //! This module owns the small native persistence boundary used by the
-//! Workbench.  It deliberately stores public message content and opaque Forge
-//! references only.  Provider transport, authentication, and Forge reference
-//! validation remain at their respective ingress boundaries.
+//! Workbench. Generic internal messages remain writable. Provider outbox
+//! records remain readable for history and recovery, while provider write and
+//! dispatch entrypoints are retired.
 
 use forge_domain::{
     ActivityId, AgentSessionId, DagNodeId, DagRevisionNumber, GoalId, GoalRevision,
@@ -70,119 +70,6 @@ CREATE TABLE ops_provider_message_routes (
 );
 ";
 
-const WORKSPACE_MESSAGES_SQL_V31: &str = r"
-CREATE TABLE ops_workspace_messages (
-    message_id BLOB PRIMARY KEY NOT NULL CHECK(length(message_id)=16 AND message_id != zeroblob(16)),
-    workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16),
-    channel_kind INTEGER NOT NULL CHECK(channel_kind IN(0,1)),
-    channel_participation_id BLOB CHECK(channel_participation_id IS NULL OR (length(channel_participation_id)=16 AND channel_participation_id != zeroblob(16))),
-    author_kind INTEGER NOT NULL CHECK(author_kind IN(0,1,2)),
-    author_participation_id BLOB CHECK(author_participation_id IS NULL OR (length(author_participation_id)=16 AND author_participation_id != zeroblob(16))),
-    author_profile_id BLOB CHECK(author_profile_id IS NULL OR (length(author_profile_id)=16 AND author_profile_id != zeroblob(16))),
-    author_participant_id BLOB CHECK(author_participant_id IS NULL OR (length(author_participant_id)=16 AND author_participant_id != zeroblob(16))),
-    author_session_id BLOB CHECK(author_session_id IS NULL OR (length(author_session_id)=16 AND author_session_id != zeroblob(16))),
-    author_display_name TEXT NOT NULL CHECK(length(CAST(author_display_name AS BLOB)) BETWEEN 1 AND 128),
-    origin_kind INTEGER NOT NULL CHECK(origin_kind IN(0,1)),
-    body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) BETWEEN 1 AND 16384),
-    sequence INTEGER NOT NULL CHECK(sequence>=1),
-    submitted_at_ms INTEGER NOT NULL CHECK(submitted_at_ms>=0),
-    activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16),
-    goal_id BLOB CHECK(goal_id IS NULL OR length(goal_id)=16),
-    dag_revision INTEGER CHECK(dag_revision IS NULL OR dag_revision>=1),
-    node_id BLOB CHECK(node_id IS NULL OR length(node_id)=16),
-    provider_conversation_id TEXT CHECK(provider_conversation_id IS NULL OR length(CAST(provider_conversation_id AS BLOB)) BETWEEN 1 AND 512),
-    provider_turn_id TEXT CHECK(provider_turn_id IS NULL OR length(CAST(provider_turn_id AS BLOB)) BETWEEN 1 AND 512),
-    provider_source_kind INTEGER CHECK(provider_source_kind IS NULL OR provider_source_kind IN(0,1)),
-    provider_source_profile_id BLOB CHECK(provider_source_profile_id IS NULL OR (length(provider_source_profile_id)=16 AND provider_source_profile_id != zeroblob(16))),
-    provider_source_participation_id BLOB CHECK(provider_source_participation_id IS NULL OR (length(provider_source_participation_id)=16 AND provider_source_participation_id != zeroblob(16))),
-    provider_source_label TEXT CHECK(provider_source_label IS NULL OR length(CAST(provider_source_label AS BLOB)) BETWEEN 1 AND 256),
-    UNIQUE(workspace_id, sequence),
-    UNIQUE(workspace_id, provider_conversation_id, provider_turn_id),
-    CHECK((channel_kind=0 AND channel_participation_id IS NULL) OR (channel_kind=1 AND channel_participation_id IS NOT NULL)),
-    CHECK((author_kind=0 AND author_participation_id IS NULL AND author_profile_id IS NULL AND author_participant_id IS NULL AND author_session_id IS NULL) OR (author_kind=1 AND author_participation_id IS NOT NULL AND author_profile_id IS NOT NULL AND author_participant_id IS NOT NULL AND author_session_id IS NOT NULL) OR (author_kind=2 AND author_participation_id IS NULL AND author_profile_id IS NULL AND author_participant_id IS NULL AND author_session_id IS NULL)),
-    CHECK((origin_kind=0 AND provider_conversation_id IS NULL AND provider_turn_id IS NULL AND provider_source_kind IS NULL AND provider_source_profile_id IS NULL AND provider_source_participation_id IS NULL AND provider_source_label IS NULL) OR (origin_kind=1 AND provider_conversation_id IS NOT NULL AND provider_turn_id IS NOT NULL AND provider_source_kind IS NOT NULL)),
-    CHECK((provider_source_kind=0 AND provider_source_profile_id IS NOT NULL AND provider_source_participation_id IS NOT NULL) OR (provider_source_kind=1 AND provider_source_profile_id IS NULL AND provider_source_participation_id IS NULL) OR provider_source_kind IS NULL),
-    CHECK((goal_id IS NOT NULL) OR (dag_revision IS NULL AND node_id IS NULL)),
-    CHECK(dag_revision IS NOT NULL OR node_id IS NULL)
-);
-";
-
-const WORKSPACE_MESSAGES_SQL_V35: &str = r"
-CREATE TABLE ops_workspace_messages (
-    message_id BLOB PRIMARY KEY NOT NULL CHECK(length(message_id)=16 AND message_id != zeroblob(16)),
-    workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16),
-    channel_kind INTEGER NOT NULL CHECK(channel_kind IN(0,1)),
-    channel_participation_id BLOB CHECK(channel_participation_id IS NULL OR (length(channel_participation_id)=16 AND channel_participation_id != zeroblob(16))),
-    author_kind INTEGER NOT NULL CHECK(author_kind IN(0,1,2,3)),
-    author_participation_id BLOB CHECK(author_participation_id IS NULL OR (length(author_participation_id)=16 AND author_participation_id != zeroblob(16))),
-    author_profile_id BLOB CHECK(author_profile_id IS NULL OR (length(author_profile_id)=16 AND author_profile_id != zeroblob(16))),
-    author_participant_id BLOB CHECK(author_participant_id IS NULL OR (length(author_participant_id)=16 AND author_participant_id != zeroblob(16))),
-    author_session_id BLOB CHECK(author_session_id IS NULL OR (length(author_session_id)=16 AND author_session_id != zeroblob(16))),
-    author_display_name TEXT NOT NULL CHECK(length(CAST(author_display_name AS BLOB)) BETWEEN 1 AND 128),
-    origin_kind INTEGER NOT NULL CHECK(origin_kind IN(0,1)),
-    body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) BETWEEN 1 AND 16384),
-    sequence INTEGER NOT NULL CHECK(sequence>=1),
-    submitted_at_ms INTEGER NOT NULL CHECK(submitted_at_ms>=0),
-    activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16),
-    goal_id BLOB CHECK(goal_id IS NULL OR length(goal_id)=16),
-    dag_revision INTEGER CHECK(dag_revision IS NULL OR dag_revision>=1),
-    node_id BLOB CHECK(node_id IS NULL OR length(node_id)=16),
-    provider_conversation_id TEXT CHECK(provider_conversation_id IS NULL OR length(CAST(provider_conversation_id AS BLOB)) BETWEEN 1 AND 512),
-    provider_turn_id TEXT CHECK(provider_turn_id IS NULL OR length(CAST(provider_turn_id AS BLOB)) BETWEEN 1 AND 512),
-    provider_source_kind INTEGER CHECK(provider_source_kind IS NULL OR provider_source_kind IN(0,1)),
-    provider_source_profile_id BLOB CHECK(provider_source_profile_id IS NULL OR (length(provider_source_profile_id)=16 AND provider_source_profile_id != zeroblob(16))),
-    provider_source_participation_id BLOB CHECK(provider_source_participation_id IS NULL OR (length(provider_source_participation_id)=16 AND provider_source_participation_id != zeroblob(16))),
-    provider_source_label TEXT CHECK(provider_source_label IS NULL OR length(CAST(provider_source_label AS BLOB)) BETWEEN 1 AND 256),
-    UNIQUE(workspace_id, sequence),
-    UNIQUE(workspace_id, provider_conversation_id, provider_turn_id),
-    CHECK((channel_kind=0 AND channel_participation_id IS NULL) OR (channel_kind=1 AND channel_participation_id IS NOT NULL)),
-    CHECK((author_kind=0 AND author_participation_id IS NULL AND author_profile_id IS NULL AND author_participant_id IS NULL AND author_session_id IS NULL) OR (author_kind=1 AND author_participation_id IS NOT NULL AND author_profile_id IS NOT NULL AND author_participant_id IS NOT NULL AND author_session_id IS NOT NULL) OR (author_kind IN(2,3) AND author_participation_id IS NULL AND author_profile_id IS NULL AND author_participant_id IS NULL AND author_session_id IS NULL)),
-    CHECK((origin_kind=0 AND provider_conversation_id IS NULL AND provider_turn_id IS NULL AND provider_source_kind IS NULL AND provider_source_profile_id IS NULL AND provider_source_participation_id IS NULL AND provider_source_label IS NULL) OR (origin_kind=1 AND provider_conversation_id IS NOT NULL AND provider_turn_id IS NOT NULL AND provider_source_kind IS NOT NULL)),
-    CHECK((provider_source_kind=0 AND provider_source_profile_id IS NOT NULL AND provider_source_participation_id IS NOT NULL) OR (provider_source_kind=1 AND provider_source_profile_id IS NULL AND provider_source_participation_id IS NULL) OR provider_source_kind IS NULL),
-    CHECK((goal_id IS NOT NULL) OR (dag_revision IS NULL AND node_id IS NULL)),
-    CHECK(dag_revision IS NOT NULL OR node_id IS NULL)
-);
-";
-
-const WORKSPACE_MESSAGES_SQL_V46: &str = r"
-CREATE TABLE ops_workspace_messages (
-    message_id BLOB PRIMARY KEY NOT NULL CHECK(length(message_id)=16 AND message_id != zeroblob(16)),
-    workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16),
-    channel_kind INTEGER NOT NULL CHECK(channel_kind IN(0,1)),
-    channel_participation_id BLOB CHECK(channel_participation_id IS NULL OR (length(channel_participation_id)=16 AND channel_participation_id != zeroblob(16))),
-    author_kind INTEGER NOT NULL CHECK(author_kind IN(0,1,2,3)),
-    author_participation_id BLOB CHECK(author_participation_id IS NULL OR (length(author_participation_id)=16 AND author_participation_id != zeroblob(16))),
-    author_profile_id BLOB CHECK(author_profile_id IS NULL OR (length(author_profile_id)=16 AND author_profile_id != zeroblob(16))),
-    author_participant_id BLOB CHECK(author_participant_id IS NULL OR (length(author_participant_id)=16 AND author_participant_id != zeroblob(16))),
-    author_session_id BLOB CHECK(author_session_id IS NULL OR (length(author_session_id)=16 AND author_session_id != zeroblob(16))),
-    author_display_name TEXT NOT NULL CHECK(length(CAST(author_display_name AS BLOB)) BETWEEN 1 AND 128),
-    origin_kind INTEGER NOT NULL CHECK(origin_kind IN(0,1)),
-    body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) BETWEEN 1 AND 16384),
-    sequence INTEGER NOT NULL CHECK(sequence>=1),
-    submitted_at_ms INTEGER NOT NULL CHECK(submitted_at_ms>=0),
-    activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16),
-    goal_id BLOB CHECK(goal_id IS NULL OR length(goal_id)=16),
-    dag_revision INTEGER CHECK(dag_revision IS NULL OR dag_revision>=1),
-    node_id BLOB CHECK(node_id IS NULL OR length(node_id)=16),
-    provider_conversation_id TEXT CHECK(provider_conversation_id IS NULL OR length(CAST(provider_conversation_id AS BLOB)) BETWEEN 1 AND 512),
-    provider_turn_id TEXT CHECK(provider_turn_id IS NULL OR length(CAST(provider_turn_id AS BLOB)) BETWEEN 1 AND 512),
-    provider_source_kind INTEGER CHECK(provider_source_kind IS NULL OR provider_source_kind IN(0,1)),
-    provider_source_profile_id BLOB CHECK(provider_source_profile_id IS NULL OR (length(provider_source_profile_id)=16 AND provider_source_profile_id != zeroblob(16))),
-    provider_source_participation_id BLOB CHECK(provider_source_participation_id IS NULL OR (length(provider_source_participation_id)=16 AND provider_source_participation_id != zeroblob(16))),
-    provider_source_label TEXT CHECK(provider_source_label IS NULL OR length(CAST(provider_source_label AS BLOB)) BETWEEN 1 AND 256),
-    goal_created_at_ms INTEGER CHECK(goal_created_at_ms IS NULL OR (goal_id IS NOT NULL AND goal_created_at_ms>=0)),
-    dag_base_goal_revision INTEGER CHECK(dag_base_goal_revision IS NULL OR (dag_revision IS NOT NULL AND dag_base_goal_revision>=1)),
-    UNIQUE(workspace_id, sequence),
-    UNIQUE(workspace_id, provider_conversation_id, provider_turn_id),
-    CHECK((channel_kind=0 AND channel_participation_id IS NULL) OR (channel_kind=1 AND channel_participation_id IS NOT NULL)),
-    CHECK((author_kind=0 AND author_participation_id IS NULL AND author_profile_id IS NULL AND author_participant_id IS NULL AND author_session_id IS NULL) OR (author_kind=1 AND author_participation_id IS NOT NULL AND author_profile_id IS NOT NULL AND author_participant_id IS NOT NULL AND author_session_id IS NOT NULL) OR (author_kind IN(2,3) AND author_participation_id IS NULL AND author_profile_id IS NULL AND author_participant_id IS NULL AND author_session_id IS NULL)),
-    CHECK((origin_kind=0 AND provider_conversation_id IS NULL AND provider_turn_id IS NULL AND provider_source_kind IS NULL AND provider_source_profile_id IS NULL AND provider_source_participation_id IS NULL AND provider_source_label IS NULL) OR (origin_kind=1 AND provider_conversation_id IS NOT NULL AND provider_turn_id IS NOT NULL AND provider_source_kind IS NOT NULL)),
-    CHECK((provider_source_kind=0 AND provider_source_profile_id IS NOT NULL AND provider_source_participation_id IS NOT NULL) OR (provider_source_kind=1 AND provider_source_profile_id IS NULL AND provider_source_participation_id IS NULL) OR provider_source_kind IS NULL),
-    CHECK((goal_id IS NOT NULL) OR (dag_revision IS NULL AND node_id IS NULL)),
-    CHECK(dag_revision IS NOT NULL OR node_id IS NULL)
-);
-";
-
 const WORKSPACE_MESSAGES_SQL: &str = r"
 CREATE TABLE ops_workspace_messages (
     message_id BLOB PRIMARY KEY NOT NULL CHECK(length(message_id)=16 AND message_id != zeroblob(16)),
@@ -219,29 +106,6 @@ CREATE TABLE ops_workspace_messages (
     CHECK((provider_source_kind=0 AND provider_source_profile_id IS NOT NULL AND provider_source_participation_id IS NOT NULL) OR (provider_source_kind=1 AND provider_source_profile_id IS NULL AND provider_source_participation_id IS NULL) OR provider_source_kind IS NULL),
     CHECK((goal_id IS NOT NULL) OR (dag_revision IS NULL AND node_id IS NULL)),
     CHECK(dag_revision IS NOT NULL OR node_id IS NULL)
-);
-";
-
-const PROVIDER_OUTBOX_SQL_V35: &str = r"
-CREATE TABLE ops_provider_message_outbox (
-    message_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_workspace_messages(message_id) CHECK(length(message_id)=16 AND message_id != zeroblob(16)),
-    workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16),
-    recipient_profile_id BLOB NOT NULL CHECK(length(recipient_profile_id)=16 AND recipient_profile_id != zeroblob(16)),
-    recipient_participation_id BLOB NOT NULL CHECK(length(recipient_participation_id)=16 AND recipient_participation_id != zeroblob(16)),
-    provider_family INTEGER NOT NULL CHECK(provider_family=1),
-    runtime_session_id BLOB NOT NULL CHECK(length(runtime_session_id)=16 AND runtime_session_id != zeroblob(16)),
-    provider_conversation_id TEXT NOT NULL CHECK(length(CAST(provider_conversation_id AS BLOB)) BETWEEN 1 AND 512),
-    state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 5),
-    queued_at_ms INTEGER NOT NULL CHECK(queued_at_ms>=0),
-    last_dispatch_at_ms INTEGER NOT NULL CHECK(last_dispatch_at_ms>=0),
-    updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms>=queued_at_ms),
-    revision INTEGER NOT NULL CHECK(revision>=1),
-    provider_turn_id TEXT CHECK(provider_turn_id IS NULL OR length(CAST(provider_turn_id AS BLOB)) BETWEEN 1 AND 512),
-    provider_body TEXT CHECK(provider_body IS NULL OR length(CAST(provider_body AS BLOB)) BETWEEN 1 AND 16384),
-    CHECK((state=3 AND provider_turn_id IS NOT NULL AND provider_body IS NOT NULL) OR (state!=3 AND provider_turn_id IS NULL AND provider_body IS NULL)),
-    FOREIGN KEY(workspace_id, recipient_profile_id) REFERENCES ops_workspace_participations(workspace_id, agent_profile_id),
-    FOREIGN KEY(workspace_id, recipient_participation_id) REFERENCES ops_workspace_participations(workspace_id, participation_id),
-    FOREIGN KEY(provider_family,runtime_session_id,provider_conversation_id) REFERENCES ops_provider_message_routes(provider_family,runtime_session_id,provider_conversation_id)
 );
 ";
 
@@ -512,36 +376,6 @@ impl ProviderMessageSource {
         Ok(Self::Unknown { label })
     }
 
-    fn validate(&self) -> Result<(), OperationsError> {
-        match self {
-            Self::Known { display_name, .. } => validate_display_name(display_name),
-            Self::Unknown { label } => validate_source_label(label),
-        }
-    }
-
-    fn kind(&self) -> i64 {
-        match self {
-            Self::Known { .. } => 0,
-            Self::Unknown { .. } => 1,
-        }
-    }
-
-    fn profile_id(&self) -> Option<AgentProfileId> {
-        match self {
-            Self::Known { profile_id, .. } => Some(*profile_id),
-            Self::Unknown { .. } => None,
-        }
-    }
-
-    fn participation_id(&self) -> Option<WorkspaceParticipationId> {
-        match self {
-            Self::Known {
-                participation_id, ..
-            } => Some(*participation_id),
-            Self::Unknown { .. } => None,
-        }
-    }
-
     fn display_name(&self) -> &str {
         match self {
             Self::Known { display_name, .. } => display_name,
@@ -596,6 +430,9 @@ impl ProviderMessageTarget {
         runtime_session_id: AgentProfileRuntimeSessionId,
         provider_conversation_id: String,
     ) -> Result<Self, OperationsError> {
+        if provider_family == AgentProfileProviderFamily::Unbound {
+            return Err(OperationsError::ProviderRetired);
+        }
         validate_workspace_id(workspace_id)?;
         validate_provider_id(&provider_conversation_id, "provider conversation identity")?;
         Ok(Self {
@@ -1030,95 +867,20 @@ impl OperationsCatalog {
         Ok(outcome)
     }
 
-    /// Append an internal message and durably enqueue its immutable provider
-    /// target and optional observed node route in one immediate SQLite transaction.
-    /// Replay compares the original witness before mutable route checks. A witness
-    /// records the trusted ingress observation; it does not itself grant authority.
+    /// Retired provider message append-and-enqueue entrypoint.
     ///
     /// # Errors
-    /// Rejects malformed messages, unverified Workspaces, invalid recipients,
-    /// changed replays, route conflicts, bounded provider text, or SQLite
-    /// failures. Any failure rolls back both the append and queue.
+    /// Always returns [`OperationsError::ProviderRetired`] without reading or
+    /// writing the catalog. Use [`Self::append_workspace_message`] for generic
+    /// internal Workspace history.
     pub fn append_and_enqueue_provider_message(
         &mut self,
         command: AppendWorkspaceMessageCommand,
         target: ProviderMessageTarget,
         node_route_witness: Option<NodeMessageRouteWitness>,
     ) -> Result<ProviderMessageQueueOutcome, OperationsError> {
-        let message_id = command.message_id;
-        let workspace_id = command.workspace_id;
-        let queued_at = command.submitted_at;
-        let context = command.context.validate()?;
-        format_provider_message_text(workspace_id, &command.body, context)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_verified_workspace(&transaction, workspace_id, self.destination)?;
-        if let Some(witness) = &node_route_witness
-            && !witness.matches_actor(command.actor)
-        {
-            return Err(OperationsError::Conflict("node message sender replay"));
-        }
-        if let Some(existing_outbox) = load_outbox(&transaction, message_id)? {
-            ensure_target(&existing_outbox.target, &target)?;
-            if existing_outbox.node_route_witness != node_route_witness {
-                return Err(OperationsError::Conflict("provider node route replay"));
-            }
-            let existing_message = load_message(&transaction, message_id)?
-                .ok_or(OperationsError::Corrupt("provider message source missing"))?;
-            ensure_replay_scope(&existing_message, workspace_id, command.channel)?;
-            let same_actor = match (command.actor, &existing_message.author) {
-                (OperationalActor::LocalOperator, MessageAuthor::Operator) => true,
-                (
-                    OperationalActor::Participant { session_id, .. },
-                    MessageAuthor::Participant {
-                        session_id: original,
-                        ..
-                    },
-                )
-                | (
-                    OperationalActor::Participant { session_id, .. },
-                    MessageAuthor::NativeParticipant {
-                        session_id: original,
-                        ..
-                    },
-                ) => session_id == *original,
-                _ => false,
-            };
-            if !same_actor
-                || !matches!(existing_message.origin, MessageOrigin::Internal)
-                || existing_message.body != command.body
-                || existing_message.context != command.context
-                || existing_message.submitted_at != command.submitted_at
-                || node_route_witness
-                    .as_ref()
-                    .is_some_and(|witness| !witness.matches_author(&existing_message.author))
-            {
-                return Err(OperationsError::Conflict(
-                    "workspace message replay changed",
-                ));
-            }
-            transaction.commit()?;
-            return Ok(ProviderMessageQueueOutcome {
-                outbox: existing_outbox,
-                created: false,
-            });
-        }
-        append_workspace_message_in_transaction(&transaction, self.destination, command)?;
-        let outcome = enqueue_provider_message_in_transaction(
-            &transaction,
-            self.destination,
-            EnqueueProviderMessageCommand {
-                message_id,
-                target,
-                queued_at,
-                node_route_witness,
-            },
-        )?;
-        transaction
-            .commit()
-            .map_err(|source| operation_commit_unconfirmed(workspace_id, message_id, source))?;
-        Ok(outcome)
+        let _ = (command, target, node_route_witness);
+        Err(OperationsError::ProviderRetired)
     }
 
     /// Read a stable sequence page for a channel or an exact node thread.
@@ -1331,27 +1093,16 @@ impl OperationsCatalog {
         Ok(message)
     }
 
-    /// Queue an already persisted internal message for one immutable provider
-    /// target.  Queueing returns `Queued`; it is never a send acknowledgement.
+    /// Retired provider outbox enqueue entrypoint.
     ///
     /// # Errors
-    /// Rejects an unverified Workspace, wrong recipient, provider route reuse,
-    /// non-internal source, changed target or SQLite failures.
+    /// Always returns [`OperationsError::ProviderRetired`] without reading or
+    /// writing the catalog.
     pub fn enqueue_provider_message(
         &mut self,
-        command: EnqueueProviderMessageCommand,
+        _command: EnqueueProviderMessageCommand,
     ) -> Result<ProviderMessageQueueOutcome, OperationsError> {
-        let message_id = command.message_id;
-        let workspace_id = command.target.workspace_id;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let outcome =
-            enqueue_provider_message_in_transaction(&transaction, self.destination, command)?;
-        transaction
-            .commit()
-            .map_err(|source| operation_commit_unconfirmed(workspace_id, message_id, source))?;
-        Ok(outcome)
+        Err(OperationsError::ProviderRetired)
     }
 
     /// Read an outbox row by stable message identity.
@@ -1373,165 +1124,38 @@ impl OperationsCatalog {
         Ok(outbox)
     }
 
-    /// Release one queued provider Execute permit or inspect an existing
-    /// pending/unknown operation.  The CAS makes Execute at-most-once per row.
+    /// Retired provider message dispatch entrypoint.
     ///
     /// # Errors
-    /// Rejects stale clocks, unverified routes, malformed rows or SQLite
-    /// failures; unknown commits remain inspect-only.
+    /// Always returns [`OperationsError::ProviderRetired`] without reading or
+    /// writing the catalog.
     pub fn next_provider_message_dispatch(
         &mut self,
         observed_at: TimestampMillis,
     ) -> Result<Option<ProviderMessageDispatchOutcome>, OperationsError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(message_id) = eligible_outbox_message(&transaction, None)? else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-        let existing = load_outbox(&transaction, message_id)?
-            .ok_or(OperationsError::Corrupt("provider queued readback"))?;
-        require_verified_workspace(&transaction, existing.target.workspace_id, self.destination)?;
-        if existing.state == ProviderMessageState::Queued
-            && governance::expire_queued_invitation(&transaction, message_id, observed_at)?
-        {
-            let outbox = load_outbox(&transaction, message_id)?
-                .ok_or(OperationsError::Corrupt("expired invitation readback"))?;
-            let dispatch = dispatch_for(&outbox, ProviderMessageDispatchAction::Inspect);
-            transaction.commit().map_err(|source| {
-                operation_commit_unconfirmed(outbox.target.workspace_id, message_id, source)
-            })?;
-            return Ok(Some(ProviderMessageDispatchOutcome { outbox, dispatch }));
-        }
-        validate_recipient(&transaction, &existing.target)?;
-        let action = if existing.state == ProviderMessageState::Queued {
-            if observed_at < existing.updated_at {
-                return Err(OperationsError::Conflict("provider dispatch clock"));
-            }
-            let revision = next_revision(existing.revision)?;
-            let changed = transaction.execute(
-                "UPDATE ops_provider_message_outbox SET state=2,updated_at_ms=?1,last_dispatch_at_ms=MAX(last_dispatch_at_ms,?1),revision=?2 WHERE message_id=?3 AND revision=?4 AND state=1",
-                params![
-                    observed_at.get(),
-                    signed_revision(revision)?,
-                    message_id.as_bytes(),
-                    signed_revision(existing.revision)?,
-                ],
-            )?;
-            if changed != 1 {
-                return Err(OperationsError::Conflict("provider dispatch CAS"));
-            }
-            ProviderMessageDispatchAction::Execute
-        } else {
-            transaction.execute(
-                "UPDATE ops_provider_message_outbox SET last_dispatch_at_ms=MAX(last_dispatch_at_ms,?1) WHERE message_id=?2 AND state IN(2,5)",
-                params![observed_at.get(), message_id.as_bytes()],
-            )?;
-            ProviderMessageDispatchAction::Inspect
-        };
-        let outbox = load_outbox(&transaction, message_id)?
-            .ok_or(OperationsError::Corrupt("provider dispatch update"))?;
-        let dispatch = dispatch_for(&outbox, action);
-        transaction.commit().map_err(|source| {
-            operation_commit_unconfirmed(outbox.target.workspace_id, message_id, source)
-        })?;
-        Ok(Some(ProviderMessageDispatchOutcome { outbox, dispatch }))
+        let _ = observed_at;
+        Err(OperationsError::ProviderRetired)
     }
 
-    /// Return the dispatch decision for one exact message identity.
+    /// Retired direct provider message dispatch entrypoint.
     ///
     /// # Errors
-    /// Rejects a nil identity, stale clocks, unverified routes, malformed rows
-    /// or SQLite failures.
+    /// Always returns [`OperationsError::ProviderRetired`] without reading or
+    /// writing the catalog.
     pub fn provider_message_dispatch(
         &mut self,
         message_id: MessageId,
         observed_at: TimestampMillis,
     ) -> Result<Option<ProviderMessageDispatchOutcome>, OperationsError> {
-        validate_message_id(message_id)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let Some(existing) = load_outbox(&transaction, message_id)? else {
-            transaction.commit()?;
-            return Ok(None);
-        };
-        if existing.state == ProviderMessageState::Queued
-            && eligible_outbox_message(&transaction, Some(message_id))? != Some(message_id)
-        {
-            transaction.commit()?;
-            return Ok(None);
-        }
-        if existing.state == ProviderMessageState::Queued
-            && governance::expire_queued_invitation(&transaction, message_id, observed_at)?
-        {
-            let outbox = load_outbox(&transaction, message_id)?
-                .ok_or(OperationsError::Corrupt("expired invitation readback"))?;
-            let dispatch = dispatch_for(&outbox, ProviderMessageDispatchAction::Inspect);
-            transaction.commit().map_err(|source| {
-                operation_commit_unconfirmed(outbox.target.workspace_id, message_id, source)
-            })?;
-            return Ok(Some(ProviderMessageDispatchOutcome { outbox, dispatch }));
-        }
-        let action = match existing.state {
-            ProviderMessageState::Queued => {
-                require_verified_workspace(
-                    &transaction,
-                    existing.target.workspace_id,
-                    self.destination,
-                )?;
-                validate_recipient(&transaction, &existing.target)?;
-                if observed_at < existing.updated_at {
-                    return Err(OperationsError::Conflict("provider dispatch clock"));
-                }
-                let revision = next_revision(existing.revision)?;
-                let changed = transaction.execute(
-                    "UPDATE ops_provider_message_outbox SET state=2,updated_at_ms=?1,last_dispatch_at_ms=MAX(last_dispatch_at_ms,?1),revision=?2 WHERE message_id=?3 AND revision=?4 AND state=1",
-                    params![
-                        observed_at.get(),
-                        signed_revision(revision)?,
-                        message_id.as_bytes(),
-                        signed_revision(existing.revision)?,
-                    ],
-                )?;
-                if changed != 1 {
-                    return Err(OperationsError::Conflict("provider dispatch CAS"));
-                }
-                ProviderMessageDispatchAction::Execute
-            }
-            ProviderMessageState::EffectPending | ProviderMessageState::Unknown => {
-                require_verified_workspace(
-                    &transaction,
-                    existing.target.workspace_id,
-                    self.destination,
-                )?;
-                validate_recipient(&transaction, &existing.target)?;
-                transaction.execute(
-                    "UPDATE ops_provider_message_outbox SET last_dispatch_at_ms=MAX(last_dispatch_at_ms,?1) WHERE message_id=?2 AND state IN(2,5)",
-                    params![observed_at.get(), message_id.as_bytes()],
-                )?;
-                ProviderMessageDispatchAction::Inspect
-            }
-            ProviderMessageState::Delivered | ProviderMessageState::Failed => {
-                transaction.commit()?;
-                return Ok(None);
-            }
-        };
-        let outbox = load_outbox(&transaction, message_id)?
-            .ok_or(OperationsError::Corrupt("provider dispatch readback"))?;
-        let dispatch = dispatch_for(&outbox, action);
-        transaction.commit().map_err(|source| {
-            operation_commit_unconfirmed(outbox.target.workspace_id, message_id, source)
-        })?;
-        Ok(Some(ProviderMessageDispatchOutcome { outbox, dispatch }))
+        let _ = (message_id, observed_at);
+        Err(OperationsError::ProviderRetired)
     }
 
-    /// Persist an uncertain provider result.  Subsequent dispatch is Inspect.
+    /// Retired provider outcome update entrypoint.
     ///
     /// # Errors
-    /// Rejects a changed target, stale revision/time, invalid lifecycle or
-    /// SQLite failures.
+    /// Always returns [`OperationsError::ProviderRetired`] without reading or
+    /// writing the catalog.
     pub fn mark_provider_message_effect_unknown(
         &mut self,
         message_id: MessageId,
@@ -1539,22 +1163,15 @@ impl OperationsCatalog {
         target: &ProviderMessageTarget,
         observed_at: TimestampMillis,
     ) -> Result<ProviderMessageOutbox, OperationsError> {
-        self.transition_provider_message(
-            message_id,
-            expected_revision,
-            target,
-            observed_at,
-            &[ProviderMessageState::EffectPending],
-            ProviderMessageState::Unknown,
-        )
+        let _ = (message_id, expected_revision, target, observed_at);
+        Err(OperationsError::ProviderRetired)
     }
 
-    /// Persist exact provider public user-turn identity/body and mark the
-    /// outbox delivered.  Target and revision are rechecked in the CAS.
+    /// Retired provider delivery confirmation entrypoint.
     ///
     /// # Errors
-    /// Rejects changed target, body, turn identity, stale revision/time,
-    /// invalid lifecycle, or SQLite failures.
+    /// Always returns [`OperationsError::ProviderRetired`] without reading or
+    /// writing the catalog.
     pub fn confirm_provider_message_delivery(
         &mut self,
         message_id: MessageId,
@@ -1562,65 +1179,15 @@ impl OperationsCatalog {
         receipt: &ProviderMessageDeliveryReceipt,
         observed_at: TimestampMillis,
     ) -> Result<ProviderMessageOutbox, OperationsError> {
-        validate_message_id(message_id)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = load_outbox(&transaction, message_id)?.ok_or(OperationsError::Conflict(
-            "provider receipt message missing",
-        ))?;
-        ensure_target(&existing.target, receipt.target())?;
-        require_verified_workspace(&transaction, existing.target.workspace_id, self.destination)?;
-        validate_recipient(&transaction, &existing.target)?;
-        let message = load_message(&transaction, message_id)?
-            .ok_or(OperationsError::Corrupt("provider receipt source message"))?;
-        let provider_body = provider_message_text(&message)?;
-        if provider_body != receipt.body {
-            return Err(OperationsError::Conflict("provider receipt body"));
-        }
-        if existing.state == ProviderMessageState::Delivered {
-            if existing.receipt.as_ref() == Some(receipt) {
-                transaction.commit()?;
-                return Ok(existing);
-            }
-            return Err(OperationsError::Conflict("provider receipt changed"));
-        }
-        if !matches!(
-            existing.state,
-            ProviderMessageState::EffectPending | ProviderMessageState::Unknown
-        ) {
-            return Err(OperationsError::Conflict("provider receipt state"));
-        }
-        validate_revision_and_time(&existing, expected_revision, observed_at)?;
-        let revision = next_revision(existing.revision)?;
-        let changed = transaction.execute(
-            "UPDATE ops_provider_message_outbox SET state=3,updated_at_ms=?1,revision=?2,provider_turn_id=?3,provider_body=?4 WHERE message_id=?5 AND revision=?6 AND state IN(2,5)",
-            params![
-                observed_at.get(),
-                signed_revision(revision)?,
-                receipt.provider_turn_id(),
-                receipt.body(),
-                message_id.as_bytes(),
-                signed_revision(expected_revision)?,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(OperationsError::Conflict("provider receipt CAS"));
-        }
-        let outbox = load_outbox(&transaction, message_id)?
-            .ok_or(OperationsError::Corrupt("provider receipt readback"))?;
-        transaction.commit().map_err(|source| {
-            operation_commit_unconfirmed(receipt.target().workspace_id, message_id, source)
-        })?;
-        Ok(outbox)
+        let _ = (message_id, expected_revision, receipt, observed_at);
+        Err(OperationsError::ProviderRetired)
     }
 
-    /// Record a definite provider failure after the adapter has inspected the
-    /// exact target.  Failed rows remain durable and are never auto-requeued.
+    /// Retired provider failure update entrypoint.
     ///
     /// # Errors
-    /// Rejects a changed target, stale revision/time, invalid lifecycle or
-    /// SQLite failures.
+    /// Always returns [`OperationsError::ProviderRetired`] without reading or
+    /// writing the catalog.
     pub fn fail_provider_message_delivery(
         &mut self,
         message_id: MessageId,
@@ -1628,17 +1195,8 @@ impl OperationsCatalog {
         target: &ProviderMessageTarget,
         observed_at: TimestampMillis,
     ) -> Result<ProviderMessageOutbox, OperationsError> {
-        self.transition_provider_message(
-            message_id,
-            expected_revision,
-            target,
-            observed_at,
-            &[
-                ProviderMessageState::EffectPending,
-                ProviderMessageState::Unknown,
-            ],
-            ProviderMessageState::Failed,
-        )
+        let _ = (message_id, expected_revision, target, observed_at);
+        Err(OperationsError::ProviderRetired)
     }
 
     /// Cancel an undispatched Queued provider message, permanently excluding it
@@ -1712,183 +1270,16 @@ impl OperationsCatalog {
         Ok(outbox)
     }
 
-    /// Deduplicate one provider public turn by exact conversation + turn
-    /// identity while preserving source attribution and Workspace sequence.
+    /// Retired provider incoming-message entrypoint.
     ///
     /// # Errors
-    /// Rejects unverified Workspaces, wrong source/recipient, route conflicts,
-    /// changed replays, malformed input or SQLite failures.
-    #[allow(clippy::too_many_lines)]
+    /// Always returns [`OperationsError::ProviderRetired`] without reading or
+    /// writing the catalog. Historical provider messages remain readable.
     pub fn record_incoming_provider_message(
         &mut self,
-        command: RecordIncomingProviderMessageCommand,
+        _command: RecordIncomingProviderMessageCommand,
     ) -> Result<IncomingProviderMessageOutcome, OperationsError> {
-        let RecordIncomingProviderMessageCommand {
-            message_id,
-            workspace_id,
-            channel,
-            target,
-            source,
-            provider_turn_id,
-            body,
-            submitted_at,
-            context,
-        } = command;
-        validate_message_id(message_id)?;
-        validate_provider_id(&provider_turn_id, "provider turn identity")?;
-        validate_body(&body)?;
-        source.validate()?;
-        let context = context.validate()?;
-        if target.workspace_id != workspace_id {
-            return Err(OperationsError::Conflict("incoming provider Workspace"));
-        }
-        if target.provider_conversation_id.is_empty() {
-            return Err(OperationsError::Bounds("provider conversation identity"));
-        }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        require_verified_workspace(&transaction, workspace_id, self.destination)?;
-        validate_channel(&transaction, workspace_id, channel)?;
-        validate_recipient(&transaction, &target)?;
-        validate_provider_source(&transaction, workspace_id, &source)?;
-        ensure_incoming_source_target(&target, &source)?;
-        claim_provider_route(&transaction, &target, submitted_at)?;
-        if let Some((existing, confirmed_body)) =
-            load_delivered_provider_turn(&transaction, &target, &provider_turn_id)?
-        {
-            if confirmed_body != body {
-                return Err(OperationsError::Conflict("provider turn body changed"));
-            }
-            ensure_replay_scope(&existing, workspace_id, channel)?;
-            transaction
-                .commit()
-                .map_err(|error| operation_commit_unconfirmed(workspace_id, message_id, error))?;
-            return Ok(IncomingProviderMessageOutcome {
-                message: existing,
-                created: false,
-            });
-        }
-        if let Some(existing) = load_message(&transaction, message_id)? {
-            ensure_replay_scope(&existing, workspace_id, channel)?;
-            ensure_replay_provider(
-                &existing,
-                &target.provider_conversation_id,
-                &provider_turn_id,
-                &source,
-                &body,
-                submitted_at,
-                context,
-            )?;
-            transaction
-                .commit()
-                .map_err(|error| operation_commit_unconfirmed(workspace_id, message_id, error))?;
-            return Ok(IncomingProviderMessageOutcome {
-                message: existing,
-                created: false,
-            });
-        }
-        if let Some(existing) = load_provider_turn(
-            &transaction,
-            workspace_id,
-            &target.provider_conversation_id,
-            &provider_turn_id,
-        )? {
-            if existing.message_id != message_id {
-                return Err(OperationsError::Conflict(
-                    "incoming provider message identity changed",
-                ));
-            }
-            ensure_replay_scope(&existing, workspace_id, channel)?;
-            ensure_replay_provider(
-                &existing,
-                &target.provider_conversation_id,
-                &provider_turn_id,
-                &source,
-                &body,
-                submitted_at,
-                context,
-            )?;
-            transaction
-                .commit()
-                .map_err(|error| operation_commit_unconfirmed(workspace_id, message_id, error))?;
-            return Ok(IncomingProviderMessageOutcome {
-                message: existing,
-                created: false,
-            });
-        }
-        let sequence = next_sequence(&transaction, workspace_id)?;
-        insert_provider_message(
-            &transaction,
-            message_id,
-            workspace_id,
-            channel,
-            &source,
-            &target.provider_conversation_id,
-            &provider_turn_id,
-            &body,
-            sequence,
-            submitted_at,
-            context,
-        )?;
-        let message = load_message(&transaction, message_id)?
-            .ok_or(OperationsError::Corrupt("incoming provider insert"))?;
-        transaction
-            .commit()
-            .map_err(|error| operation_commit_unconfirmed(workspace_id, message_id, error))?;
-        Ok(IncomingProviderMessageOutcome {
-            message,
-            created: true,
-        })
-    }
-
-    fn transition_provider_message(
-        &mut self,
-        message_id: MessageId,
-        expected_revision: u64,
-        target: &ProviderMessageTarget,
-        observed_at: TimestampMillis,
-        expected_states: &[ProviderMessageState],
-        next_state: ProviderMessageState,
-    ) -> Result<ProviderMessageOutbox, OperationsError> {
-        validate_message_id(message_id)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = load_outbox(&transaction, message_id)?.ok_or(OperationsError::Conflict(
-            "provider transition message missing",
-        ))?;
-        ensure_target(&existing.target, target)?;
-        require_verified_workspace(&transaction, existing.target.workspace_id, self.destination)?;
-        validate_recipient(&transaction, &existing.target)?;
-        if existing.state == next_state {
-            transaction.commit()?;
-            return Ok(existing);
-        }
-        if !expected_states.contains(&existing.state) {
-            return Err(OperationsError::Conflict("provider transition state"));
-        }
-        validate_revision_and_time(&existing, expected_revision, observed_at)?;
-        let revision = next_revision(existing.revision)?;
-        let changed = transaction.execute(
-            "UPDATE ops_provider_message_outbox SET state=?1,updated_at_ms=?2,revision=?3 WHERE message_id=?4 AND revision=?5 AND state IN(2,5)",
-            params![
-                encode_state(next_state),
-                observed_at.get(),
-                signed_revision(revision)?,
-                message_id.as_bytes(),
-                signed_revision(expected_revision)?,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(OperationsError::Conflict("provider transition CAS"));
-        }
-        let outbox = load_outbox(&transaction, message_id)?
-            .ok_or(OperationsError::Corrupt("provider transition readback"))?;
-        transaction.commit().map_err(|source| {
-            operation_commit_unconfirmed(target.workspace_id, message_id, source)
-        })?;
-        Ok(outbox)
+        Err(OperationsError::ProviderRetired)
     }
 }
 
@@ -1940,86 +1331,6 @@ fn append_workspace_message_in_transaction(
         created: true,
     })
 }
-
-fn enqueue_provider_message_in_transaction(
-    transaction: &Transaction<'_>,
-    destination: Uuid,
-    command: EnqueueProviderMessageCommand,
-) -> Result<ProviderMessageQueueOutcome, OperationsError> {
-    let EnqueueProviderMessageCommand {
-        message_id,
-        target,
-        queued_at,
-        node_route_witness,
-    } = command;
-    validate_message_id(message_id)?;
-    require_verified_workspace(transaction, target.workspace_id, destination)?;
-    let message = load_message(transaction, message_id)?
-        .ok_or(OperationsError::Conflict("provider message source missing"))?;
-    if message.workspace_id != target.workspace_id {
-        return Err(OperationsError::Conflict("provider message Workspace"));
-    }
-    if !matches!(message.origin, MessageOrigin::Internal) {
-        return Err(OperationsError::Conflict("provider message source origin"));
-    }
-    if let Some(existing) = load_outbox(transaction, message_id)? {
-        ensure_target(&existing.target, &target)?;
-        if existing.node_route_witness != node_route_witness {
-            return Err(OperationsError::Conflict("provider node route replay"));
-        }
-        return Ok(ProviderMessageQueueOutcome {
-            outbox: existing,
-            created: false,
-        });
-    }
-    if message.context.node_id().is_some() != node_route_witness.is_some() {
-        return Err(OperationsError::Conflict(
-            "fresh node message requires exact route witness",
-        ));
-    }
-    let encoded_node_route = node_route_witness
-        .as_ref()
-        .map(NodeMessageRouteWitness::encode)
-        .transpose()?;
-    if let Some(witness) = &node_route_witness {
-        MessageReadScope::Node(message.context).validate()?;
-        let sender_shape = matches!(
-            (&message.author, witness.sender_leadership_revision()),
-            (MessageAuthor::Operator, None)
-                | (
-                    MessageAuthor::Participant { .. } | MessageAuthor::NativeParticipant { .. },
-                    Some(_)
-                )
-        );
-        if !sender_shape {
-            return Err(OperationsError::Conflict("node message sender witness"));
-        }
-        node_route::validate_node_admission(transaction, &message, &target, witness)?;
-    }
-    validate_recipient(transaction, &target)?;
-    claim_provider_route(transaction, &target, queued_at)?;
-    transaction.execute(
-        "INSERT INTO ops_provider_message_outbox(message_id,workspace_id,recipient_profile_id,recipient_participation_id,provider_family,runtime_session_id,provider_conversation_id,state,queued_at_ms,last_dispatch_at_ms,updated_at_ms,revision,provider_turn_id,provider_body,node_route_witness) VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8,0,?8,1,NULL,NULL,?9)",
-        params![
-            message_id.as_bytes(),
-            target.workspace_id.into_uuid().as_bytes(),
-            target.profile_id.into_uuid().as_bytes(),
-            target.participation_id.into_uuid().as_bytes(),
-            encode_provider_family(target.provider_family),
-            target.runtime_session_id.into_uuid().as_bytes(),
-            target.provider_conversation_id(),
-            queued_at.get(),
-            encoded_node_route,
-        ],
-    )?;
-    let outbox = load_outbox(transaction, message_id)?
-        .ok_or(OperationsError::Corrupt("provider message queue insert"))?;
-    Ok(ProviderMessageQueueOutcome {
-        outbox,
-        created: true,
-    })
-}
-
 /// Schema hooks are intentionally exposed for Main's catalog integration.
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
     let mut objects = vec![
@@ -2036,150 +1347,11 @@ pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)
     objects
 }
 
-/// Exact message, outbox and governance schema at catalog versions 32 through 35.
-pub(crate) fn schema_objects_v35() -> Vec<(&'static str, &'static str, &'static str)> {
-    schema_objects()
-        .into_iter()
-        .map(|(kind, name, sql)| {
-            (
-                kind,
-                name,
-                match name {
-                    "ops_workspace_messages" => WORKSPACE_MESSAGES_SQL_V35,
-                    "ops_provider_message_outbox" => PROVIDER_OUTBOX_SQL_V35,
-                    _ => sql,
-                },
-            )
-        })
-        .collect()
-}
-
-/// Exact message/outbox schema at catalog version 46.
-pub(crate) fn schema_objects_v46() -> Vec<(&'static str, &'static str, &'static str)> {
-    schema_objects()
-        .into_iter()
-        .map(|(kind, name, sql)| {
-            (
-                kind,
-                name,
-                if name == "ops_workspace_messages" {
-                    WORKSPACE_MESSAGES_SQL_V46
-                } else {
-                    sql
-                },
-            )
-        })
-        .collect()
-}
-
-/// Preserve legacy messages and add exact Goal-generation/DAG-base provenance.
-pub(crate) fn migrate_v35_to_v36(transaction: &Transaction<'_>) -> Result<(), OperationsError> {
-    transaction.execute_batch(
-        "ALTER TABLE ops_provider_message_outbox ADD COLUMN node_route_witness BLOB CHECK(node_route_witness IS NULL OR (typeof(node_route_witness)='blob' AND length(node_route_witness) BETWEEN 1 AND 2048));\
-         ALTER TABLE ops_workspace_messages ADD COLUMN goal_created_at_ms INTEGER CHECK(goal_created_at_ms IS NULL OR (goal_id IS NOT NULL AND goal_created_at_ms>=0));\
-         ALTER TABLE ops_workspace_messages ADD COLUMN dag_base_goal_revision INTEGER CHECK(dag_base_goal_revision IS NULL OR (dag_revision IS NOT NULL AND dag_base_goal_revision>=1))",
-    )?;
-    Ok(())
-}
-
-/// Add the native message author shape while preserving every v46 message,
-/// outbox reference, explicit index, and trigger.
-///
-/// The catalog migration owner disables foreign-key enforcement around the
-/// rebuild and runs `foreign_key_check` before committing.
-pub(crate) fn migrate_v46_to_v47(transaction: &Transaction<'_>) -> Result<(), OperationsError> {
-    let has_unsupported_author_kind: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM ops_workspace_messages WHERE author_kind NOT IN(0,1,2,3))",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_unsupported_author_kind {
-        return Err(OperationsError::Corrupt(
-            "unsupported v46 workspace message author kind",
-        ));
-    }
-    let preserved_objects = {
-        let mut statement = transaction.prepare(
-            "SELECT sql FROM sqlite_schema WHERE tbl_name='ops_workspace_messages' AND type IN('index','trigger') AND sql IS NOT NULL ORDER BY type,name",
-        )?;
-        statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    transaction.execute_batch(&WORKSPACE_MESSAGES_SQL.replace(
-        "CREATE TABLE ops_workspace_messages ",
-        "CREATE TABLE ops_workspace_messages_v47 ",
-    ))?;
-    transaction.execute(
-        "INSERT INTO ops_workspace_messages_v47(message_id,workspace_id,channel_kind,channel_participation_id,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms,activity_id,goal_id,dag_revision,node_id,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_profile_id,provider_source_participation_id,provider_source_label,goal_created_at_ms,dag_base_goal_revision) SELECT message_id,workspace_id,channel_kind,channel_participation_id,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms,activity_id,goal_id,dag_revision,node_id,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_profile_id,provider_source_participation_id,provider_source_label,goal_created_at_ms,dag_base_goal_revision FROM ops_workspace_messages",
-        [],
-    )?;
-    transaction.execute_batch(
-        "DROP TABLE ops_workspace_messages; ALTER TABLE ops_workspace_messages_v47 RENAME TO ops_workspace_messages;",
-    )?;
-    for object in preserved_objects {
-        transaction.execute_batch(&object)?;
-    }
-    Ok(())
-}
-
-/// Exact message/outbox schema as it existed at catalog version 31.
-/// Historical validators must use this hook rather than the current schema.
-pub(crate) fn schema_objects_v31() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
-        ("table", "ops_provider_message_routes", PROVIDER_ROUTES_SQL),
-        (
-            "table",
-            "ops_workspace_messages",
-            WORKSPACE_MESSAGES_SQL_V31,
-        ),
-        (
-            "table",
-            "ops_provider_message_outbox",
-            PROVIDER_OUTBOX_SQL_V35,
-        ),
-        (
-            "index",
-            "ops_provider_message_outbox_queue_idx",
-            OUTBOX_TARGET_INDEX,
-        ),
-    ]
-}
-
 /// Create the message/outbox tables in an already initialized Operations
-/// catalog.  Catalog version and migration ownership remain with Main.
+/// catalog.
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsError> {
     for (_, _, sql) in schema_objects() {
         connection.execute_batch(sql)?;
-    }
-    Ok(())
-}
-
-/// Upgrade the message table to the catalog-32 System-author shape and add
-/// governance invitations.  Catalog migration owns foreign-key enforcement
-/// state around this helper; this function only performs the transactional
-/// table rebuild and preserves every existing message/outbox row.
-pub(crate) fn migrate_v31_to_v32(transaction: &Transaction<'_>) -> Result<(), OperationsError> {
-    let has_system_author: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ops_workspace_messages') WHERE name='message_id') AND instr(COALESCE((SELECT sql FROM sqlite_schema WHERE type='table' AND name='ops_workspace_messages'),''),'author_kind IN(0,1,2,3)') > 0",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_system_author {
-        transaction.execute_batch(&WORKSPACE_MESSAGES_SQL_V35.replace(
-            "CREATE TABLE ops_workspace_messages ",
-            "CREATE TABLE ops_workspace_messages_v32 ",
-        ))?;
-        transaction.execute(
-            "INSERT INTO ops_workspace_messages_v32(message_id,workspace_id,channel_kind,channel_participation_id,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms,activity_id,goal_id,dag_revision,node_id,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_profile_id,provider_source_participation_id,provider_source_label) SELECT message_id,workspace_id,channel_kind,channel_participation_id,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms,activity_id,goal_id,dag_revision,node_id,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_profile_id,provider_source_participation_id,provider_source_label FROM ops_workspace_messages",
-            [],
-        )?;
-        transaction.execute_batch(
-            "DROP TABLE ops_workspace_messages; ALTER TABLE ops_workspace_messages_v32 RENAME TO ops_workspace_messages;",
-        )?;
-    }
-    if !governance::table_exists(transaction, "ops_governance_invitations")? {
-        governance::create_schema(transaction)?;
     }
     Ok(())
 }
@@ -2267,126 +1439,6 @@ fn validate_recipient(
         ))
     }
 }
-
-fn claim_provider_route(
-    connection: &Connection,
-    target: &ProviderMessageTarget,
-    observed_at: TimestampMillis,
-) -> Result<(), OperationsError> {
-    let mut statement = connection.prepare(
-        "SELECT substr(workspace_id,1,17),substr(recipient_profile_id,1,17),substr(recipient_participation_id,1,17),substr(runtime_session_id,1,17),provider_conversation_id FROM ops_provider_message_routes WHERE provider_family=?1 AND (runtime_session_id=?2 OR provider_conversation_id=?3)",
-    )?;
-    let rows = statement.query_map(
-        params![
-            encode_provider_family(target.provider_family),
-            target.runtime_session_id.into_uuid().as_bytes(),
-            target.provider_conversation_id(),
-        ],
-        |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Vec<u8>>(3)?,
-                row.get::<_, String>(4)?,
-            ))
-        },
-    )?;
-    for row in rows {
-        let (workspace, profile, participation, runtime_session, conversation) = row?;
-        let workspace = WorkspaceId::from_uuid(decode_uuid(workspace, "provider route Workspace")?);
-        let profile = AgentProfileId::from_uuid(decode_uuid(profile, "provider route profile")?)
-            .map_err(|_| OperationsError::Corrupt("provider route profile"))?;
-        let participation = WorkspaceParticipationId::from_uuid(decode_uuid(
-            participation,
-            "provider route participation",
-        )?)?;
-        let runtime_session = AgentProfileRuntimeSessionId::from_uuid(decode_uuid(
-            runtime_session,
-            "provider route runtime",
-        )?)
-        .map_err(|_| OperationsError::Corrupt("provider route runtime"))?;
-        let same_runtime = runtime_session == target.runtime_session_id;
-        let same_conversation = conversation == target.provider_conversation_id();
-        if same_runtime && same_conversation {
-            if workspace != target.workspace_id {
-                return Err(OperationsError::Conflict("provider route Workspace"));
-            }
-            if profile != target.profile_id || participation != target.participation_id {
-                return Err(OperationsError::Conflict("provider route recipient"));
-            }
-            return Ok(());
-        }
-        if same_runtime {
-            return Err(OperationsError::Conflict("provider route runtime alias"));
-        }
-        if same_conversation {
-            return Err(OperationsError::Conflict(
-                "provider route conversation alias",
-            ));
-        }
-    }
-    drop(statement);
-    connection.execute(
-        "INSERT INTO ops_provider_message_routes(provider_family,runtime_session_id,provider_conversation_id,workspace_id,recipient_profile_id,recipient_participation_id,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-        params![
-            encode_provider_family(target.provider_family),
-            target.runtime_session_id.into_uuid().as_bytes(),
-            target.provider_conversation_id(),
-            target.workspace_id.into_uuid().as_bytes(),
-            target.profile_id.into_uuid().as_bytes(),
-            target.participation_id.into_uuid().as_bytes(),
-            observed_at.get(),
-        ],
-    )?;
-    Ok(())
-}
-
-fn validate_provider_source(
-    connection: &Connection,
-    workspace_id: WorkspaceId,
-    source: &ProviderMessageSource,
-) -> Result<(), OperationsError> {
-    if let ProviderMessageSource::Known {
-        profile_id,
-        participation_id,
-        ..
-    } = source
-    {
-        let present: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM ops_workspace_participations WHERE workspace_id=?1 AND agent_profile_id=?2 AND participation_id=?3)",
-            params![
-                workspace_id.into_uuid().as_bytes(),
-                profile_id.into_uuid().as_bytes(),
-                participation_id.into_uuid().as_bytes(),
-            ],
-            |row| row.get(0),
-        )?;
-        if !present {
-            return Err(OperationsError::Conflict(
-                "provider source Workspace/Participation",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn ensure_incoming_source_target(
-    target: &ProviderMessageTarget,
-    source: &ProviderMessageSource,
-) -> Result<(), OperationsError> {
-    if let ProviderMessageSource::Known {
-        profile_id,
-        participation_id,
-        ..
-    } = source
-        && (*profile_id != target.profile_id || *participation_id != target.participation_id)
-    {
-        return Err(OperationsError::Conflict("incoming provider source target"));
-    }
-    Ok(())
-}
-
 fn ensure_target(
     existing: &ProviderMessageTarget,
     requested: &ProviderMessageTarget,
@@ -2575,38 +1627,6 @@ fn ensure_replay_internal(
     }
     Ok(())
 }
-
-fn ensure_replay_provider(
-    existing: &WorkspaceMessage,
-    conversation_id: &str,
-    turn_id: &str,
-    source: &ProviderMessageSource,
-    body: &str,
-    submitted_at: TimestampMillis,
-    context: MessageContext,
-) -> Result<(), OperationsError> {
-    let matches_origin = matches!(
-        &existing.origin,
-        MessageOrigin::Provider {
-            provider_conversation_id,
-            provider_turn_id,
-            source: existing_source,
-        } if provider_conversation_id == conversation_id
-            && provider_turn_id == turn_id
-            && existing_source == source
-    );
-    if !matches_origin
-        || existing.body != body
-        || existing.submitted_at != submitted_at
-        || existing.context != context
-    {
-        return Err(OperationsError::Conflict(
-            "incoming provider replay changed",
-        ));
-    }
-    Ok(())
-}
-
 fn author_matches_resolved(author: &MessageAuthor, resolved: &ResolvedOperationalActor) -> bool {
     match (author, resolved) {
         (MessageAuthor::Operator, ResolvedOperationalActor::Operator { .. }) => true,
@@ -2712,74 +1732,6 @@ fn insert_internal_message(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn insert_system_message(
-    transaction: &Transaction<'_>,
-    message_id: MessageId,
-    workspace_id: WorkspaceId,
-    channel: MessageChannel,
-    body: &str,
-    sequence: u64,
-    submitted_at: TimestampMillis,
-) -> Result<(), OperationsError> {
-    transaction.execute(
-        "INSERT INTO ops_workspace_messages(message_id,workspace_id,channel_kind,channel_participation_id,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms,activity_id,goal_id,dag_revision,node_id,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_profile_id,provider_source_participation_id,provider_source_label,goal_created_at_ms,dag_base_goal_revision) VALUES(?1,?2,?3,?4,3,NULL,NULL,NULL,NULL,'System',0,?5,?6,?7,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)",
-        params![
-            message_id.as_bytes(),
-            workspace_id.into_uuid().as_bytes(),
-            channel.kind(),
-            channel
-                .participation_id()
-                .map(|value| value.into_uuid().into_bytes().to_vec()),
-            body,
-            signed_counter(sequence)?,
-            submitted_at.get(),
-        ],
-    )?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn insert_provider_message(
-    transaction: &Transaction<'_>,
-    message_id: MessageId,
-    workspace_id: WorkspaceId,
-    channel: MessageChannel,
-    source: &ProviderMessageSource,
-    conversation_id: &str,
-    turn_id: &str,
-    body: &str,
-    sequence: u64,
-    submitted_at: TimestampMillis,
-    context: MessageContext,
-) -> Result<(), OperationsError> {
-    transaction.execute(
-        "INSERT INTO ops_workspace_messages(message_id,workspace_id,channel_kind,channel_participation_id,author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name,origin_kind,body,sequence,submitted_at_ms,activity_id,goal_id,dag_revision,node_id,provider_conversation_id,provider_turn_id,provider_source_kind,provider_source_profile_id,provider_source_participation_id,provider_source_label,goal_created_at_ms,dag_base_goal_revision) VALUES(?1,?2,?3,?4,2,NULL,NULL,NULL,NULL,?5,1,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
-        params![
-            message_id.as_bytes(),
-            workspace_id.into_uuid().as_bytes(),
-            channel.kind(),
-            channel.participation_id().map(|value| value.into_uuid().into_bytes().to_vec()),
-            source.display_name(),
-            body,
-            signed_counter(sequence)?,
-            submitted_at.get(),
-            context.activity_id.map(|value| value.into_uuid().into_bytes().to_vec()),
-            context.goal_id.map(|value| value.into_uuid().into_bytes().to_vec()),
-            context.dag_revision.map(DagRevisionNumber::get),
-            context.node_id.map(|value| value.into_uuid().into_bytes().to_vec()),
-            conversation_id,
-            turn_id,
-            source.kind(),
-            source.profile_id().map(|value| value.into_uuid().into_bytes().to_vec()),
-            source.participation_id().map(|value| value.into_uuid().into_bytes().to_vec()),
-            Some(source.display_name()),
-            context.goal_created_at.map(TimestampMillis::get),
-            context.dag_base_goal_revision.map(GoalRevision::get),
-        ],
-    )?;
-    Ok(())
-}
-
 fn load_message(
     connection: &Connection,
     message_id: MessageId,
@@ -2820,7 +1772,7 @@ fn load_delivered_provider_turn(
                 target.workspace_id.into_uuid().as_bytes(),
                 target.profile_id.into_uuid().as_bytes(),
                 target.participation_id.into_uuid().as_bytes(),
-                encode_provider_family(target.provider_family),
+                encode_provider_family(target.provider_family)?,
                 target.runtime_session_id.into_uuid().as_bytes(),
                 target.provider_conversation_id(),
                 turn_id,
@@ -3234,68 +2186,6 @@ fn load_outbox(
         )
         .optional()?)
 }
-
-fn eligible_outbox_message(
-    connection: &Connection,
-    requested_message_id: Option<MessageId>,
-) -> Result<Option<Uuid>, OperationsError> {
-    let requested = requested_message_id.map(|id| id.as_bytes().to_vec());
-    connection
-        .query_row(
-            "SELECT substr(candidate.message_id,1,17)
-               FROM ops_provider_message_outbox AS candidate
-              WHERE candidate.state IN(1,2,5)
-                AND NOT (
-                    candidate.state=5
-                    AND EXISTS(
-                        SELECT 1 FROM ops_provider_message_unknown_isolations AS isolation
-                         WHERE isolation.message_id=candidate.message_id
-                    )
-                )
-                AND (?1 IS NULL OR candidate.message_id=?1)
-                AND (
-                    candidate.state IN(2,5)
-                    OR (
-                        NOT EXISTS(
-                            SELECT 1 FROM ops_provider_message_outbox AS blocked
-                             WHERE blocked.runtime_session_id=candidate.runtime_session_id
-                               AND blocked.state IN(2,5)
-                        )
-                        AND NOT EXISTS(
-                            SELECT 1 FROM ops_provider_message_outbox AS earlier
-                             WHERE earlier.runtime_session_id=candidate.runtime_session_id
-                               AND earlier.state=1
-                               AND (
-                                    earlier.queued_at_ms < candidate.queued_at_ms
-                                    OR (earlier.queued_at_ms = candidate.queued_at_ms
-                                        AND earlier.message_id < candidate.message_id)
-                               )
-                        )
-                    )
-                )
-              ORDER BY candidate.last_dispatch_at_ms ASC,
-                       candidate.queued_at_ms ASC,
-                       candidate.message_id ASC
-              LIMIT 1",
-            params![requested],
-            |row| decode_uuid(row.get(0)?, "provider eligible message"),
-        )
-        .optional()
-        .map_err(OperationsError::from)
-}
-
-fn dispatch_for(
-    outbox: &ProviderMessageOutbox,
-    action: ProviderMessageDispatchAction,
-) -> ProviderMessageDispatch {
-    ProviderMessageDispatch {
-        message_id: outbox.message_id,
-        revision: outbox.revision,
-        action,
-        target: outbox.target.clone(),
-    }
-}
-
 fn validate_revision_and_time(
     existing: &ProviderMessageOutbox,
     expected_revision: u64,
@@ -3325,9 +2215,10 @@ fn decode_state(value: i64) -> rusqlite::Result<ProviderMessageState> {
     }
 }
 
-fn encode_provider_family(value: AgentProfileProviderFamily) -> i64 {
+fn encode_provider_family(value: AgentProfileProviderFamily) -> Result<i64, OperationsError> {
     match value {
-        AgentProfileProviderFamily::ChatGpt => 1,
+        AgentProfileProviderFamily::ChatGpt => Ok(1),
+        AgentProfileProviderFamily::Unbound => Err(OperationsError::ProviderRetired),
     }
 }
 
@@ -3335,16 +2226,6 @@ fn decode_provider_family(value: i64) -> rusqlite::Result<AgentProfileProviderFa
     match value {
         1 => Ok(AgentProfileProviderFamily::ChatGpt),
         _ => Err(to_sqlite_error(OperationsError::Corrupt("provider family"))),
-    }
-}
-
-fn encode_state(value: ProviderMessageState) -> i64 {
-    match value {
-        ProviderMessageState::Queued => 1,
-        ProviderMessageState::EffectPending => 2,
-        ProviderMessageState::Delivered => 3,
-        ProviderMessageState::Failed => 4,
-        ProviderMessageState::Unknown => 5,
     }
 }
 
@@ -3379,7 +2260,7 @@ mod tests {
     use std::error::Error;
     use std::fs;
 
-    use forge_domain::{AuthenticatedPrincipal, DirectTokenId, TimestampMillis, WorkspaceId};
+    use forge_domain::{AuthenticatedPrincipal, TimestampMillis, WorkspaceId};
     use heterarchy_orchestration_sessions::{AgentProfileId, AgentProfileRuntimeSessionId};
     use rusqlite::params;
 
@@ -3453,168 +2334,6 @@ mod tests {
         TimestampMillis::new(value).map_err(|_| OperationsError::Bounds("test timestamp"))
     }
 
-    fn snapshot_rows(
-        connection: &rusqlite::Connection,
-        query: &str,
-    ) -> Result<Vec<Vec<rusqlite::types::Value>>, Box<dyn Error>> {
-        let mut statement = connection.prepare(query)?;
-        let columns = statement.column_count();
-        let rows = statement
-            .query_map([], |row| {
-                (0..columns)
-                    .map(|column| row.get(column))
-                    .collect::<Result<Vec<_>, _>>()
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    fn seed_node_recipient(
-        fixture: &mut Fixture,
-        context: MessageContext,
-    ) -> Result<(), Box<dyn Error>> {
-        let operation = Uuid::from_u128(0xC101);
-        let participant = Uuid::from_u128(0xC110);
-        let session = Uuid::from_u128(0xC104);
-        let agent = Uuid::from_u128(0xC103);
-        let activity = context.activity_id().ok_or("node Activity missing")?;
-        let request = Uuid::from_u128(0xC111);
-        let connection = &fixture.catalog.connection;
-        connection.execute(
-            "INSERT INTO ops_logical_members(workspace_id,participant_id,session_id,principal_kind,principal_id,display_name,declared_role,transport_kind,membership_revision,created_at_ms) VALUES(?1,?2,?3,0,NULL,'Node target','worker',1,1,1)",
-            params![fixture.workspace.into_uuid().as_bytes(),participant.as_bytes(),session.as_bytes()],
-        )?;
-        connection.execute(
-            "INSERT INTO ops_current_effect_bindings(workspace_id,participant_id,activity_id,session_id,agent_id,source_kind,source_request_id) VALUES(?1,?2,?3,?4,?5,0,?6)",
-            params![fixture.workspace.into_uuid().as_bytes(),participant.as_bytes(),activity.into_uuid().as_bytes(),session.as_bytes(),agent.as_bytes(),operation.as_bytes()],
-        )?;
-        connection.execute(
-            "INSERT INTO ops_workspace_participation_mappings(request_id,workspace_id,participation_id,agent_profile_id,profile_revision,profile_mapping_request_id,session_id,session_revision,participant_id,participant_membership_revision,mapped_at_ms) VALUES(?1,?2,?3,?4,1,?5,?6,1,?7,1,1)",
-            params![Uuid::from_u128(0xC112).as_bytes(),fixture.workspace.into_uuid().as_bytes(),fixture.participation_id.into_uuid().as_bytes(),fixture.profile_id.into_uuid().as_bytes(),operation.as_bytes(),session.as_bytes(),participant.as_bytes()],
-        )?;
-        connection.execute(
-            "INSERT INTO ops_agent_requests(request_id,workspace_id,activity_id,requester_agent_id,requester_session_id,coordinator_revision,objective,capability,requested_count,effect_scope,independence_requirement,reason,state,created_at_ms,revision) VALUES(?1,?2,?3,?4,?5,1,'node','worker',1,0,0,'node conversation',1,1,1)",
-            params![request.as_bytes(),fixture.workspace.into_uuid().as_bytes(),activity.into_uuid().as_bytes(),agent.as_bytes(),session.as_bytes()],
-        )?;
-        connection.execute(
-            "INSERT INTO ops_agent_request_resolutions(request_id,slot_ordinal,resolution_kind,claim_id,profile_id,profile_revision,runtime_session_id,runtime_session_revision,policy_revision,reserved_at_ms) VALUES(?1,0,2,?2,?3,1,?4,1,1,1)",
-            params![request.as_bytes(),Uuid::from_u128(0xC113).as_bytes(),fixture.profile_id.into_uuid().as_bytes(),fixture.runtime_session_id.into_uuid().as_bytes()],
-        )?;
-        connection.execute(
-            "INSERT INTO ops_agent_provision_operations(operation_id,request_id,slot_ordinal,effect_kind,provider_family,profile_id,runtime_session_id,state,provider_conversation_id,prepared_at_ms,updated_at_ms,revision) VALUES(?1,?2,0,1,1,?3,?4,5,'conversation-1',1,1,1)",
-            params![operation.as_bytes(),request.as_bytes(),fixture.profile_id.into_uuid().as_bytes(),fixture.runtime_session_id.into_uuid().as_bytes()],
-        )?;
-        let scope = crate::NodeTeamBindingScope::new(
-            fixture.workspace,
-            activity,
-            context.goal_id().ok_or("node Goal missing")?,
-            context.goal_created_at().ok_or("node creation missing")?,
-            context.dag_revision().ok_or("node DAG missing")?,
-            context
-                .dag_base_goal_revision()
-                .ok_or("node DAG base missing")?,
-            context.node_id().ok_or("node ID missing")?,
-        )?;
-        let _receipt =
-            fixture
-                .catalog
-                .record_assignment_affinity(&crate::AssignmentAffinityCommand {
-                    workspace_id: fixture.workspace,
-                    assignment_id: forge_domain::AgentAssignmentId::from_uuid(Uuid::from_u128(
-                        0xC102,
-                    )),
-                    activity_id: activity,
-                    target_agent_id: forge_domain::AgentInstanceId::from_uuid(agent),
-                    target_session_id: forge_domain::AgentSessionId::from_uuid(session),
-                    expected_target_principal: forge_domain::AuthenticatedPrincipal::TrustedStdio,
-                    requester: OperationalActor::LocalOperator,
-                    team_id: None,
-                    assignment_payload_fingerprint: [0xC1; 32],
-                    original_offer_payload: b"fixture-offer".to_vec(),
-                    observed_at: time(100)?,
-                    node_scope: scope,
-                    expected_binding_revision: None,
-                })?;
-        Ok(())
-    }
-
-    fn confirm_node_workspace_leader(
-        fixture: &mut Fixture,
-        context: MessageContext,
-    ) -> Result<i64, Box<dyn Error>> {
-        let activity_id = context.activity_id().ok_or("node Activity missing")?;
-        let assignment_id = forge_domain::AgentAssignmentId::from_uuid(Uuid::from_u128(0xC102));
-        let agent_id = forge_domain::AgentInstanceId::from_uuid(Uuid::from_u128(0xC103));
-        let session_id = forge_domain::AgentSessionId::from_uuid(Uuid::from_u128(0xC104));
-        let migration_id: Vec<u8> = fixture.catalog.connection.query_row(
-            "SELECT migration_id FROM ops_imports WHERE workspace_id=?1 AND phase=2 LIMIT 1",
-            params![fixture.workspace.into_uuid().as_bytes()],
-            |row| row.get(0),
-        )?;
-        fixture.catalog.connection.execute(
-            "INSERT INTO ops_effect_fact_consumers(migration_id,workspace_id,destination_id,last_sequence,applied_count) VALUES(?1,?2,?3,0,0)",
-            params![
-                migration_id.as_slice(),
-                fixture.workspace.into_uuid().as_bytes(),
-                fixture.destination.as_bytes(),
-            ],
-        )?;
-        fixture.catalog.connection.execute(
-            "INSERT INTO ops_assignment_offer_projection(migration_id,source_sequence,fact_digest,assignment_id,workspace_id,activity_id,goal_id,node_id,target_agent_id,target_session_id,credit_budget,offered_at_ms) VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,100)",
-            params![
-                migration_id.as_slice(),
-                [0xC1_u8; 32].as_slice(),
-                assignment_id.into_uuid().as_bytes(),
-                fixture.workspace.into_uuid().as_bytes(),
-                activity_id.into_uuid().as_bytes(),
-                context.goal_id().ok_or("node Goal missing")?.into_uuid().as_bytes(),
-                context.node_id().ok_or("node ID missing")?.into_uuid().as_bytes(),
-                agent_id.into_uuid().as_bytes(),
-                session_id.into_uuid().as_bytes(),
-            ],
-        )?;
-        {
-            let transaction = fixture.catalog.connection.transaction()?;
-            crate::leadership::bootstrap_from_offer(
-                &transaction,
-                crate::leadership::OfferBootstrapObservation {
-                    workspace_id: fixture.workspace,
-                    activity_id,
-                    assignment_id,
-                    target_agent_id: agent_id,
-                    offered_at_ms: 100,
-                },
-            )?;
-            transaction.commit()?;
-        }
-        let scope = crate::LeadershipScope::workspace(fixture.workspace);
-        let bootstrapped = fixture
-            .catalog
-            .leadership_scope_view(scope, 100)?
-            .ok_or("Workspace leadership bootstrap missing")?;
-        assert_eq!(bootstrapped.state(), crate::LeadershipState::Bootstrapping);
-        let confirmed =
-            fixture
-                .catalog
-                .confirm_bootstrap_evidence(crate::ConfirmBootstrapEvidenceCommand {
-                    scope,
-                    assignment_id,
-                    expected_revision: bootstrapped.leadership_revision(),
-                    now_ms: 101,
-                })?;
-        assert_eq!(confirmed.state(), crate::LeadershipState::Stabilizing);
-        let authority = fixture
-            .catalog
-            .current_leadership_authority(scope)?
-            .ok_or("confirmed Workspace leader authority missing")?;
-        assert_eq!(authority.participant_id(), Uuid::from_u128(0xC110));
-        assert_eq!(
-            authority.leadership_revision(),
-            confirmed.leadership_revision()
-        );
-        Ok(authority.leadership_revision())
-    }
-
     fn append(
         catalog: &mut OperationsCatalog,
         workspace: WorkspaceId,
@@ -3653,30 +2372,6 @@ mod tests {
         })
     }
 
-    fn append_and_enqueue(
-        catalog: &mut OperationsCatalog,
-        workspace: WorkspaceId,
-        message_id: MessageId,
-        body: &str,
-        context: MessageContext,
-        target: ProviderMessageTarget,
-        submitted_at: i64,
-    ) -> Result<ProviderMessageQueueOutcome, OperationsError> {
-        catalog.append_and_enqueue_provider_message(
-            AppendWorkspaceMessageCommand {
-                message_id,
-                workspace_id: workspace,
-                channel: MessageChannel::Workspace,
-                actor: OperationalActor::LocalOperator,
-                body: body.to_owned(),
-                submitted_at: time(submitted_at)?,
-                context,
-            },
-            target,
-            None,
-        )
-    }
-
     fn insert_recipient(
         fixture: &Fixture,
     ) -> Result<
@@ -3701,29 +2396,41 @@ mod tests {
         Ok((profile_id, participation_id, runtime_session_id))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn incoming(
-        catalog: &mut OperationsCatalog,
+    fn seed_outbox_row(
+        fixture: &Fixture,
         message_id: MessageId,
-        workspace: WorkspaceId,
-        target: ProviderMessageTarget,
-        source: ProviderMessageSource,
-        turn_id: &str,
-        body: &str,
-        submitted_at: i64,
-        context: MessageContext,
-    ) -> Result<IncomingProviderMessageOutcome, OperationsError> {
-        catalog.record_incoming_provider_message(RecordIncomingProviderMessageCommand {
-            message_id,
-            workspace_id: workspace,
-            channel: MessageChannel::Workspace,
-            target,
-            source,
-            provider_turn_id: turn_id.to_owned(),
-            body: body.to_owned(),
-            submitted_at: time(submitted_at)?,
-            context,
-        })
+        target: &ProviderMessageTarget,
+        state: i64,
+        revision: i64,
+        last_dispatch_at_ms: i64,
+        updated_at_ms: i64,
+    ) -> Result<(), Box<dyn Error>> {
+        fixture.catalog.connection.execute(
+            "INSERT INTO ops_provider_message_routes(provider_family,runtime_session_id,provider_conversation_id,workspace_id,recipient_profile_id,recipient_participation_id,created_at_ms) VALUES(1,?1,?2,?3,?4,?5,10)",
+            params![
+                target.runtime_session_id().into_uuid().as_bytes(),
+                target.provider_conversation_id(),
+                target.workspace_id().into_uuid().as_bytes(),
+                target.profile_id().into_uuid().as_bytes(),
+                target.participation_id().into_uuid().as_bytes(),
+            ],
+        )?;
+        fixture.catalog.connection.execute(
+            "INSERT INTO ops_provider_message_outbox(message_id,workspace_id,recipient_profile_id,recipient_participation_id,provider_family,runtime_session_id,provider_conversation_id,state,queued_at_ms,last_dispatch_at_ms,updated_at_ms,revision,provider_turn_id,provider_body,node_route_witness) VALUES(?1,?2,?3,?4,1,?5,?6,?7,10,?8,?9,?10,NULL,NULL,NULL)",
+            params![
+                message_id.as_bytes(),
+                target.workspace_id().into_uuid().as_bytes(),
+                target.profile_id().into_uuid().as_bytes(),
+                target.participation_id().into_uuid().as_bytes(),
+                target.runtime_session_id().into_uuid().as_bytes(),
+                target.provider_conversation_id(),
+                state,
+                last_dispatch_at_ms,
+                updated_at_ms,
+                revision,
+            ],
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -3759,282 +2466,253 @@ mod tests {
         Ok(())
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "One durable fixture proves append rollback, exact node route replay, reopen and corrupt witness rejection."
-    )]
-    #[test]
-    fn append_and_enqueue_is_atomic_and_replays_by_message_identity() -> Result<(), Box<dyn Error>>
-    {
-        let mut fixture = fixture()?;
-        let target = fixture.target()?;
-        let message_id = Uuid::now_v7();
-        let first = append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            message_id,
-            "hello",
-            MessageContext::default(),
-            target.clone(),
-            10,
-        )?;
-        assert!(first.created());
-        let replay = append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            message_id,
-            "hello",
-            MessageContext::default(),
-            target,
-            10,
-        )?;
-        assert!(!replay.created());
-        assert_eq!(replay.outbox(), first.outbox());
-
-        let wrong_target = ProviderMessageTarget::new(
-            fixture.workspace,
-            fixture.profile_id,
-            WorkspaceParticipationId::from_uuid(Uuid::now_v7())?,
-            fixture.runtime_session_id,
-            "conversation-rollback".to_owned(),
-        )?;
-        let rejected = append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            Uuid::now_v7(),
-            "must rollback",
-            MessageContext::default(),
-            wrong_target,
-            11,
-        );
-        assert!(rejected.is_err());
-        let messages = fixture.catalog.read_workspace_messages(
-            fixture.workspace,
-            MessageReadScope::Channel(MessageChannel::Workspace),
-            None,
-            MAX_MESSAGE_PAGE_SIZE,
-        )?;
-        assert_eq!(messages.messages().len(), 1);
-        // Node routing is captured before delivery and survives exact replay.
-        let witness = NodeMessageRouteWitness::new(
-            Uuid::from_u128(0xC101),
-            1,
-            2,
-            OperationalActor::LocalOperator,
-            None,
-            NodeMessageRouteTarget::Agent {
-                assignment_id: Uuid::from_u128(0xC102),
-                assignment_revision: 3,
-                agent_id: Uuid::from_u128(0xC103),
-                session_id: Uuid::from_u128(0xC104),
-            },
-        )?;
-        assert!(
+    fn assert_retired_enqueue_dispatch_writers(
+        fixture: &mut Fixture,
+        historical_message_id: MessageId,
+        new_message_id: MessageId,
+        target: &ProviderMessageTarget,
+    ) -> Result<(), Box<dyn Error>> {
+        assert!(matches!(
+            fixture.catalog.append_and_enqueue_provider_message(
+                AppendWorkspaceMessageCommand {
+                    message_id: new_message_id,
+                    workspace_id: fixture.workspace,
+                    channel: MessageChannel::Workspace,
+                    actor: OperationalActor::LocalOperator,
+                    body: "must not append or enqueue".to_owned(),
+                    submitted_at: time(20)?,
+                    context: MessageContext::default(),
+                },
+                target.clone(),
+                None,
+            ),
+            Err(OperationsError::ProviderRetired)
+        ));
+        assert!(matches!(
             fixture
                 .catalog
                 .enqueue_provider_message(EnqueueProviderMessageCommand {
-                    message_id,
-                    target: first.outbox().target().clone(),
-                    queued_at: time(12)?,
-                    node_route_witness: Some(witness.clone()),
-                })
-                .is_err()
-        );
-        let command = AppendWorkspaceMessageCommand {
-            message_id: Uuid::from_u128(0xC105),
-            workspace_id: fixture.workspace,
-            channel: MessageChannel::Direct(fixture.participation_id),
-            actor: OperationalActor::LocalOperator,
-            body: "steer exact node".to_owned(),
-            submitted_at: time(112)?,
-            context: MessageContext::new(
-                Some(ActivityId::from_uuid(Uuid::from_u128(0xC106))),
-                Some(GoalId::from_uuid(Uuid::from_u128(0xC107))),
-                Some(time(99)?),
-                Some(DagRevisionNumber::INITIAL),
-                Some(GoalRevision::INITIAL),
-                Some(DagNodeId::from_uuid(Uuid::from_u128(0xC108))),
-            )?,
-        };
-        assert!(matches!(
-            fixture.catalog.append_and_enqueue_provider_message(
-                command.clone(),
-                fixture.target()?,
-                None,
-            ),
-            Err(OperationsError::Conflict(
-                "fresh node message requires exact route witness"
-            ))
+                    node_route_witness: None,
+                    message_id: historical_message_id,
+                    target: target.clone(),
+                    queued_at: time(20)?,
+                }),
+            Err(OperationsError::ProviderRetired)
         ));
-        assert!(
-            fixture
-                .catalog
-                .workspace_message(command.message_id)?
-                .is_none()
-        );
-        seed_node_recipient(&mut fixture, command.context)?;
-        let sender_actor = OperationalActor::Participant {
-            activity_id: command.context.activity_id().ok_or("Activity missing")?,
-            agent_id: forge_domain::AgentInstanceId::from_uuid(Uuid::from_u128(0xC103)),
-            session_id: forge_domain::AgentSessionId::from_uuid(Uuid::from_u128(0xC104)),
-        };
-        let mut unauthorized = command.clone();
-        unauthorized.message_id = Uuid::now_v7();
-        unauthorized.actor = sender_actor;
-        let unauthorized_witness = NodeMessageRouteWitness::new(
-            witness.operation_id(),
-            witness.participation_revision(),
-            witness.runtime_revision(),
-            sender_actor,
-            Some(1),
-            witness.target(),
-        )?;
         assert!(matches!(
-            fixture.catalog.append_and_enqueue_provider_message(
-                unauthorized.clone(),
-                fixture.target()?,
-                Some(unauthorized_witness),
-            ),
-            Err(OperationsError::Conflict("node message sender leadership"))
+            fixture.catalog.next_provider_message_dispatch(time(20)?),
+            Err(OperationsError::ProviderRetired)
         ));
-        assert!(
+        assert!(matches!(
             fixture
                 .catalog
-                .workspace_message(unauthorized.message_id)?
-                .is_none()
-        );
-        let sender_leadership_revision =
-            confirm_node_workspace_leader(&mut fixture, command.context)?;
-        let mut participant_command = command.clone();
-        participant_command.actor = sender_actor;
-        let participant_witness = NodeMessageRouteWitness::new(
-            witness.operation_id(),
-            witness.participation_revision(),
-            witness.runtime_revision(),
-            sender_actor,
-            Some(sender_leadership_revision),
-            witness.target(),
-        )?;
-        let node_first = fixture.catalog.append_and_enqueue_provider_message(
-            participant_command.clone(),
-            fixture.target()?,
-            Some(participant_witness.clone()),
-        )?;
-        assert_eq!(
-            node_first.outbox().node_route_witness(),
-            Some(&participant_witness)
-        );
-        assert!(node_first.outbox().receipt().is_none());
-        // The sender's Ready binding also sustains the Workspace leader proof.
-        // Removing it must not change an exact replay's durable witness/outbox.
-        fixture.catalog.connection.execute(
-            "DELETE FROM ops_current_effect_bindings WHERE workspace_id=?1",
-            params![fixture.workspace.into_uuid().as_bytes()],
-        )?;
-        let mut stale = participant_command.clone();
-        stale.message_id = Uuid::now_v7();
-        assert!(
-            fixture
-                .catalog
-                .append_and_enqueue_provider_message(
-                    stale.clone(),
-                    fixture.target()?,
-                    Some(participant_witness.clone()),
-                )
-                .is_err()
-        );
-        assert!(
-            fixture
-                .catalog
-                .workspace_message(stale.message_id)?
-                .is_none()
-        );
-        let node_replay = fixture.catalog.append_and_enqueue_provider_message(
-            participant_command.clone(),
-            fixture.target()?,
-            Some(participant_witness.clone()),
-        )?;
-        assert!(!node_replay.created());
-        assert_eq!(node_replay.outbox(), node_first.outbox());
+                .provider_message_dispatch(historical_message_id, time(20)?),
+            Err(OperationsError::ProviderRetired)
+        ));
+        Ok(())
+    }
 
-        let mut changed_actor_command = participant_command.clone();
-        changed_actor_command.actor = OperationalActor::Participant {
-            activity_id: ActivityId::from_uuid(Uuid::from_u128(0xC120)),
-            agent_id: forge_domain::AgentInstanceId::from_uuid(Uuid::from_u128(0xC121)),
-            session_id: forge_domain::AgentSessionId::from_uuid(Uuid::from_u128(0xC104)),
-        };
+    fn assert_retired_provider_receipt_writers(
+        fixture: &mut Fixture,
+        historical_message_id: MessageId,
+        target: &ProviderMessageTarget,
+    ) -> Result<(), Box<dyn Error>> {
         assert!(matches!(
-            fixture.catalog.append_and_enqueue_provider_message(
-                changed_actor_command,
-                fixture.target()?,
-                Some(participant_witness.clone()),
+            fixture.catalog.mark_provider_message_effect_unknown(
+                historical_message_id,
+                7,
+                target,
+                time(20)?,
             ),
-            Err(OperationsError::Conflict("node message sender replay"))
+            Err(OperationsError::ProviderRetired)
         ));
-        assert!(
-            fixture
-                .catalog
-                .append_and_enqueue_provider_message(
-                    participant_command.clone(),
-                    fixture.target()?,
-                    None,
-                )
-                .is_err()
-        );
-        let changed_witness = NodeMessageRouteWitness::new(
-            participant_witness.operation_id(),
-            participant_witness.participation_revision(),
-            participant_witness.runtime_revision(),
-            sender_actor,
-            Some(sender_leadership_revision),
-            NodeMessageRouteTarget::Team {
-                team_id: Uuid::from_u128(0xC109),
-                binding_revision: 1,
-                leadership_revision: 4,
-            },
+        let receipt = ProviderMessageDeliveryReceipt::new(
+            target.clone(),
+            "turn-retired".to_owned(),
+            "body-retired".to_owned(),
         )?;
-        assert!(
-            fixture
-                .catalog
-                .append_and_enqueue_provider_message(
-                    participant_command.clone(),
-                    fixture.target()?,
-                    Some(changed_witness),
-                )
-                .is_err()
-        );
-        let reopened = OperationsCatalog::open(&fixture.path, fixture.catalog.destination_id())?;
+        assert!(matches!(
+            fixture.catalog.confirm_provider_message_delivery(
+                historical_message_id,
+                7,
+                &receipt,
+                time(20)?,
+            ),
+            Err(OperationsError::ProviderRetired)
+        ));
+        assert!(matches!(
+            fixture.catalog.fail_provider_message_delivery(
+                historical_message_id,
+                7,
+                target,
+                time(20)?,
+            ),
+            Err(OperationsError::ProviderRetired)
+        ));
+        assert!(matches!(
+            fixture.catalog.record_incoming_provider_message(
+                RecordIncomingProviderMessageCommand {
+                    message_id: Uuid::now_v7(),
+                    workspace_id: fixture.workspace,
+                    channel: MessageChannel::Workspace,
+                    target: target.clone(),
+                    source: ProviderMessageSource::unknown("retired".to_owned())?,
+                    provider_turn_id: "turn-incoming".to_owned(),
+                    body: "must not append".to_owned(),
+                    submitted_at: time(20)?,
+                    context: MessageContext::default(),
+                },
+            ),
+            Err(OperationsError::ProviderRetired)
+        ));
+        let isolation = ProviderMessageUnknownIsolationCommand::new(
+            Uuid::now_v7(),
+            historical_message_id,
+            7,
+            target.clone(),
+            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown,
+            AuthenticatedPrincipal::TrustedStdio,
+            time(20)?,
+        )?;
+        assert!(matches!(
+            fixture.catalog.isolate_unknown_provider_message(&isolation),
+            Err(OperationsError::ProviderRetired)
+        ));
+        assert!(matches!(
+            fixture.catalog.cancel_queued_provider_message(
+                historical_message_id,
+                7,
+                target,
+                time(20)?,
+            ),
+            Err(OperationsError::Conflict("provider cancel state"))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn retired_provider_writers_preserve_unknown_outbox_and_generic_history()
+    -> Result<(), Box<dyn Error>> {
+        let mut fixture = fixture()?;
+        let target = fixture.target()?;
+        let historical_message_id = Uuid::now_v7();
+        append(
+            &mut fixture.catalog,
+            fixture.workspace,
+            historical_message_id,
+            "historical internal message",
+            10,
+        )?;
+        seed_outbox_row(&fixture, historical_message_id, &target, 5, 7, 15, 15)?;
+        let before_outbox = fixture
+            .catalog
+            .provider_message_outbox(historical_message_id)?
+            .ok_or("historical UNKNOWN outbox missing")?;
+        assert_eq!(before_outbox.state(), ProviderMessageState::Unknown);
+        assert_eq!(before_outbox.revision(), 7);
+        let before_routes: i64 = fixture.catalog.connection.query_row(
+            "SELECT COUNT(*) FROM ops_provider_message_routes",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let new_message_id = Uuid::now_v7();
+        assert_retired_enqueue_dispatch_writers(
+            &mut fixture,
+            historical_message_id,
+            new_message_id,
+            &target,
+        )?;
+        assert_retired_provider_receipt_writers(&mut fixture, historical_message_id, &target)?;
+
+        let generic_message_id = Uuid::now_v7();
+        append(
+            &mut fixture.catalog,
+            fixture.workspace,
+            generic_message_id,
+            "generic internal message still appends",
+            21,
+        )?;
+        let rows_after: i64 = fixture.catalog.connection.query_row(
+            "SELECT COUNT(*) FROM ops_provider_message_routes",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rows_after, before_routes);
+        assert!(fixture.catalog.workspace_message(new_message_id)?.is_none());
         assert_eq!(
-            reopened
-                .provider_message_outbox(command.message_id)?
-                .ok_or("node outbox missing after reopen")?
-                .node_route_witness(),
-            Some(&participant_witness)
-        );
-        drop(reopened);
-        fixture
-            .catalog
-            .connection
-            .execute_batch("SAVEPOINT corrupt_node_route")?;
-        fixture.catalog.connection.execute(
-            "UPDATE ops_provider_message_outbox SET node_route_witness=X'00' WHERE message_id=?1",
-            params![command.message_id.as_bytes()],
-        )?;
-        assert!(
             fixture
                 .catalog
-                .provider_message_outbox(command.message_id)
-                .is_err()
+                .provider_message_outbox(historical_message_id)?,
+            Some(before_outbox)
         );
-        fixture
-            .catalog
-            .connection
-            .execute_batch("ROLLBACK TO corrupt_node_route; RELEASE corrupt_node_route")?;
+        assert_eq!(
+            fixture
+                .catalog
+                .workspace_message(historical_message_id)?
+                .ok_or("historical message missing")?
+                .body(),
+            "historical internal message"
+        );
+        assert_eq!(
+            fixture
+                .catalog
+                .workspace_message(generic_message_id)?
+                .ok_or("generic message missing")?
+                .body(),
+            "generic internal message still appends"
+        );
         fixture.cleanup()?;
         Ok(())
     }
 
     #[test]
+    fn queued_provider_message_can_only_be_cancelled_before_dispatch() -> Result<(), Box<dyn Error>>
+    {
+        let mut fixture = fixture()?;
+        let message_id = Uuid::now_v7();
+        let target = fixture.target()?;
+        append(
+            &mut fixture.catalog,
+            fixture.workspace,
+            message_id,
+            "queued history",
+            10,
+        )?;
+        seed_outbox_row(&fixture, message_id, &target, 1, 1, 0, 10)?;
+
+        let cancelled =
+            fixture
+                .catalog
+                .cancel_queued_provider_message(message_id, 1, &target, time(20)?)?;
+        assert_eq!(cancelled.state(), ProviderMessageState::Failed);
+        assert_eq!(cancelled.revision(), 2);
+        assert_eq!(cancelled.last_dispatch_at().get(), 0);
+        assert_eq!(
+            fixture
+                .catalog
+                .workspace_message(message_id)?
+                .ok_or("message missing")?
+                .body(),
+            "queued history"
+        );
+        assert!(matches!(
+            fixture.catalog.next_provider_message_dispatch(time(25)?),
+            Err(OperationsError::ProviderRetired)
+        ));
+        assert_eq!(
+            fixture.catalog.provider_message_outbox(message_id)?,
+            Some(cancelled)
+        );
+        fixture.cleanup()?;
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Checks generic message context formatting readback."
+    )]
     fn provider_text_formatter_preserves_plain_body_and_adds_exact_context()
     -> Result<(), Box<dyn Error>> {
         let mut fixture = fixture()?;
@@ -4131,120 +2809,6 @@ mod tests {
                 fixture.workspace, goal, node
             )
         );
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn provider_receipt_must_match_formatted_context_body() -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let target = fixture.target()?;
-        let context = MessageContext::new(
-            Some(ActivityId::from_uuid(Uuid::from_u128(0xAB03))),
-            Some(GoalId::from_uuid(Uuid::from_u128(0xAB01))),
-            Some(time(321)?),
-            Some(DagRevisionNumber::INITIAL),
-            Some(GoalRevision::INITIAL),
-            Some(DagNodeId::from_uuid(Uuid::from_u128(0xAB02))),
-        )?;
-        let message_id = Uuid::now_v7();
-        seed_node_recipient(&mut fixture, context)?;
-        let queued = fixture.catalog.append_and_enqueue_provider_message(
-            AppendWorkspaceMessageCommand {
-                message_id,
-                workspace_id: fixture.workspace,
-                channel: MessageChannel::Direct(fixture.participation_id),
-                actor: OperationalActor::LocalOperator,
-                body: "body".to_owned(),
-                submitted_at: time(10)?,
-                context,
-            },
-            target.clone(),
-            Some(NodeMessageRouteWitness::new(
-                Uuid::from_u128(0xC101),
-                1,
-                2,
-                OperationalActor::LocalOperator,
-                None,
-                NodeMessageRouteTarget::Agent {
-                    assignment_id: Uuid::from_u128(0xC102),
-                    assignment_revision: 3,
-                    agent_id: Uuid::from_u128(0xC103),
-                    session_id: Uuid::from_u128(0xC104),
-                },
-            )?),
-        )?;
-        let execute = fixture
-            .catalog
-            .next_provider_message_dispatch(time(11)?)?
-            .ok_or("missing provider execute")?;
-        assert_eq!(execute.outbox().revision(), queued.outbox().revision() + 1);
-        let raw_receipt = ProviderMessageDeliveryReceipt::new(
-            target.clone(),
-            "turn-raw".to_owned(),
-            "body".to_owned(),
-        )?;
-        assert!(
-            fixture
-                .catalog
-                .confirm_provider_message_delivery(
-                    message_id,
-                    execute.outbox().revision(),
-                    &raw_receipt,
-                    time(12)?,
-                )
-                .is_err()
-        );
-        let message = fixture
-            .catalog
-            .workspace_message(message_id)?
-            .ok_or("message missing")?;
-        let formatted = provider_message_text(&message)?;
-        let receipt =
-            ProviderMessageDeliveryReceipt::new(target, "turn-formatted".to_owned(), formatted)?;
-        let delivered = fixture.catalog.confirm_provider_message_delivery(
-            message_id,
-            execute.outbox().revision(),
-            &receipt,
-            time(13)?,
-        )?;
-        assert_eq!(delivered.state(), ProviderMessageState::Delivered);
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn formatted_provider_body_bound_rejects_before_atomic_enqueue() -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let context = MessageContext::new(
-            None,
-            Some(GoalId::from_uuid(Uuid::from_u128(0xAC01))),
-            None,
-            Some(DagRevisionNumber::INITIAL),
-            None,
-            Some(DagNodeId::from_uuid(Uuid::from_u128(0xAC02))),
-        )?;
-        let target = fixture.target()?;
-        let rejected = append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            Uuid::now_v7(),
-            &"x".repeat(MAX_MESSAGE_BODY_BYTES - 1),
-            context,
-            target,
-            10,
-        );
-        assert!(matches!(
-            rejected,
-            Err(OperationsError::Bounds("message body"))
-        ));
-        let page = fixture.catalog.read_workspace_messages(
-            fixture.workspace,
-            MessageReadScope::Channel(MessageChannel::Workspace),
-            None,
-            MAX_MESSAGE_PAGE_SIZE,
-        )?;
-        assert!(page.messages().is_empty());
         fixture.cleanup()?;
         Ok(())
     }
@@ -4619,1356 +3183,6 @@ mod tests {
                 )
                 .is_err()
         );
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn dispatch_fairness_blocks_same_runtime_but_allows_other_runtime() -> Result<(), Box<dyn Error>>
-    {
-        let mut fixture = fixture()?;
-        let (profile_b, participation_b, runtime_b) = insert_recipient(&fixture)?;
-        let target_a = fixture.target()?;
-        let target_b = ProviderMessageTarget::new(
-            fixture.workspace,
-            profile_b,
-            participation_b,
-            runtime_b,
-            "conversation-b".to_owned(),
-        )?;
-        let a1 = Uuid::now_v7();
-        let a2 = Uuid::now_v7();
-        let b1 = Uuid::now_v7();
-        let b2 = Uuid::now_v7();
-        append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            a1,
-            "a1",
-            MessageContext::default(),
-            target_a.clone(),
-            20,
-        )?;
-        append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            a2,
-            "a2",
-            MessageContext::default(),
-            target_a.clone(),
-            21,
-        )?;
-        append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            b1,
-            "b1",
-            MessageContext::default(),
-            target_b.clone(),
-            20,
-        )?;
-        append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            b2,
-            "b2",
-            MessageContext::default(),
-            target_b.clone(),
-            21,
-        )?;
-
-        let first = fixture
-            .catalog
-            .provider_message_dispatch(a1, time(22)?)?
-            .ok_or("missing first runtime A dispatch")?;
-        assert_eq!(
-            first.dispatch().action(),
-            ProviderMessageDispatchAction::Execute
-        );
-        let unknown_a = fixture.catalog.mark_provider_message_effect_unknown(
-            a1,
-            first.outbox().revision(),
-            &target_a,
-            time(23)?,
-        )?;
-
-        let a2_blocked = fixture.catalog.provider_message_dispatch(a2, time(24)?)?;
-        assert!(
-            a2_blocked.is_none(),
-            "same-runtime queued work bypassed Unknown"
-        );
-
-        let second = fixture
-            .catalog
-            .next_provider_message_dispatch(time(25)?)?
-            .ok_or("different runtime did not progress")?;
-        assert_eq!(second.outbox().message_id(), b1);
-        assert_eq!(
-            second.dispatch().action(),
-            ProviderMessageDispatchAction::Execute
-        );
-
-        let b2_blocked = fixture.catalog.provider_message_dispatch(b2, time(26)?)?;
-        assert!(
-            b2_blocked.is_none(),
-            "same-runtime queue order was bypassed"
-        );
-
-        let inspection = fixture
-            .catalog
-            .provider_message_dispatch(a1, time(27)?)?
-            .ok_or("missing Unknown inspection")?;
-        assert_eq!(
-            inspection.dispatch().action(),
-            ProviderMessageDispatchAction::Inspect
-        );
-        assert_eq!(inspection.dispatch().revision(), unknown_a.revision());
-        assert_eq!(inspection.outbox().last_dispatch_at(), time(27)?);
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn unknown_isolation_receipt_is_fenced_immutable_and_replayable_after_delivery()
-    -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let target = fixture.target()?;
-        let message_id = Uuid::from_u128(0xA901);
-        append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            message_id,
-            "preserve this uncertain message",
-            MessageContext::default(),
-            target.clone(),
-            10,
-        )?;
-        let execute = fixture
-            .catalog
-            .provider_message_dispatch(message_id, time(11)?)?
-            .ok_or("missing provider Execute")?;
-        let unknown = fixture.catalog.mark_provider_message_effect_unknown(
-            message_id,
-            execute.outbox().revision(),
-            &target,
-            time(12)?,
-        )?;
-        let original_outbox = fixture
-            .catalog
-            .provider_message_outbox(message_id)?
-            .ok_or("missing UNKNOWN outbox")?;
-        let original_message = fixture
-            .catalog
-            .workspace_message(message_id)?
-            .ok_or("missing Workspace message")?;
-        let principal =
-            AuthenticatedPrincipal::DirectToken(DirectTokenId::from_uuid(Uuid::from_u128(0xA902)));
-        let request_id = Uuid::from_u128(0xA903);
-        let command = ProviderMessageUnknownIsolationCommand::new(
-            request_id,
-            message_id,
-            unknown.revision(),
-            target.clone(),
-            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown,
-            principal,
-            time(13)?,
-        )?;
-
-        let wrong_target = ProviderMessageTarget::new(
-            fixture.workspace,
-            fixture.profile_id,
-            fixture.participation_id,
-            fixture.runtime_session_id,
-            "another-conversation".to_owned(),
-        )?;
-        let wrong_target_command = ProviderMessageUnknownIsolationCommand::new(
-            Uuid::from_u128(0xA904),
-            message_id,
-            unknown.revision(),
-            wrong_target,
-            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown,
-            principal,
-            time(13)?,
-        )?;
-        assert!(
-            fixture
-                .catalog
-                .isolate_unknown_provider_message(&wrong_target_command)
-                .is_err()
-        );
-
-        let receipt = fixture.catalog.isolate_unknown_provider_message(&command)?;
-        assert_eq!(receipt.request_id(), request_id);
-        assert_eq!(receipt.message_id(), message_id);
-        assert_eq!(receipt.expected_revision(), unknown.revision());
-        assert_eq!(receipt.expected_target(), &target);
-        assert_eq!(receipt.principal(), principal);
-        assert_eq!(receipt.acknowledged_at(), time(13)?);
-        assert_eq!(
-            fixture.catalog.isolate_unknown_provider_message(&command)?,
-            receipt
-        );
-        assert_eq!(
-            fixture
-                .catalog
-                .provider_message_unknown_isolation(message_id, Some(request_id))?,
-            Some(receipt.clone())
-        );
-        assert_eq!(
-            fixture
-                .catalog
-                .provider_message_unknown_isolation(message_id, None)?,
-            Some(receipt.clone())
-        );
-        assert!(
-            fixture
-                .catalog
-                .provider_message_unknown_isolation(Uuid::from_u128(0xA905), Some(request_id))
-                .is_err()
-        );
-        assert_eq!(
-            fixture.catalog.provider_message_outbox(message_id)?,
-            Some(original_outbox)
-        );
-        assert_eq!(
-            fixture.catalog.workspace_message(message_id)?,
-            Some(original_message)
-        );
-
-        let changed_request = ProviderMessageUnknownIsolationCommand::new(
-            request_id,
-            message_id,
-            unknown.revision() + 1,
-            target.clone(),
-            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown,
-            principal,
-            time(13)?,
-        )?;
-        assert!(
-            fixture
-                .catalog
-                .isolate_unknown_provider_message(&changed_request)
-                .is_err()
-        );
-        let second_request = ProviderMessageUnknownIsolationCommand::new(
-            Uuid::from_u128(0xA906),
-            message_id,
-            unknown.revision(),
-            target.clone(),
-            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown,
-            principal,
-            time(13)?,
-        )?;
-        assert!(
-            fixture
-                .catalog
-                .isolate_unknown_provider_message(&second_request)
-                .is_err()
-        );
-
-        let delivery = ProviderMessageDeliveryReceipt::new(
-            target,
-            "provider-turn-after-isolation".to_owned(),
-            "preserve this uncertain message".to_owned(),
-        )?;
-        let delivered = fixture.catalog.confirm_provider_message_delivery(
-            message_id,
-            unknown.revision(),
-            &delivery,
-            time(14)?,
-        )?;
-        assert_eq!(delivered.state(), ProviderMessageState::Delivered);
-        assert_eq!(
-            fixture
-                .catalog
-                .provider_message_unknown_isolation(message_id, Some(request_id))?,
-            Some(receipt.clone())
-        );
-        assert_eq!(
-            fixture.catalog.isolate_unknown_provider_message(&command)?,
-            receipt
-        );
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn isolated_unknown_leaves_same_runtime_queue_blocked_and_other_runtime_moving()
-    -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let (profile_b, participation_b, runtime_b) = insert_recipient(&fixture)?;
-        let target_a = fixture.target()?;
-        let target_b = ProviderMessageTarget::new(
-            fixture.workspace,
-            profile_b,
-            participation_b,
-            runtime_b,
-            "conversation-b".to_owned(),
-        )?;
-        let a1 = Uuid::from_u128(0xA911);
-        let a2 = Uuid::from_u128(0xA912);
-        let b1 = Uuid::from_u128(0xA913);
-        for (message_id, body, target, queued_at) in [
-            (a1, "a1", target_a.clone(), 20),
-            (a2, "a2", target_a.clone(), 21),
-            (b1, "b1", target_b, 20),
-        ] {
-            append_and_enqueue(
-                &mut fixture.catalog,
-                fixture.workspace,
-                message_id,
-                body,
-                MessageContext::default(),
-                target,
-                queued_at,
-            )?;
-        }
-
-        let execute_a1 = fixture
-            .catalog
-            .provider_message_dispatch(a1, time(22)?)?
-            .ok_or("missing runtime A Execute")?;
-        let unknown_a1 = fixture.catalog.mark_provider_message_effect_unknown(
-            a1,
-            execute_a1.outbox().revision(),
-            &target_a,
-            time(23)?,
-        )?;
-        let command = ProviderMessageUnknownIsolationCommand::new(
-            Uuid::from_u128(0xA914),
-            a1,
-            unknown_a1.revision(),
-            target_a,
-            ProviderMessageUnknownIsolationReason::OperatorAcknowledgedUnknown,
-            AuthenticatedPrincipal::TrustedStdio,
-            time(24)?,
-        )?;
-        fixture.catalog.isolate_unknown_provider_message(&command)?;
-
-        let in_flight = fixture.catalog.provider_message_in_flight_page(None, 32)?;
-        assert!(
-            !in_flight
-                .outboxes
-                .iter()
-                .any(|outbox| outbox.message_id() == a1)
-        );
-        assert!(
-            fixture
-                .catalog
-                .provider_message_dispatch(a2, time(25)?)?
-                .is_none()
-        );
-        let other_runtime = fixture
-            .catalog
-            .next_provider_message_dispatch(time(26)?)?
-            .ok_or("different runtime did not progress")?;
-        assert_eq!(other_runtime.outbox().message_id(), b1);
-        assert_eq!(
-            other_runtime.dispatch().action(),
-            ProviderMessageDispatchAction::Execute
-        );
-
-        let late_inspection = fixture
-            .catalog
-            .provider_message_dispatch(a1, time(27)?)?
-            .ok_or("isolated UNKNOWN lost exact inspection")?;
-        assert_eq!(
-            late_inspection.dispatch().action(),
-            ProviderMessageDispatchAction::Inspect
-        );
-        assert_eq!(late_inspection.dispatch().revision(), unknown_a1.revision());
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn v50_upgrade_adds_isolation_schema_without_rewriting_message_rows()
-    -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let target = fixture.target()?;
-        let message_id = Uuid::from_u128(0xA921);
-        append_and_enqueue(
-            &mut fixture.catalog,
-            fixture.workspace,
-            message_id,
-            "legacy uncertain body",
-            MessageContext::default(),
-            target.clone(),
-            10,
-        )?;
-        let execute = fixture
-            .catalog
-            .provider_message_dispatch(message_id, time(11)?)?
-            .ok_or("missing migration fixture Execute")?;
-        fixture.catalog.mark_provider_message_effect_unknown(
-            message_id,
-            execute.outbox().revision(),
-            &target,
-            time(12)?,
-        )?;
-        let workspace_rows_before = snapshot_rows(
-            &fixture.catalog.connection,
-            "SELECT * FROM ops_workspace_messages ORDER BY message_id",
-        )?;
-        let outbox_rows_before = snapshot_rows(
-            &fixture.catalog.connection,
-            "SELECT * FROM ops_provider_message_outbox ORDER BY message_id",
-        )?;
-
-        crate::import_handoff::drop_schema_for_legacy_fixture(&fixture.catalog.connection)?;
-        fixture.catalog.connection.execute_batch(
-            "DROP TRIGGER ops_provider_message_unknown_isolations_no_update;
-             DROP TRIGGER ops_provider_message_unknown_isolations_no_delete;
-             DROP TABLE ops_provider_message_unknown_isolations;
-             PRAGMA user_version=50;",
-        )?;
-        let path = fixture.path.clone();
-        let destination = fixture.destination;
-        drop(fixture.catalog);
-
-        let upgraded = OperationsCatalog::open(&path, destination)?;
-        let version: i64 = upgraded
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, crate::catalog::VERSION);
-        assert_eq!(
-            snapshot_rows(
-                &upgraded.connection,
-                "SELECT * FROM ops_workspace_messages ORDER BY message_id",
-            )?,
-            workspace_rows_before
-        );
-        assert_eq!(
-            snapshot_rows(
-                &upgraded.connection,
-                "SELECT * FROM ops_provider_message_outbox ORDER BY message_id",
-            )?,
-            outbox_rows_before
-        );
-        let after = upgraded
-            .provider_message_outbox(message_id)?
-            .ok_or("migration removed UNKNOWN outbox")?;
-        assert_eq!(after.state(), ProviderMessageState::Unknown);
-        assert_eq!(after.revision(), 3);
-        drop(upgraded);
-        fs::remove_file(path)?;
-        Ok(())
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn provider_dispatch_is_execute_once_then_inspect_and_unknown_is_durable()
-    -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let message_id = Uuid::now_v7();
-        append(
-            &mut fixture.catalog,
-            fixture.workspace,
-            message_id,
-            "hello",
-            10,
-        )?;
-        let target = fixture.target()?;
-        let queued = fixture
-            .catalog
-            .enqueue_provider_message(EnqueueProviderMessageCommand {
-                node_route_witness: None,
-                message_id,
-                target: target.clone(),
-                queued_at: time(11)?,
-            })?;
-        assert!(queued.created());
-        assert_eq!(queued.outbox().state(), ProviderMessageState::Queued);
-        let execute = fixture
-            .catalog
-            .next_provider_message_dispatch(time(12)?)?
-            .ok_or("missing Execute")?;
-        assert_eq!(
-            execute.dispatch().action(),
-            ProviderMessageDispatchAction::Execute
-        );
-        assert_eq!(
-            execute.outbox().state(),
-            ProviderMessageState::EffectPending
-        );
-        let changes = fixture.catalog.connection.total_changes();
-        let observed = fixture.catalog.provider_message_in_flight_page(None, 1)?;
-        assert_eq!(observed.outboxes, vec![execute.outbox().clone()]);
-        assert!(observed.next_message_id.is_none());
-        assert_eq!(fixture.catalog.connection.total_changes(), changes);
-        let inspect = fixture
-            .catalog
-            .next_provider_message_dispatch(time(13)?)?
-            .ok_or("missing Inspect")?;
-        assert_eq!(
-            inspect.dispatch().action(),
-            ProviderMessageDispatchAction::Inspect
-        );
-        assert_eq!(inspect.dispatch().revision(), execute.dispatch().revision());
-        let changed_target = ProviderMessageTarget::new(
-            fixture.workspace,
-            fixture.profile_id,
-            fixture.participation_id,
-            fixture.runtime_session_id,
-            "conversation-2".to_owned(),
-        )?;
-        assert!(
-            fixture
-                .catalog
-                .mark_provider_message_effect_unknown(
-                    message_id,
-                    execute.dispatch().revision(),
-                    &changed_target,
-                    time(14)?,
-                )
-                .is_err()
-        );
-        let unknown = fixture.catalog.mark_provider_message_effect_unknown(
-            message_id,
-            execute.dispatch().revision(),
-            &target,
-            time(15)?,
-        )?;
-        assert_eq!(unknown.state(), ProviderMessageState::Unknown);
-        let inspect_after_unknown = fixture
-            .catalog
-            .next_provider_message_dispatch(time(16)?)?
-            .ok_or("missing unknown Inspect")?;
-        assert_eq!(
-            inspect_after_unknown.dispatch().action(),
-            ProviderMessageDispatchAction::Inspect
-        );
-        let receipt =
-            ProviderMessageDeliveryReceipt::new(target, "turn-1".to_owned(), "hello".to_owned())?;
-        let delivered = fixture.catalog.confirm_provider_message_delivery(
-            message_id,
-            unknown.revision(),
-            &receipt,
-            time(17)?,
-        )?;
-        assert_eq!(delivered.state(), ProviderMessageState::Delivered);
-        let changed_receipt = ProviderMessageDeliveryReceipt::new(
-            receipt.target().clone(),
-            "turn-2".to_owned(),
-            "hello".to_owned(),
-        )?;
-        assert!(
-            fixture
-                .catalog
-                .confirm_provider_message_delivery(
-                    message_id,
-                    delivered.revision(),
-                    &changed_receipt,
-                    time(18)?,
-                )
-                .is_err()
-        );
-        let captured = incoming(
-            &mut fixture.catalog,
-            Uuid::now_v7(),
-            fixture.workspace,
-            receipt.target().clone(),
-            ProviderMessageSource::known(
-                fixture.profile_id,
-                fixture.participation_id,
-                "Agent".to_owned(),
-            )?,
-            "turn-1",
-            "hello",
-            19,
-            MessageContext::default(),
-        )?;
-        assert!(!captured.created());
-        assert_eq!(captured.message().message_id(), message_id);
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    fn assert_turn_observation_is_read_only(
-        fixture: &Fixture,
-        target: &ProviderMessageTarget,
-        expected: &WorkspaceMessage,
-    ) -> Result<(), Box<dyn Error>> {
-        let changes = fixture.catalog.connection.total_changes();
-        let observed = fixture
-            .catalog
-            .incoming_provider_turn(target, "turn-1")?
-            .ok_or("recorded turn readback missing")?;
-        assert_eq!(&observed.message, expected);
-        assert_eq!(observed.observed_body, expected.body());
-        assert!(
-            fixture
-                .catalog
-                .incoming_provider_turn(target, "absent-turn")?
-                .is_none()
-        );
-        assert_eq!(fixture.catalog.connection.total_changes(), changes);
-        Ok(())
-    }
-
-    #[test]
-    fn incoming_provider_turn_dedupes_and_preserves_goal_generation() -> Result<(), Box<dyn Error>>
-    {
-        let mut fixture = fixture()?;
-        let target = fixture.target()?;
-        let source = ProviderMessageSource::unknown("unattributed provider".to_owned())?;
-        let message_id = Uuid::now_v7();
-        let context = MessageContext::new(
-            Some(ActivityId::from_uuid(Uuid::from_u128(0xCE01))),
-            Some(GoalId::from_uuid(Uuid::from_u128(0xCE02))),
-            Some(time(222)?),
-            Some(DagRevisionNumber::INITIAL),
-            Some(GoalRevision::INITIAL),
-            Some(DagNodeId::from_uuid(Uuid::from_u128(0xCE03))),
-        )?;
-        let first = incoming(
-            &mut fixture.catalog,
-            message_id,
-            fixture.workspace,
-            target.clone(),
-            source.clone(),
-            "turn-1",
-            "incoming",
-            10,
-            context,
-        )?;
-        assert!(first.created());
-        assert_turn_observation_is_read_only(&fixture, &target, first.message())?;
-        let duplicate = incoming(
-            &mut fixture.catalog,
-            message_id,
-            fixture.workspace,
-            target.clone(),
-            source.clone(),
-            "turn-1",
-            "incoming",
-            10,
-            context,
-        )?;
-        assert!(!duplicate.created());
-        assert_eq!(duplicate.message(), first.message());
-        let changed_body = incoming(
-            &mut fixture.catalog,
-            message_id,
-            fixture.workspace,
-            target.clone(),
-            source.clone(),
-            "turn-1",
-            "changed",
-            10,
-            context,
-        );
-        assert!(changed_body.is_err());
-        let another_generation = MessageContext::new(
-            context.activity_id(),
-            context.goal_id(),
-            Some(time(223)?),
-            context.dag_revision(),
-            context.dag_base_goal_revision(),
-            context.node_id(),
-        )?;
-        let changed_generation = incoming(
-            &mut fixture.catalog,
-            message_id,
-            fixture.workspace,
-            target.clone(),
-            source.clone(),
-            "turn-1",
-            "incoming",
-            10,
-            another_generation,
-        );
-        assert!(changed_generation.is_err());
-
-        let changed_id = incoming(
-            &mut fixture.catalog,
-            Uuid::now_v7(),
-            fixture.workspace,
-            target,
-            source,
-            "turn-1",
-            "incoming",
-            10,
-            context,
-        );
-        assert!(changed_id.is_err());
-        assert_eq!(first.message().context(), context);
-        let reopened = OperationsCatalog::open(&fixture.path, fixture.destination)?;
-        let reread = reopened
-            .workspace_message(message_id)?
-            .ok_or("incoming provider message missing after reopen")?;
-        assert_eq!(reread.context(), context);
-        drop(reopened);
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn wrong_provider_recipient_is_rejected() -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let message_id = Uuid::now_v7();
-        append(
-            &mut fixture.catalog,
-            fixture.workspace,
-            message_id,
-            "hello",
-            10,
-        )?;
-        let wrong_participation = WorkspaceParticipationId::from_uuid(Uuid::now_v7())?;
-        let target = ProviderMessageTarget::new(
-            fixture.workspace,
-            fixture.profile_id,
-            wrong_participation,
-            fixture.runtime_session_id,
-            "conversation-1".to_owned(),
-        )?;
-        assert!(
-            fixture
-                .catalog
-                .enqueue_provider_message(EnqueueProviderMessageCommand {
-                    node_route_witness: None,
-                    message_id,
-                    target,
-                    queued_at: time(11)?,
-                })
-                .is_err()
-        );
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn provider_route_rejects_cross_workspace_reuse() -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let first_message = Uuid::now_v7();
-        append(
-            &mut fixture.catalog,
-            fixture.workspace,
-            first_message,
-            "first",
-            10,
-        )?;
-        let target = fixture.target()?;
-        fixture
-            .catalog
-            .enqueue_provider_message(EnqueueProviderMessageCommand {
-                node_route_witness: None,
-                message_id: first_message,
-                target: target.clone(),
-                queued_at: time(11)?,
-            })?;
-
-        let second_workspace = WorkspaceId::from_uuid(Uuid::now_v7());
-        let second_participation = WorkspaceParticipationId::from_uuid(Uuid::now_v7())?;
-        fixture.catalog.connection.execute(
-            "INSERT INTO ops_imports(migration_id,workspace_id,destination_id,source_revision,phase,next_cursor,page_count,record_count,import_digest,verified_pages,verify_digest) VALUES(?1,?2,?3,1,2,NULL,5,0,?4,5,?4)",
-            params![
-                Uuid::now_v7().as_bytes(),
-                second_workspace.into_uuid().as_bytes(),
-                fixture.destination.as_bytes(),
-                [0_u8; 32].as_slice(),
-            ],
-        )?;
-        fixture.catalog.connection.execute(
-            "INSERT INTO ops_workspace_participations(workspace_id,agent_profile_id,participation_id,created_at_ms,revision) VALUES(?1,?2,?3,0,1)",
-            params![
-                second_workspace.into_uuid().as_bytes(),
-                fixture.profile_id.into_uuid().as_bytes(),
-                second_participation.into_uuid().as_bytes(),
-            ],
-        )?;
-        let second_message = Uuid::now_v7();
-        append(
-            &mut fixture.catalog,
-            second_workspace,
-            second_message,
-            "second",
-            12,
-        )?;
-        let runtime_alias_target = ProviderMessageTarget::new(
-            second_workspace,
-            fixture.profile_id,
-            second_participation,
-            fixture.runtime_session_id,
-            "conversation-2".to_owned(),
-        )?;
-        let runtime_alias =
-            fixture
-                .catalog
-                .enqueue_provider_message(EnqueueProviderMessageCommand {
-                    node_route_witness: None,
-                    message_id: second_message,
-                    target: runtime_alias_target,
-                    queued_at: time(12)?,
-                });
-        assert!(matches!(
-            runtime_alias,
-            Err(OperationsError::Conflict("provider route runtime alias"))
-        ));
-        let second_runtime = AgentProfileRuntimeSessionId::from_uuid(Uuid::now_v7())?;
-        let conversation_alias_target = ProviderMessageTarget::new(
-            second_workspace,
-            fixture.profile_id,
-            second_participation,
-            second_runtime,
-            "conversation-1".to_owned(),
-        )?;
-        let conversation_alias =
-            fixture
-                .catalog
-                .enqueue_provider_message(EnqueueProviderMessageCommand {
-                    node_route_witness: None,
-                    message_id: second_message,
-                    target: conversation_alias_target,
-                    queued_at: time(12)?,
-                });
-        assert!(matches!(
-            conversation_alias,
-            Err(OperationsError::Conflict(
-                "provider route conversation alias"
-            ))
-        ));
-        let cross_workspace_target = ProviderMessageTarget::new(
-            second_workspace,
-            fixture.profile_id,
-            second_participation,
-            fixture.runtime_session_id,
-            "conversation-1".to_owned(),
-        )?;
-        let cross_workspace =
-            fixture
-                .catalog
-                .enqueue_provider_message(EnqueueProviderMessageCommand {
-                    node_route_witness: None,
-                    message_id: second_message,
-                    target: cross_workspace_target,
-                    queued_at: time(13)?,
-                });
-        assert!(cross_workspace.is_err());
-
-        let repeated_message = Uuid::now_v7();
-        append(
-            &mut fixture.catalog,
-            fixture.workspace,
-            repeated_message,
-            "repeat",
-            14,
-        )?;
-        let repeated = fixture
-            .catalog
-            .enqueue_provider_message(EnqueueProviderMessageCommand {
-                node_route_witness: None,
-                message_id: repeated_message,
-                target,
-                queued_at: time(15)?,
-            })?;
-        assert!(repeated.created());
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn cancel_queued_provider_message_lifecycle_and_exclusion() -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let message_id = Uuid::now_v7();
-        let target = fixture.target()?;
-
-        append(
-            &mut fixture.catalog,
-            fixture.workspace,
-            message_id,
-            "test cancel message",
-            10,
-        )?;
-        let queued = fixture
-            .catalog
-            .enqueue_provider_message(EnqueueProviderMessageCommand {
-                node_route_witness: None,
-                message_id,
-                target: target.clone(),
-                queued_at: time(10)?,
-            })?;
-        assert!(queued.created());
-
-        // Verify initially queued
-        let initial_outbox = fixture
-            .catalog
-            .provider_message_outbox(message_id)?
-            .ok_or_else(|| std::io::Error::other("outbox row missing after enqueue"))?;
-        assert_eq!(initial_outbox.state(), ProviderMessageState::Queued);
-        assert_eq!(initial_outbox.revision(), 1);
-        assert_eq!(initial_outbox.last_dispatch_at().get(), 0);
-
-        // Cancel the queued message
-        let canceled =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(message_id, 1, &target, time(20)?)?;
-        assert_eq!(canceled.state(), ProviderMessageState::Failed);
-        assert_eq!(canceled.revision(), 2);
-        assert_eq!(canceled.updated_at().get(), 20);
-        assert_eq!(canceled.last_dispatch_at().get(), 0);
-
-        // Verification: excluded from eligible_outbox_message and dispatch
-        let next_dispatch = fixture.catalog.next_provider_message_dispatch(time(25)?)?;
-        assert!(next_dispatch.is_none());
-
-        let direct_dispatch = fixture
-            .catalog
-            .provider_message_dispatch(message_id, time(25)?)?;
-        assert!(direct_dispatch.is_none());
-
-        // Idempotency: calling cancel again with original expected_revision (1) or new revision (2)
-        let retry_orig =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(message_id, 1, &target, time(25)?)?;
-        assert_eq!(retry_orig.state(), ProviderMessageState::Failed);
-        assert_eq!(retry_orig.revision(), 2);
-
-        let retry_updated =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(message_id, 2, &target, time(30)?)?;
-        assert_eq!(retry_updated.state(), ProviderMessageState::Failed);
-        assert_eq!(retry_updated.revision(), 2);
-
-        // Idempotency rejects mismatched revision fence
-        let retry_wrong_rev =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(message_id, 99, &target, time(35)?);
-        assert!(matches!(
-            retry_wrong_rev,
-            Err(OperationsError::Conflict("provider message revision fence"))
-        ));
-
-        // Idempotency rejects stale timestamp fence
-        let retry_stale_time =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(message_id, 1, &target, time(10)?);
-        assert!(matches!(
-            retry_stale_time,
-            Err(OperationsError::Conflict(
-                "provider message timestamp fence"
-            ))
-        ));
-
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn cancel_vs_dispatch_race_and_effect_ordering() -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let target = fixture.target()?;
-
-        // =========================================================================
-        // Case A: Cancel precedes Dispatch -> Dispatch Impossible (No Execute Effect)
-        // =========================================================================
-        let msg_a = Uuid::now_v7();
-        append(&mut fixture.catalog, fixture.workspace, msg_a, "msg A", 10)?;
-        fixture
-            .catalog
-            .enqueue_provider_message(EnqueueProviderMessageCommand {
-                node_route_witness: None,
-                message_id: msg_a,
-                target: target.clone(),
-                queued_at: time(10)?,
-            })?;
-
-        // Cancel executes first
-        let canceled_a =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(msg_a, 1, &target, time(15)?)?;
-        assert_eq!(canceled_a.state(), ProviderMessageState::Failed);
-        assert_eq!(canceled_a.revision(), 2);
-        assert_eq!(canceled_a.last_dispatch_at().get(), 0);
-
-        // Dispatch attempted afterwards -> MUST return None (NO provider execute effect)
-        let dispatch_a = fixture
-            .catalog
-            .provider_message_dispatch(msg_a, time(20)?)?;
-        assert!(
-            dispatch_a.is_none(),
-            "canceled message must not release dispatch action"
-        );
-
-        let next_a = fixture.catalog.next_provider_message_dispatch(time(20)?)?;
-        assert!(
-            next_a.is_none(),
-            "canceled message must be excluded from queue selection"
-        );
-
-        // =========================================================================
-        // Case B: Dispatch precedes Cancel -> Cancel Rejected (Execute In Flight)
-        // =========================================================================
-        let msg_b = Uuid::now_v7();
-        append(&mut fixture.catalog, fixture.workspace, msg_b, "msg B", 25)?;
-        fixture
-            .catalog
-            .enqueue_provider_message(EnqueueProviderMessageCommand {
-                node_route_witness: None,
-                message_id: msg_b,
-                target: target.clone(),
-                queued_at: time(25)?,
-            })?;
-
-        // Dispatch executes first -> releases Execute action to provider worker
-        let dispatch_b = fixture
-            .catalog
-            .provider_message_dispatch(msg_b, time(30)?)?
-            .ok_or_else(|| std::io::Error::other("queued message did not dispatch"))?;
-        assert_eq!(
-            dispatch_b.dispatch().action(),
-            ProviderMessageDispatchAction::Execute
-        );
-        assert_eq!(
-            dispatch_b.outbox().state(),
-            ProviderMessageState::EffectPending
-        );
-        assert_eq!(dispatch_b.outbox().revision(), 2);
-        assert_eq!(dispatch_b.outbox().last_dispatch_at().get(), 30);
-
-        // Cancel attempted afterwards -> MUST be rejected (cannot cancel in-flight message)
-        let cancel_b = fixture
-            .catalog
-            .cancel_queued_provider_message(msg_b, 2, &target, time(35)?);
-        assert!(
-            matches!(
-                cancel_b,
-                Err(OperationsError::Conflict("provider cancel state"))
-            ),
-            "cancel must reject in-flight EffectPending message"
-        );
-
-        // =========================================================================
-        // Case C: Provider Failure (Post-Dispatch) vs Queued Cancel (Requirement 4)
-        // Message failed due to external provider error -> calling cancel must NOT
-        // falsely treat this different failure cause as a successful cancel replay!
-        // =========================================================================
-        let failed_b =
-            fixture
-                .catalog
-                .fail_provider_message_delivery(msg_b, 2, &target, time(40)?)?;
-        assert_eq!(failed_b.state(), ProviderMessageState::Failed);
-        assert_eq!(failed_b.revision(), 3);
-        assert_eq!(failed_b.last_dispatch_at().get(), 30); // was dispatched!
-
-        // Calling cancel_queued_provider_message on a dispatched failure must reject
-        let cancel_post_dispatch =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(msg_b, 3, &target, time(45)?);
-        assert!(
-            matches!(
-                cancel_post_dispatch,
-                Err(OperationsError::Conflict(
-                    "provider cancel already dispatched"
-                ))
-            ),
-            "cancel must reject messages that failed post-dispatch"
-        );
-
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn cancellation_on_one_connection_prevents_dispatch_on_another() -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let target = fixture.target()?;
-        let mut catalog2 = OperationsCatalog::open(&fixture.path, fixture.destination)?;
-
-        let msg_1 = Uuid::now_v7();
-        append(
-            &mut fixture.catalog,
-            fixture.workspace,
-            msg_1,
-            "concurrent msg 1",
-            10,
-        )?;
-        fixture
-            .catalog
-            .enqueue_provider_message(EnqueueProviderMessageCommand {
-                node_route_witness: None,
-                message_id: msg_1,
-                target: target.clone(),
-                queued_at: time(10)?,
-            })?;
-
-        let canceled_1 =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(msg_1, 1, &target, time(15)?)?;
-        assert_eq!(canceled_1.state(), ProviderMessageState::Failed);
-        assert_eq!(canceled_1.revision(), 2);
-        assert_eq!(canceled_1.last_dispatch_at().get(), 0);
-
-        let dispatch_on_conn2 = catalog2.provider_message_dispatch(msg_1, time(20)?)?;
-        assert!(
-            dispatch_on_conn2.is_none(),
-            "dispatch on second connection must return None when message was canceled on first connection"
-        );
-
-        let outbox_readback_conn2 = catalog2.provider_message_outbox(msg_1)?.ok_or_else(|| {
-            std::io::Error::other("canceled outbox row missing on second connection")
-        })?;
-        assert_eq!(outbox_readback_conn2.state(), ProviderMessageState::Failed);
-        assert_eq!(outbox_readback_conn2.revision(), 2);
-        assert_eq!(outbox_readback_conn2.last_dispatch_at().get(), 0);
-
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn dispatch_on_one_connection_rejects_cancel_on_another() -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let target = fixture.target()?;
-        let mut catalog2 = OperationsCatalog::open(&fixture.path, fixture.destination)?;
-
-        let msg_2 = Uuid::now_v7();
-        append(
-            &mut fixture.catalog,
-            fixture.workspace,
-            msg_2,
-            "concurrent msg 2",
-            25,
-        )?;
-        fixture
-            .catalog
-            .enqueue_provider_message(EnqueueProviderMessageCommand {
-                node_route_witness: None,
-                message_id: msg_2,
-                target: target.clone(),
-                queued_at: time(25)?,
-            })?;
-
-        let dispatch_2 = catalog2
-            .provider_message_dispatch(msg_2, time(30)?)?
-            .ok_or_else(|| {
-                std::io::Error::other("queued message did not dispatch on second connection")
-            })?;
-        assert_eq!(
-            dispatch_2.dispatch().action(),
-            ProviderMessageDispatchAction::Execute
-        );
-        assert_eq!(
-            dispatch_2.outbox().state(),
-            ProviderMessageState::EffectPending
-        );
-        assert_eq!(dispatch_2.outbox().revision(), 2);
-        assert_eq!(dispatch_2.outbox().last_dispatch_at().get(), 30);
-
-        let cancel_on_conn1 =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(msg_2, 2, &target, time(35)?);
-        assert!(
-            matches!(
-                cancel_on_conn1,
-                Err(OperationsError::Conflict("provider cancel state"))
-            ),
-            "cancel on first connection must reject in-flight message dispatched by second connection"
-        );
-
-        let outbox_readback_conn1 =
-            fixture
-                .catalog
-                .provider_message_outbox(msg_2)?
-                .ok_or_else(|| {
-                    std::io::Error::other("dispatched outbox row missing on first connection")
-                })?;
-        assert_eq!(
-            outbox_readback_conn1.state(),
-            ProviderMessageState::EffectPending
-        );
-        assert_eq!(outbox_readback_conn1.revision(), 2);
-        assert_eq!(outbox_readback_conn1.last_dispatch_at().get(), 30);
-
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn concurrent_cancel_and_dispatch_across_connections_have_one_cas_winner()
-    -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let target = fixture.target()?;
-        let mut catalog2 = OperationsCatalog::open(&fixture.path, fixture.destination)?;
-
-        let msg_3 = Uuid::now_v7();
-        append(
-            &mut fixture.catalog,
-            fixture.workspace,
-            msg_3,
-            "concurrent msg 3",
-            40,
-        )?;
-        fixture
-            .catalog
-            .enqueue_provider_message(EnqueueProviderMessageCommand {
-                node_route_witness: None,
-                message_id: msg_3,
-                target: target.clone(),
-                queued_at: time(40)?,
-            })?;
-
-        let cancel_at = time(50)?;
-        let dispatch_at = time(50)?;
-        let (cancel_res, dispatch_res) = std::thread::scope(|scope| {
-            let cancel_catalog = &mut fixture.catalog;
-            let dispatch_catalog = &mut catalog2;
-            let cancel_target = &target;
-            let cancel = scope.spawn(move || {
-                cancel_catalog.cancel_queued_provider_message(msg_3, 1, cancel_target, cancel_at)
-            });
-            let dispatch =
-                scope.spawn(move || dispatch_catalog.provider_message_dispatch(msg_3, dispatch_at));
-            let cancel_result = cancel.join().map_err(|_| "cancel worker thread panicked");
-            let dispatch_result = dispatch
-                .join()
-                .map_err(|_| "dispatch worker thread panicked");
-            match (cancel_result, dispatch_result) {
-                (Ok(cancel_result), Ok(dispatch_result)) => Ok((cancel_result, dispatch_result)),
-                (Err(cancel_error), Err(dispatch_error)) => Err(std::io::Error::other(format!(
-                    "{cancel_error}; {dispatch_error}"
-                ))),
-                (Err(error), _) | (_, Err(error)) => Err(std::io::Error::other(error)),
-            }
-        })?;
-
-        let outbox_final = {
-            let read_catalog = OperationsCatalog::open(&fixture.path, fixture.destination)?;
-            read_catalog
-                .provider_message_outbox(msg_3)?
-                .ok_or_else(|| std::io::Error::other("raced outbox row missing on readback"))?
-        };
-
-        match (cancel_res, dispatch_res) {
-            (Ok(canceled), Ok(None)) => {
-                assert_eq!(canceled.state(), ProviderMessageState::Failed);
-                assert_eq!(canceled.revision(), 2);
-                assert_eq!(canceled.last_dispatch_at().get(), 0);
-                assert_eq!(outbox_final.state(), ProviderMessageState::Failed);
-                assert_eq!(outbox_final.revision(), 2);
-                assert_eq!(outbox_final.last_dispatch_at().get(), 0);
-            }
-            (Err(OperationsError::Conflict(_)), Ok(Some(dispatched))) => {
-                assert_eq!(
-                    dispatched.dispatch().action(),
-                    ProviderMessageDispatchAction::Execute
-                );
-                assert_eq!(
-                    dispatched.outbox().state(),
-                    ProviderMessageState::EffectPending
-                );
-                assert_eq!(dispatched.outbox().revision(), 2);
-                assert_eq!(dispatched.outbox().last_dispatch_at().get(), 50);
-                assert_eq!(outbox_final.state(), ProviderMessageState::EffectPending);
-                assert_eq!(outbox_final.revision(), 2);
-            }
-            (c, d) => {
-                return Err(format!(
-                    "unexpected concurrent race outcome: cancel={c:?}, dispatch={d:?}"
-                )
-                .into());
-            }
-        }
-
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn cancel_queued_provider_message_conflicts() -> Result<(), Box<dyn Error>> {
-        let mut fixture = fixture()?;
-        let message_id = Uuid::now_v7();
-        let target = fixture.target()?;
-
-        append(
-            &mut fixture.catalog,
-            fixture.workspace,
-            message_id,
-            "test cancel conflicts",
-            10,
-        )?;
-        fixture
-            .catalog
-            .enqueue_provider_message(EnqueueProviderMessageCommand {
-                node_route_witness: None,
-                message_id,
-                target: target.clone(),
-                queued_at: time(10)?,
-            })?;
-
-        // Conflict on mismatched target
-        let other_session = AgentProfileRuntimeSessionId::from_uuid(Uuid::now_v7())?;
-        let wrong_target = ProviderMessageTarget::new(
-            fixture.workspace,
-            fixture.profile_id,
-            fixture.participation_id,
-            other_session,
-            "conversation-1".to_owned(),
-        )?;
-        let target_conflict =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(message_id, 1, &wrong_target, time(20)?);
-        assert!(matches!(
-            target_conflict,
-            Err(OperationsError::Conflict("provider message target changed"))
-        ));
-
-        // Conflict on revision fence
-        let rev_conflict =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(message_id, 99, &target, time(20)?);
-        assert!(matches!(
-            rev_conflict,
-            Err(OperationsError::Conflict("provider message revision fence"))
-        ));
-
-        // Conflict on timestamp fence (observed_at < updated_at)
-        let time_conflict =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(message_id, 1, &target, time(5)?);
-        assert!(matches!(
-            time_conflict,
-            Err(OperationsError::Conflict(
-                "provider message timestamp fence"
-            ))
-        ));
-
-        // Dispatch the message -> state becomes EffectPending (2), last_dispatch_at > 0
-        let dispatched = fixture
-            .catalog
-            .provider_message_dispatch(message_id, time(15)?)?
-            .ok_or_else(|| std::io::Error::other("queued message did not dispatch"))?;
-        assert_eq!(
-            dispatched.outbox().state(),
-            ProviderMessageState::EffectPending
-        );
-        assert_eq!(dispatched.outbox().revision(), 2);
-
-        // Cancel on EffectPending must be rejected with conflict
-        let dispatched_conflict =
-            fixture
-                .catalog
-                .cancel_queued_provider_message(message_id, 2, &target, time(25)?);
-        assert!(matches!(
-            dispatched_conflict,
-            Err(OperationsError::Conflict("provider cancel state"))
-        ));
-
         fixture.cleanup()?;
         Ok(())
     }

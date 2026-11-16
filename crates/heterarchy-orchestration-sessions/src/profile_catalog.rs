@@ -20,8 +20,10 @@ use uuid::Uuid;
 
 mod configuration;
 mod deletion;
+mod execution_preference;
 mod home_acceptance;
 mod resolver;
+mod sql;
 pub use configuration::{
     ProfileConfiguration, ProfileMutation, ProfileMutationCommand, ProfileMutationKind,
     ProfileMutationReceipt,
@@ -31,6 +33,7 @@ pub use deletion::{
     AgentProfileDeletionManifest, AgentProfileDeletionRuntimeEntry,
     AgentProfileDeletionRuntimeEntryPage, AgentProfileDeletionRuntimeTarget,
 };
+pub use execution_preference::{CliEngine, ExecutionPreference, RolePromptDigest};
 pub use home_acceptance::{
     HomeAcceptanceProfileAcquireOutcome, HomeAcceptanceProfileError, HomeAcceptanceProfileIntent,
     HomeAcceptanceProfileOperationsAdmission, HomeAcceptanceProfileOperationsResolution,
@@ -43,18 +46,31 @@ pub use resolver::{
     AgentProfileResolverAvailability, AgentProfileResolverCandidate,
     AgentProfileResolverCandidates, MAX_AGENT_PROFILE_RESOLVER_CANDIDATES,
 };
+use sql::{
+    AGENT_PROFILE_CAPABILITIES_TABLE_SQL, AGENT_PROFILE_LOGICAL_SESSIONS_TABLE_SQL,
+    AGENT_PROFILE_MUTATION_CAPABILITIES_TABLE_SQL, AGENT_PROFILE_MUTATION_RECEIPTS_TABLE_SQL,
+    AGENT_PROFILE_RUNTIME_SESSIONS_TABLE_SQL, AGENT_PROFILES_TABLE_SQL,
+    COUNT_FORBIDDEN_PROFILE_COLUMNS_SQL, COUNT_LIVE_RUNTIME_SESSIONS_SQL,
+    COUNT_NON_INTERNAL_SCHEMA_OBJECTS_SQL, DELETE_PROFILE_CAPABILITIES_SQL, FOREIGN_KEY_CHECK_SQL,
+    INSERT_LOGICAL_SESSION_LINK_SQL, INSERT_PROFILE_CAPABILITY_SQL,
+    INSERT_PROFILE_MUTATION_CAPABILITY_SQL, INSERT_PROFILE_MUTATION_RECEIPT_SQL,
+    INSERT_PROFILE_SQL, QUICK_CHECK_SQL, SELECT_LOGICAL_SESSION_HISTORY_SQL,
+    SELECT_LOGICAL_SESSION_LINK_BY_REQUEST_SQL, SELECT_LOGICAL_SESSION_LINK_BY_SESSION_SQL,
+    SELECT_PROFILE_BY_ID_SQL, SELECT_PROFILE_CAPABILITIES_SQL, SELECT_PROFILE_ID_BY_REQUEST_SQL,
+    SELECT_PROFILE_IDS_FOR_LIST_SQL, SELECT_PROFILE_MUTATION_CAPABILITIES_SQL,
+    SELECT_PROFILE_MUTATION_RECEIPT_SQL, SELECT_RUNTIME_SESSION_BY_ID_SQL,
+    SELECT_RUNTIME_SESSION_HISTORY_IDS_SQL, SELECT_RUNTIME_SESSION_ID_BY_REQUEST_SQL,
+    SELECT_RUNTIME_SESSIONS_PAGE_SQL, SELECT_TABLE_SCHEMA_SQL, UPDATE_PROFILE_SQL,
+};
 
 /// Application identifier written into `PRAGMA application_id` for the global
 /// Agent Profile catalog. It is distinct from the logical Session catalog.
 pub const AGENT_PROFILE_APPLICATION_ID: i64 = 0x4846_4150;
-/// Current schema version for the non-authoritative Agent Profile catalog.
-pub const AGENT_PROFILE_SCHEMA_VERSION: i64 = 7;
-const AGENT_PROFILE_V6_SCHEMA_VERSION: i64 = 6;
-const AGENT_PROFILE_V3_SCHEMA_VERSION: i64 = 3;
-const AGENT_PROFILE_V4_SCHEMA_VERSION: i64 = 4;
-const AGENT_PROFILE_V5_SCHEMA_VERSION: i64 = 5;
-const AGENT_PROFILE_V6_OBJECT_COUNT: i64 = 11;
-const AGENT_PROFILE_OBJECT_COUNT: i64 = 20;
+/// Single canonical schema version for the non-authoritative Agent Profile catalog.
+pub const AGENT_PROFILE_SCHEMA_VERSION: i64 = 1;
+const AGENT_PROFILE_BASE_OBJECT_COUNT: i64 = 20;
+const AGENT_PROFILE_OBJECT_COUNT: i64 =
+    AGENT_PROFILE_BASE_OBJECT_COUNT + execution_preference::OBJECT_COUNT;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const JOURNAL_MODE_RETRY_LIMIT: usize = 8;
@@ -70,97 +86,7 @@ pub const MAX_AGENT_PROFILE_LOGICAL_SESSION_LINKS: usize = 32;
 pub const MAX_AGENT_PROFILE_RUNTIME_SESSIONS: usize = 32;
 const UUID_BYTES: usize = 16;
 
-const AGENT_PROFILES_TABLE_SQL: &str = r"
-CREATE TABLE agent_profiles (
-    profile_id BLOB PRIMARY KEY NOT NULL CHECK(length(profile_id) = 16 AND profile_id != zeroblob(16)),
-    request_id BLOB NOT NULL UNIQUE CHECK(length(request_id) = 16 AND request_id != zeroblob(16)),
-    stable_name TEXT NOT NULL CHECK(length(CAST(stable_name AS BLOB)) BETWEEN 1 AND 128),
-    display_name TEXT NOT NULL CHECK(length(CAST(display_name AS BLOB)) BETWEEN 1 AND 128),
-    provider_family INTEGER NOT NULL CHECK(provider_family = 1),
-    preferred_model TEXT CHECK(preferred_model IS NULL OR length(CAST(preferred_model AS BLOB)) BETWEEN 1 AND 128),
-    preferred_reasoning TEXT CHECK(preferred_reasoning IS NULL OR length(CAST(preferred_reasoning AS BLOB)) BETWEEN 1 AND 128),
-    lifecycle_state INTEGER NOT NULL CHECK(lifecycle_state IN (1, 2, 3)),
-    creation_origin INTEGER NOT NULL CHECK(creation_origin IN (1, 2, 3, 4)),
-    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
-    updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
-    last_used_at_ms INTEGER CHECK(last_used_at_ms IS NULL OR last_used_at_ms >= created_at_ms),
-    revision INTEGER NOT NULL CHECK(revision > 0)
-);
-";
-
 pub const MAX_PROFILES_PER_LIST: usize = 64;
-
-const AGENT_PROFILE_CAPABILITIES_TABLE_SQL: &str = r"
-CREATE TABLE agent_profile_capabilities (
-    profile_id BLOB NOT NULL CHECK(length(profile_id) = 16 AND profile_id != zeroblob(16)),
-    capability TEXT NOT NULL CHECK(length(CAST(capability AS BLOB)) BETWEEN 1 AND 64),
-    PRIMARY KEY(profile_id, capability),
-    FOREIGN KEY(profile_id) REFERENCES agent_profiles(profile_id)
-);
-";
-
-const AGENT_PROFILE_LOGICAL_SESSIONS_TABLE_SQL: &str = r"
-CREATE TABLE agent_profile_logical_sessions (
-    request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id) = 16 AND request_id != zeroblob(16)),
-    profile_id BLOB NOT NULL CHECK(length(profile_id) = 16 AND profile_id != zeroblob(16)),
-    profile_revision INTEGER NOT NULL CHECK(profile_revision > 0),
-    session_id BLOB NOT NULL UNIQUE CHECK(length(session_id) = 16 AND session_id != zeroblob(16)),
-    session_revision INTEGER NOT NULL CHECK(session_revision > 0),
-    linked_at_ms INTEGER NOT NULL CHECK(linked_at_ms >= 0),
-    FOREIGN KEY(profile_id) REFERENCES agent_profiles(profile_id)
-);
-";
-
-const AGENT_PROFILE_RUNTIME_SESSIONS_TABLE_SQL: &str = r"
-CREATE TABLE agent_profile_runtime_sessions (
-    runtime_session_id BLOB PRIMARY KEY NOT NULL CHECK(length(runtime_session_id) = 16 AND runtime_session_id != zeroblob(16)),
-    request_id BLOB NOT NULL UNIQUE CHECK(length(request_id) = 16 AND request_id != zeroblob(16)),
-    profile_id BLOB NOT NULL CHECK(length(profile_id) = 16 AND profile_id != zeroblob(16)),
-    provider_family INTEGER NOT NULL CHECK(provider_family = 1),
-    provider_conversation_id TEXT CHECK(provider_conversation_id IS NULL OR length(CAST(provider_conversation_id AS BLOB)) BETWEEN 1 AND 512),
-    state INTEGER NOT NULL CHECK(state BETWEEN 1 AND 8),
-    opened_at_ms INTEGER NOT NULL CHECK(opened_at_ms >= 0),
-    last_seen_at_ms INTEGER NOT NULL CHECK(last_seen_at_ms >= opened_at_ms),
-    closed_at_ms INTEGER CHECK(closed_at_ms IS NULL OR closed_at_ms >= opened_at_ms),
-    revision INTEGER NOT NULL CHECK(revision > 0),
-    FOREIGN KEY(profile_id) REFERENCES agent_profiles(profile_id),
-    UNIQUE(provider_family, provider_conversation_id),
-    CHECK((state = 8 AND closed_at_ms IS NOT NULL) OR (state != 8 AND closed_at_ms IS NULL)),
-    CHECK((state IN (2,3,4,5,6) AND provider_conversation_id IS NOT NULL) OR state IN (1,7,8))
-);
-";
-
-const AGENT_PROFILE_MUTATION_RECEIPTS_TABLE_SQL: &str = r"
-CREATE TABLE agent_profile_mutation_receipts (
-    request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id) = 16 AND request_id != zeroblob(16)),
-    profile_id BLOB NOT NULL CHECK(length(profile_id) = 16 AND profile_id != zeroblob(16)),
-    operation_kind INTEGER NOT NULL CHECK(operation_kind BETWEEN 1 AND 4),
-    expected_revision INTEGER CHECK(expected_revision IS NULL OR expected_revision > 0),
-    creation_request_id BLOB NOT NULL CHECK(length(creation_request_id) = 16 AND creation_request_id != zeroblob(16)),
-    stable_name TEXT NOT NULL CHECK(length(CAST(stable_name AS BLOB)) BETWEEN 1 AND 128),
-    display_name TEXT NOT NULL CHECK(length(CAST(display_name AS BLOB)) BETWEEN 1 AND 128),
-    provider_family INTEGER NOT NULL CHECK(provider_family = 1),
-    preferred_model TEXT CHECK(preferred_model IS NULL OR length(CAST(preferred_model AS BLOB)) BETWEEN 1 AND 128),
-    preferred_reasoning TEXT CHECK(preferred_reasoning IS NULL OR length(CAST(preferred_reasoning AS BLOB)) BETWEEN 1 AND 128),
-    lifecycle_state INTEGER NOT NULL CHECK(lifecycle_state IN (1, 2, 3)),
-    creation_origin INTEGER NOT NULL CHECK(creation_origin IN (1, 2, 3, 4)),
-    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
-    updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
-    last_used_at_ms INTEGER CHECK(last_used_at_ms IS NULL OR last_used_at_ms >= created_at_ms),
-    revision INTEGER NOT NULL CHECK(revision > 0),
-    FOREIGN KEY(profile_id) REFERENCES agent_profiles(profile_id),
-    CHECK((operation_kind = 1 AND expected_revision IS NULL) OR (operation_kind BETWEEN 2 AND 4 AND expected_revision IS NOT NULL))
-);
-";
-
-const AGENT_PROFILE_MUTATION_CAPABILITIES_TABLE_SQL: &str = r"
-CREATE TABLE agent_profile_mutation_capabilities (
-    request_id BLOB NOT NULL CHECK(length(request_id) = 16 AND request_id != zeroblob(16)),
-    capability TEXT NOT NULL CHECK(length(CAST(capability AS BLOB)) BETWEEN 1 AND 64),
-    PRIMARY KEY(request_id, capability),
-    FOREIGN KEY(request_id) REFERENCES agent_profile_mutation_receipts(request_id)
-);
-";
 
 /// Stable global Agent Profile identity. It is intentionally unrelated to
 /// Workspace participant IDs, Forge Agent IDs, and provider conversation IDs.
@@ -191,10 +117,14 @@ impl fmt::Display for AgentProfileId {
     }
 }
 
-/// Provider family preference recorded on a global Profile. This is selection
-/// metadata only and never effect authority.
+/// Provider family metadata recorded on a global Profile. `Unbound` means no
+/// execution provider; `ChatGpt` remains historical metadata only. Neither value
+/// grants provider effect authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentProfileProviderFamily {
+    /// No execution provider is bound to this Profile.
+    Unbound,
+    /// Retained provider metadata from historical Profile records only.
     ChatGpt,
 }
 
@@ -489,13 +419,15 @@ pub struct CreateAgentProfile {
     preferred_model: Option<String>,
     preferred_reasoning: Option<String>,
     base_capabilities: Vec<String>,
+    execution_preference: Option<ExecutionPreference>,
     creation_origin: AgentProfileCreationOrigin,
     created_at: TimestampMillis,
 }
 
 impl CreateAgentProfile {
-    /// Build a validated create request. Capability order is canonicalized and
-    /// duplicate tags are rejected rather than silently merged.
+    /// Build a validated Profile request with no execution provider bound.
+    /// Capability order is canonicalized and duplicate tags are rejected rather
+    /// than silently merged.
     ///
     /// # Errors
     /// Rejects nil IDs, unbounded/empty text, excessive capabilities, and
@@ -506,7 +438,6 @@ impl CreateAgentProfile {
         request_id: Uuid,
         stable_name: String,
         display_name: String,
-        provider_family: AgentProfileProviderFamily,
         preferred_model: Option<String>,
         preferred_reasoning: Option<String>,
         mut base_capabilities: Vec<String>,
@@ -546,13 +477,30 @@ impl CreateAgentProfile {
             request_id,
             stable_name,
             display_name,
-            provider_family,
+            provider_family: AgentProfileProviderFamily::Unbound,
             preferred_model,
             preferred_reasoning,
             base_capabilities,
+            execution_preference: None,
             creation_origin,
             created_at,
         })
+    }
+
+    /// Attach or clear a reusable CLI execution preference on this create
+    /// request.
+    #[must_use]
+    pub fn with_execution_preference(
+        mut self,
+        execution_preference: Option<ExecutionPreference>,
+    ) -> Self {
+        self.execution_preference = execution_preference;
+        self
+    }
+
+    #[must_use]
+    pub const fn execution_preference(&self) -> Option<&ExecutionPreference> {
+        self.execution_preference.as_ref()
     }
 }
 
@@ -567,6 +515,7 @@ pub struct AgentProfile {
     preferred_model: Option<String>,
     preferred_reasoning: Option<String>,
     base_capabilities: Vec<String>,
+    execution_preference: Option<ExecutionPreference>,
     lifecycle_state: AgentProfileLifecycleState,
     creation_origin: AgentProfileCreationOrigin,
     created_at: TimestampMillis,
@@ -617,6 +566,11 @@ impl AgentProfile {
     }
 
     #[must_use]
+    pub const fn execution_preference(&self) -> Option<&ExecutionPreference> {
+        self.execution_preference.as_ref()
+    }
+
+    #[must_use]
     pub const fn lifecycle_state(&self) -> AgentProfileLifecycleState {
         self.lifecycle_state
     }
@@ -649,10 +603,10 @@ impl AgentProfile {
     fn matches_create(&self, command: &CreateAgentProfile) -> bool {
         self.stable_name == command.stable_name
             && self.display_name == command.display_name
-            && self.provider_family == command.provider_family
             && self.preferred_model == command.preferred_model
             && self.preferred_reasoning == command.preferred_reasoning
             && self.base_capabilities == command.base_capabilities
+            && self.execution_preference == command.execution_preference
             && self.creation_origin == command.creation_origin
     }
 }
@@ -919,6 +873,7 @@ impl AgentProfileCatalog {
             preferred_model: command.preferred_model.clone(),
             preferred_reasoning: command.preferred_reasoning.clone(),
             base_capabilities: command.base_capabilities.clone(),
+            execution_preference: command.execution_preference.clone(),
             lifecycle_state: AgentProfileLifecycleState::Active,
             creation_origin: command.creation_origin,
             created_at: command.created_at,
@@ -1061,27 +1016,17 @@ impl AgentProfileCatalog {
             .map(|receipt| receipt.into_public(false)))
     }
 
-    /// Create one provider Runtime Session idempotently by request identity.
-    /// New Runtime Sessions always begin in `PROVISIONING` and carry no
-    /// provider conversation identity until explicitly confirmed.
-    /// An exact stored request replay returns its original Runtime Session
-    /// before lifecycle admission checks; fresh creation requires an active
-    /// Profile.
+    /// Read back an exact historical Runtime Session create request. Fresh
+    /// provider `RuntimeSession` creation is retired.
     ///
     /// # Errors
-    /// Rejects missing/inactive Profiles, conflicting request replay, reused
-    /// Runtime Session identities, or persistence failures.
+    /// Returns an exact historical replay or `ProviderRetired` for a fresh create.
     pub fn create_runtime_session(
         &mut self,
         command: &CreateAgentProfileRuntimeSession,
     ) -> Result<AgentProfileRuntimeSessionCreateOutcome, AgentProfileError> {
         self.ensure_live_binding()?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let profile = load_profile(&transaction, command.profile_id)?
-            .ok_or(AgentProfileError::ProfileMissing(command.profile_id))?;
-        if let Some(existing) = runtime_session_by_request(&transaction, command.request_id)? {
+        if let Some(existing) = runtime_session_by_request(&self.connection, command.request_id)? {
             if existing.profile_id != command.profile_id
                 || existing.provider_family != command.provider_family
                 || existing.opened_at != command.opened_at
@@ -1090,57 +1035,19 @@ impl AgentProfileCatalog {
                     command.request_id,
                 ));
             }
-            transaction.commit()?;
-            self.ensure_live_binding()?;
             return Ok(AgentProfileRuntimeSessionCreateOutcome {
                 session: existing,
                 created: false,
             });
         }
-        if profile.lifecycle_state() == AgentProfileLifecycleState::Retired {
-            return Err(AgentProfileError::RuntimeSessionProfileRetired(
-                command.profile_id,
-            ));
-        }
-        if profile.lifecycle_state() != AgentProfileLifecycleState::Active {
-            return Err(AgentProfileError::ProfileNotActive {
-                profile_id: command.profile_id,
-                lifecycle_state: profile.lifecycle_state(),
-            });
-        }
-        if load_runtime_session(&transaction, command.proposed_id)?.is_some() {
-            return Err(AgentProfileError::RuntimeSessionIdConflict(
-                command.proposed_id,
-            ));
-        }
-        let session = AgentProfileRuntimeSession {
-            id: command.proposed_id,
-            request_id: command.request_id,
-            profile_id: command.profile_id,
-            provider_family: command.provider_family,
-            provider_conversation_id: None,
-            state: AgentProfileRuntimeSessionState::Provisioning,
-            opened_at: command.opened_at,
-            last_seen_at: command.opened_at,
-            closed_at: None,
-            revision: AgentProfileRuntimeSessionRevision(1),
-        };
-        insert_runtime_session(&transaction, &session)?;
-        transaction.commit()?;
-        self.ensure_live_binding()?;
-        Ok(AgentProfileRuntimeSessionCreateOutcome {
-            session,
-            created: true,
-        })
+        Err(AgentProfileError::ProviderRetired)
     }
 
-    /// Confirm the exact non-secret provider conversation identity and promote
-    /// one `PROVISIONING` Runtime Session to `READY`. Exact identical replay is
-    /// idempotent after a lost response.
+    /// Read back an exact historical `PROVISIONING -> READY` confirmation.
+    /// Fresh provider confirmation is retired and performs no writes.
     ///
     /// # Errors
-    /// Rejects invalid/busy conversation identity, stale revisions, invalid
-    /// source state, non-monotonic observation time, or persistence failures.
+    /// Returns an exact historical replay or `ProviderRetired` for a transition.
     pub fn confirm_runtime_session_ready(
         &mut self,
         id: AgentProfileRuntimeSessionId,
@@ -1148,80 +1055,24 @@ impl AgentProfileCatalog {
         provider_conversation_id: &str,
         observed_at: TimestampMillis,
     ) -> Result<AgentProfileRuntimeSession, AgentProfileError> {
-        validate_text(
-            "provider_conversation_id",
-            provider_conversation_id,
-            MAX_PROVIDER_CONVERSATION_ID_BYTES,
-        )?;
         self.ensure_live_binding()?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = load_runtime_session(&transaction, id)?
+        let current = load_runtime_session(&self.connection, id)?
             .ok_or(AgentProfileError::RuntimeSessionMissing(id))?;
         if current.state == AgentProfileRuntimeSessionState::Ready
             && current.provider_conversation_id.as_deref() == Some(provider_conversation_id)
         {
-            transaction.commit()?;
-            self.ensure_live_binding()?;
             return Ok(current);
         }
-        if deletion::manifest_exists_for_profile(&transaction, current.profile_id)? {
-            return Err(AgentProfileError::ProfileDeletionTargetsFrozen(
-                current.profile_id,
-            ));
-        }
-        if current.revision != expected_revision {
-            return Err(AgentProfileError::RuntimeSessionRevisionConflict {
-                expected: expected_revision,
-                actual: current.revision,
-            });
-        }
-        if current.state != AgentProfileRuntimeSessionState::Provisioning {
-            return Err(AgentProfileError::RuntimeSessionTransition {
-                from: current.state,
-                to: AgentProfileRuntimeSessionState::Ready,
-            });
-        }
-        ensure_runtime_observation(&current, observed_at)?;
-        if let Some(existing_id) = runtime_session_id_by_conversation(
-            &transaction,
-            current.provider_family,
-            provider_conversation_id,
-        )? && existing_id != id
-        {
-            return Err(AgentProfileError::RuntimeSessionConversationConflict);
-        }
-        let next_revision = next_runtime_revision(current.revision)?;
-        transaction.execute(
-            "UPDATE agent_profile_runtime_sessions
-             SET provider_conversation_id=?1,state=?2,last_seen_at_ms=?3,revision=?4
-             WHERE runtime_session_id=?5 AND revision=?6",
-            params![
-                provider_conversation_id,
-                encode_runtime_state(AgentProfileRuntimeSessionState::Ready),
-                observed_at.get(),
-                next_revision.get(),
-                id.into_uuid().as_bytes(),
-                expected_revision.get(),
-            ],
-        )?;
-        let updated = load_runtime_session(&transaction, id)?
-            .ok_or(AgentProfileError::RuntimeSessionMissing(id))?;
-        transaction.commit()?;
-        self.ensure_live_binding()?;
-        Ok(updated)
+        let _ = (expected_revision, observed_at);
+        Err(AgentProfileError::ProviderRetired)
     }
 
-    /// Compare-and-set one provider Runtime Session lifecycle transition.
-    /// `PROVISIONING -> READY` must use `confirm_runtime_session_ready` so exact
-    /// provider conversation identity is never bypassed.
+    /// Read back an exact already-stored lifecycle state. Fresh provider state
+    /// transitions are retired and perform no writes.
     ///
     /// # Errors
-    /// Rejects stale revisions, invalid transitions, missing conversation
-    /// identity for a state that requires it, activation/wake of an inactive
-    /// Profile, frozen deletion targets, clock regression, or persistence
-    /// failures.
+    /// Returns the row when state and revision already match; otherwise returns
+    /// `ProviderRetired` without changing historical state.
     pub fn transition_runtime_session(
         &mut self,
         id: AgentProfileRuntimeSessionId,
@@ -1230,83 +1081,20 @@ impl AgentProfileCatalog {
         observed_at: TimestampMillis,
     ) -> Result<AgentProfileRuntimeSession, AgentProfileError> {
         self.ensure_live_binding()?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = load_runtime_session(&transaction, id)?
+        let current = load_runtime_session(&self.connection, id)?
             .ok_or(AgentProfileError::RuntimeSessionMissing(id))?;
-        if deletion::manifest_exists_for_profile(&transaction, current.profile_id)? {
-            return Err(AgentProfileError::ProfileDeletionTargetsFrozen(
-                current.profile_id,
-            ));
+        if current.state == target && current.revision == expected_revision {
+            return Ok(current);
         }
-        if current.revision != expected_revision {
-            return Err(AgentProfileError::RuntimeSessionRevisionConflict {
-                expected: expected_revision,
-                actual: current.revision,
-            });
-        }
-        if current.state == AgentProfileRuntimeSessionState::Provisioning
-            && target == AgentProfileRuntimeSessionState::Ready
-        {
-            return Err(AgentProfileError::RuntimeSessionIdentityRequired);
-        }
-        if !runtime_transition_allowed(current.state, target) {
-            return Err(AgentProfileError::RuntimeSessionTransition {
-                from: current.state,
-                to: target,
-            });
-        }
-        if runtime_state_requires_identity(target) && current.provider_conversation_id.is_none() {
-            return Err(AgentProfileError::RuntimeSessionIdentityRequired);
-        }
-        if matches!(
-            target,
-            AgentProfileRuntimeSessionState::Active | AgentProfileRuntimeSessionState::Waking
-        ) {
-            let profile = load_profile(&transaction, current.profile_id)?
-                .ok_or(AgentProfileError::ProfileMissing(current.profile_id))?;
-            if profile.lifecycle_state() != AgentProfileLifecycleState::Active {
-                return Err(AgentProfileError::ProfileNotActive {
-                    profile_id: current.profile_id,
-                    lifecycle_state: profile.lifecycle_state(),
-                });
-            }
-        }
-        ensure_runtime_observation(&current, observed_at)?;
-        let next_revision = next_runtime_revision(current.revision)?;
-        let closed_at =
-            (target == AgentProfileRuntimeSessionState::Closed).then_some(observed_at.get());
-        transaction.execute(
-            "UPDATE agent_profile_runtime_sessions
-             SET state=?1,last_seen_at_ms=?2,closed_at_ms=?3,revision=?4
-             WHERE runtime_session_id=?5 AND revision=?6",
-            params![
-                encode_runtime_state(target),
-                observed_at.get(),
-                closed_at,
-                next_revision.get(),
-                id.into_uuid().as_bytes(),
-                expected_revision.get(),
-            ],
-        )?;
-        let updated = load_runtime_session(&transaction, id)?
-            .ok_or(AgentProfileError::RuntimeSessionMissing(id))?;
-        transaction.commit()?;
-        self.ensure_live_binding()?;
-        Ok(updated)
+        let _ = (expected_revision, observed_at);
+        Err(AgentProfileError::ProviderRetired)
     }
 
-    /// Record the exact provider-observed completion of a wake that was already
-    /// admitted elsewhere. This is not a new wake authorization: the caller
-    /// must supply the existing Runtime Session identity and its exact
-    /// provider conversation identity. It remains usable while the Profile is
-    /// Disabled or Retired so prior admitted work can be reconciled.
+    /// Read back an exact historical ready result for a wake. Fresh provider
+    /// wake completion is retired and performs no writes.
     ///
     /// # Errors
-    /// Rejects a missing Runtime Session, stale revision, changed conversation
-    /// identity, frozen deletion targets, invalid source state, clock regression,
-    /// or persistence errors.
+    /// Returns an exact existing ready row or `ProviderRetired` without writes.
     pub fn confirm_existing_runtime_wake_observed(
         &mut self,
         id: AgentProfileRuntimeSessionId,
@@ -1314,66 +1102,16 @@ impl AgentProfileCatalog {
         exact_provider_conversation_id: &str,
         observed_at: TimestampMillis,
     ) -> Result<AgentProfileRuntimeSession, AgentProfileError> {
-        validate_text(
-            "provider_conversation_id",
-            exact_provider_conversation_id,
-            MAX_PROVIDER_CONVERSATION_ID_BYTES,
-        )?;
         self.ensure_live_binding()?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current = load_runtime_session(&transaction, id)?
+        let current = load_runtime_session(&self.connection, id)?
             .ok_or(AgentProfileError::RuntimeSessionMissing(id))?;
         if current.state == AgentProfileRuntimeSessionState::Ready
             && current.provider_conversation_id.as_deref() == Some(exact_provider_conversation_id)
         {
-            transaction.commit()?;
-            self.ensure_live_binding()?;
             return Ok(current);
         }
-        if deletion::manifest_exists_for_profile(&transaction, current.profile_id)? {
-            return Err(AgentProfileError::ProfileDeletionTargetsFrozen(
-                current.profile_id,
-            ));
-        }
-        if current.revision != expected_revision {
-            return Err(AgentProfileError::RuntimeSessionRevisionConflict {
-                expected: expected_revision,
-                actual: current.revision,
-            });
-        }
-        if current.provider_conversation_id.as_deref() != Some(exact_provider_conversation_id) {
-            return Err(AgentProfileError::RuntimeSessionConversationConflict);
-        }
-        if !matches!(
-            current.state,
-            AgentProfileRuntimeSessionState::Offline | AgentProfileRuntimeSessionState::Waking
-        ) {
-            return Err(AgentProfileError::RuntimeSessionTransition {
-                from: current.state,
-                to: AgentProfileRuntimeSessionState::Ready,
-            });
-        }
-        ensure_runtime_observation(&current, observed_at)?;
-        let next_revision = next_runtime_revision(current.revision)?;
-        transaction.execute(
-            "UPDATE agent_profile_runtime_sessions
-             SET state=?1,last_seen_at_ms=?2,closed_at_ms=NULL,revision=?3
-             WHERE runtime_session_id=?4 AND revision=?5",
-            params![
-                encode_runtime_state(AgentProfileRuntimeSessionState::Ready),
-                observed_at.get(),
-                next_revision.get(),
-                id.into_uuid().as_bytes(),
-                expected_revision.get(),
-            ],
-        )?;
-        let updated = load_runtime_session(&transaction, id)?
-            .ok_or(AgentProfileError::RuntimeSessionMissing(id))?;
-        transaction.commit()?;
-        self.ensure_live_binding()?;
-        Ok(updated)
+        let _ = (expected_revision, observed_at);
+        Err(AgentProfileError::ProviderRetired)
     }
 
     /// Resolve one exact provider Runtime Session.
@@ -1451,7 +1189,7 @@ impl AgentProfileCatalog {
         let Some(profile) = load_profile(&self.connection, profile_id)? else {
             return Ok(None);
         };
-        Ok(Some(derive_operational_state(&self.connection, &profile)?))
+        Ok(Some(derive_operational_state(&profile)))
     }
 
     /// Resolve one Profile and derive its operational state from the same
@@ -1470,7 +1208,7 @@ impl AgentProfileCatalog {
         };
         // Preserve the revalidation previously performed by operational_state after resolve.
         self.ensure_live_binding()?;
-        let state = derive_operational_state(&self.connection, &profile)?;
+        let state = derive_operational_state(&profile);
         Ok(Some((profile, state)))
     }
 
@@ -1496,9 +1234,7 @@ impl AgentProfileCatalog {
         if limit == 0 || limit > MAX_PROFILES_PER_LIST {
             return Err(AgentProfileError::InvalidIdentity("profile list limit"));
         }
-        let statement = self.connection.prepare(
-            "SELECT profile_id FROM agent_profiles ORDER BY created_at_ms DESC, profile_id DESC LIMIT ?1",
-        );
+        let statement = self.connection.prepare(SELECT_PROFILE_IDS_FOR_LIST_SQL);
         let mut statement = statement?;
         let ids = statement
             .query_map(
@@ -1582,7 +1318,7 @@ impl AgentProfileCatalog {
             });
         }
         transaction.execute(
-            "INSERT INTO agent_profile_logical_sessions(request_id,profile_id,profile_revision,session_id,session_revision,linked_at_ms) VALUES(?1,?2,?3,?4,?5,?6)",
+            INSERT_LOGICAL_SESSION_LINK_SQL,
             params![
                 request_id.as_bytes(),
                 profile_id.into_uuid().as_bytes(),
@@ -1662,11 +1398,9 @@ impl AgentProfileCatalog {
         }
         let query_limit = i64::try_from(MAX_AGENT_PROFILE_LOGICAL_SESSION_LINKS + 1)
             .map_err(|_| AgentProfileError::Corrupt("logical Session history limit"))?;
-        let mut statement = self.connection.prepare(
-            "SELECT request_id,profile_id,profile_revision,session_id,session_revision,linked_at_ms \
-             FROM agent_profile_logical_sessions WHERE profile_id=?1 \
-             ORDER BY linked_at_ms DESC, request_id DESC LIMIT ?2",
-        )?;
+        let mut statement = self
+            .connection
+            .prepare(SELECT_LOGICAL_SESSION_HISTORY_SQL)?;
         let mut rows = statement.query(params![profile_id.into_uuid().as_bytes(), query_limit])?;
         let mut links = Vec::new();
         while let Some(row) = rows.next()? {
@@ -1849,39 +1583,12 @@ fn is_busy_error(error: &rusqlite::Error) -> bool {
 }
 
 fn initialize_or_validate(connection: &mut Connection) -> Result<(), AgentProfileError> {
-    // Observe all ownership selectors in one SQLite snapshot before deciding
-    // whether to configure or migrate an existing catalog.
     let snapshot = connection.transaction()?;
     let ownership = catalog_ownership(&snapshot)?;
-    let known_shape = match ownership {
-        (0, 0, 0) => true,
-        (AGENT_PROFILE_APPLICATION_ID, 1, 3) => {
-            validate_v1_schema(&snapshot)?;
-            true
-        }
-        (AGENT_PROFILE_APPLICATION_ID, 2, 4) => {
-            validate_v2_schema(&snapshot)?;
-            true
-        }
-        (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V3_SCHEMA_VERSION, 6) => {
-            validate_v3_schema(&snapshot)?;
-            true
-        }
-        (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V4_SCHEMA_VERSION, 7) => {
-            validate_v4_schema(&snapshot)?;
-            true
-        }
-        (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V5_SCHEMA_VERSION, 9) => {
-            validate_v5_schema(&snapshot)?;
-            true
-        }
-        (
-            AGENT_PROFILE_APPLICATION_ID,
-            AGENT_PROFILE_V6_SCHEMA_VERSION,
-            AGENT_PROFILE_V6_OBJECT_COUNT,
-        ) => {
-            validate_v6_schema(&snapshot)?;
-            true
+    match ownership {
+        (0, 0, 0) => {
+            snapshot.commit()?;
+            create_schema(connection)
         }
         (
             AGENT_PROFILE_APPLICATION_ID,
@@ -1889,66 +1596,17 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<(), AgentProfil
             AGENT_PROFILE_OBJECT_COUNT,
         ) => {
             validate_schema(&snapshot)?;
-            true
+            snapshot.commit()?;
+            Ok(())
         }
-        _ => false,
-    };
-    if !known_shape {
-        snapshot.commit()?;
-        return Err(AgentProfileError::Ownership {
-            application_id: ownership.0,
-            user_version: ownership.1,
-            object_count: ownership.2,
-        });
-    }
-    snapshot.commit()?;
-    match ownership {
-        (0, 0, 0) => create_schema(connection),
-        (AGENT_PROFILE_APPLICATION_ID, 1, 3) => {
-            migrate_v1_to_v2(connection)?;
-            migrate_v2_to_v3(connection)?;
-            migrate_v3_to_v4(connection)?;
-            migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)?;
-            migrate_v6_to_v7(connection)
+        _ => {
+            snapshot.commit()?;
+            Err(AgentProfileError::Ownership {
+                application_id: ownership.0,
+                user_version: ownership.1,
+                object_count: ownership.2,
+            })
         }
-        (AGENT_PROFILE_APPLICATION_ID, 2, 4) => {
-            migrate_v2_to_v3(connection)?;
-            migrate_v3_to_v4(connection)?;
-            migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)?;
-            migrate_v6_to_v7(connection)
-        }
-        (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V3_SCHEMA_VERSION, 6) => {
-            migrate_v3_to_v4(connection)?;
-            migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)?;
-            migrate_v6_to_v7(connection)
-        }
-        (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V4_SCHEMA_VERSION, 7) => {
-            migrate_v4_to_v5(connection)?;
-            migrate_v5_to_v6(connection)?;
-            migrate_v6_to_v7(connection)
-        }
-        (AGENT_PROFILE_APPLICATION_ID, AGENT_PROFILE_V5_SCHEMA_VERSION, 9) => {
-            migrate_v5_to_v6(connection)?;
-            migrate_v6_to_v7(connection)
-        }
-        (
-            AGENT_PROFILE_APPLICATION_ID,
-            AGENT_PROFILE_V6_SCHEMA_VERSION,
-            AGENT_PROFILE_V6_OBJECT_COUNT,
-        ) => migrate_v6_to_v7(connection),
-        (
-            AGENT_PROFILE_APPLICATION_ID,
-            AGENT_PROFILE_SCHEMA_VERSION,
-            AGENT_PROFILE_OBJECT_COUNT,
-        ) => Ok(()),
-        _ => Err(AgentProfileError::Ownership {
-            application_id: ownership.0,
-            user_version: ownership.1,
-            object_count: ownership.2,
-        }),
     }
 }
 
@@ -1957,11 +1615,8 @@ fn catalog_ownership(connection: &Connection) -> Result<(i64, i64, i64), AgentPr
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let user_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let object_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-        [],
-        |row| row.get(0),
-    )?;
+    let object_count: i64 =
+        connection.query_row(COUNT_NON_INTERNAL_SCHEMA_OBJECTS_SQL, [], |row| row.get(0))?;
     Ok((application_id, user_version, object_count))
 }
 
@@ -1981,6 +1636,7 @@ fn create_schema(connection: &mut Connection) -> Result<(), AgentProfileError> {
             transaction.execute_batch(AGENT_PROFILE_MUTATION_CAPABILITIES_TABLE_SQL)?;
             home_acceptance::schema::create_schema(&transaction)
                 .map_err(AgentProfileError::from)?;
+            execution_preference::create_schema(&transaction)?;
             transaction.pragma_update(None, "application_id", AGENT_PROFILE_APPLICATION_ID)?;
             transaction.pragma_update(None, "user_version", AGENT_PROFILE_SCHEMA_VERSION)?;
         }
@@ -1989,146 +1645,10 @@ fn create_schema(connection: &mut Connection) -> Result<(), AgentProfileError> {
             AGENT_PROFILE_SCHEMA_VERSION,
             AGENT_PROFILE_OBJECT_COUNT,
         ) => {
-            transaction.commit()?;
-            return validate_schema(connection);
-        }
-        (application_id, user_version, object_count) => {
-            return Err(AgentProfileError::Ownership {
-                application_id,
-                user_version,
-                object_count,
-            });
-        }
-    }
-    transaction.commit()?;
-    validate_schema(connection)
-}
-
-fn migrate_v1_to_v2(connection: &mut Connection) -> Result<(), AgentProfileError> {
-    validate_v1_schema(connection)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if catalog_ownership(&transaction)? != (AGENT_PROFILE_APPLICATION_ID, 1, 3) {
-        return Err(AgentProfileError::Corrupt(
-            "Agent Profile v1 migration ownership changed",
-        ));
-    }
-    transaction.execute_batch(AGENT_PROFILE_RUNTIME_SESSIONS_TABLE_SQL)?;
-    transaction.pragma_update(None, "user_version", 2)?;
-    transaction.commit()?;
-    validate_v2_schema(connection)
-}
-
-fn migrate_v2_to_v3(connection: &mut Connection) -> Result<(), AgentProfileError> {
-    validate_v2_schema(connection)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if catalog_ownership(&transaction)? != (AGENT_PROFILE_APPLICATION_ID, 2, 4) {
-        return Err(AgentProfileError::Corrupt(
-            "Agent Profile v2 migration ownership changed",
-        ));
-    }
-    resolver::create_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", AGENT_PROFILE_V3_SCHEMA_VERSION)?;
-    transaction.commit()?;
-    validate_v3_schema(connection)
-}
-
-fn migrate_v3_to_v4(connection: &mut Connection) -> Result<(), AgentProfileError> {
-    validate_v3_schema(connection)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if catalog_ownership(&transaction)?
-        != (
-            AGENT_PROFILE_APPLICATION_ID,
-            AGENT_PROFILE_V3_SCHEMA_VERSION,
-            6,
-        )
-    {
-        return Err(AgentProfileError::Corrupt(
-            "Agent Profile v3 migration ownership changed",
-        ));
-    }
-    deletion::create_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", AGENT_PROFILE_V4_SCHEMA_VERSION)?;
-    transaction.commit()?;
-    validate_v4_schema(connection)
-}
-
-fn migrate_v4_to_v5(connection: &mut Connection) -> Result<(), AgentProfileError> {
-    validate_v4_schema(connection)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if catalog_ownership(&transaction)?
-        != (
-            AGENT_PROFILE_APPLICATION_ID,
-            AGENT_PROFILE_V4_SCHEMA_VERSION,
-            7,
-        )
-    {
-        return Err(AgentProfileError::Corrupt(
-            "Agent Profile v4 migration ownership changed",
-        ));
-    }
-    deletion::create_manifest_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", AGENT_PROFILE_V5_SCHEMA_VERSION)?;
-    transaction.commit()?;
-    validate_v5_schema(connection)
-}
-
-fn migrate_v5_to_v6(connection: &mut Connection) -> Result<(), AgentProfileError> {
-    validate_v5_schema(connection)?;
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if catalog_ownership(&transaction)?
-        != (
-            AGENT_PROFILE_APPLICATION_ID,
-            AGENT_PROFILE_V5_SCHEMA_VERSION,
-            9,
-        )
-    {
-        return Err(AgentProfileError::Corrupt(
-            "Agent Profile v5 migration ownership changed",
-        ));
-    }
-    transaction.execute_batch(AGENT_PROFILE_MUTATION_RECEIPTS_TABLE_SQL)?;
-    transaction.execute_batch(AGENT_PROFILE_MUTATION_CAPABILITIES_TABLE_SQL)?;
-    let profile_ids = transaction
-        .prepare("SELECT profile_id FROM agent_profiles ORDER BY profile_id")?
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    for raw_profile_id in profile_ids {
-        let profile_id = decode_profile_id(&raw_profile_id, "profile_id")?;
-        let profile = load_profile(&transaction, profile_id)?
-            .ok_or(AgentProfileError::ProfileMissing(profile_id))?;
-        insert_profile_mutation_receipt(
-            &transaction,
-            profile.request_id(),
-            None,
-            ProfileMutationKind::OriginalCreate,
-            &original_create_snapshot(&profile),
-        )?;
-    }
-    transaction.pragma_update(None, "user_version", AGENT_PROFILE_V6_SCHEMA_VERSION)?;
-    transaction.commit()?;
-    validate_v6_schema(connection)
-}
-
-/// Atomically add Home recipient pins to an exact, previously validated v6
-/// catalog. If another opener wins while this connection waits for the writer,
-/// validate and reuse that committed v7 result instead of replaying its DDL.
-fn migrate_v6_to_v7(connection: &mut Connection) -> Result<(), AgentProfileError> {
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    match catalog_ownership(&transaction)? {
-        (
-            AGENT_PROFILE_APPLICATION_ID,
-            AGENT_PROFILE_SCHEMA_VERSION,
-            AGENT_PROFILE_OBJECT_COUNT,
-        ) => {
             validate_schema(&transaction)?;
             transaction.commit()?;
-            return validate_schema(connection);
+            return Ok(());
         }
-        (
-            AGENT_PROFILE_APPLICATION_ID,
-            AGENT_PROFILE_V6_SCHEMA_VERSION,
-            AGENT_PROFILE_V6_OBJECT_COUNT,
-        ) => validate_v6_schema(&transaction)?,
         (application_id, user_version, object_count) => {
             return Err(AgentProfileError::Ownership {
                 application_id,
@@ -2137,205 +1657,24 @@ fn migrate_v6_to_v7(connection: &mut Connection) -> Result<(), AgentProfileError
             });
         }
     }
-    home_acceptance::schema::create_schema(&transaction)?;
-    transaction.pragma_update(None, "user_version", AGENT_PROFILE_SCHEMA_VERSION)?;
+    validate_schema(&transaction)?;
     transaction.commit()?;
-    validate_schema(connection)
-}
-
-fn validate_v1_schema(connection: &Connection) -> Result<(), AgentProfileError> {
-    let quick: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-    if quick != "ok" {
-        return Err(AgentProfileError::Integrity);
-    }
-    let ownership = catalog_ownership(connection)?;
-    if ownership != (AGENT_PROFILE_APPLICATION_ID, 1, 3) {
-        return Err(AgentProfileError::Ownership {
-            application_id: ownership.0,
-            user_version: ownership.1,
-            object_count: ownership.2,
-        });
-    }
-    validate_schema_sql(connection, "agent_profiles", AGENT_PROFILES_TABLE_SQL)?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_capabilities",
-        AGENT_PROFILE_CAPABILITIES_TABLE_SQL,
-    )?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_logical_sessions",
-        AGENT_PROFILE_LOGICAL_SESSIONS_TABLE_SQL,
-    )?;
-    validate_profile_authority_boundary(connection)?;
-    validate_foreign_keys(connection)
-}
-
-fn validate_v2_schema(connection: &Connection) -> Result<(), AgentProfileError> {
-    let quick: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-    if quick != "ok" {
-        return Err(AgentProfileError::Integrity);
-    }
-    let ownership = catalog_ownership(connection)?;
-    if ownership != (AGENT_PROFILE_APPLICATION_ID, 2, 4) {
-        return Err(AgentProfileError::Ownership {
-            application_id: ownership.0,
-            user_version: ownership.1,
-            object_count: ownership.2,
-        });
-    }
-    validate_schema_sql(connection, "agent_profiles", AGENT_PROFILES_TABLE_SQL)?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_capabilities",
-        AGENT_PROFILE_CAPABILITIES_TABLE_SQL,
-    )?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_logical_sessions",
-        AGENT_PROFILE_LOGICAL_SESSIONS_TABLE_SQL,
-    )?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_runtime_sessions",
-        AGENT_PROFILE_RUNTIME_SESSIONS_TABLE_SQL,
-    )?;
-    validate_profile_authority_boundary(connection)?;
-    validate_foreign_keys(connection)
-}
-
-fn validate_v3_schema(connection: &Connection) -> Result<(), AgentProfileError> {
-    let quick: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-    if quick != "ok" {
-        return Err(AgentProfileError::Integrity);
-    }
-    let ownership = catalog_ownership(connection)?;
-    if ownership
-        != (
-            AGENT_PROFILE_APPLICATION_ID,
-            AGENT_PROFILE_V3_SCHEMA_VERSION,
-            6,
-        )
-    {
-        return Err(AgentProfileError::Ownership {
-            application_id: ownership.0,
-            user_version: ownership.1,
-            object_count: ownership.2,
-        });
-    }
-    validate_schema_sql(connection, "agent_profiles", AGENT_PROFILES_TABLE_SQL)?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_capabilities",
-        AGENT_PROFILE_CAPABILITIES_TABLE_SQL,
-    )?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_logical_sessions",
-        AGENT_PROFILE_LOGICAL_SESSIONS_TABLE_SQL,
-    )?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_runtime_sessions",
-        AGENT_PROFILE_RUNTIME_SESSIONS_TABLE_SQL,
-    )?;
-    resolver::validate_schema(connection)?;
-    validate_profile_authority_boundary(connection)?;
-    validate_foreign_keys(connection)
-}
-
-fn validate_v4_schema(connection: &Connection) -> Result<(), AgentProfileError> {
-    let quick: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
-    if quick != "ok" {
-        return Err(AgentProfileError::Integrity);
-    }
-    let ownership = catalog_ownership(connection)?;
-    if ownership
-        != (
-            AGENT_PROFILE_APPLICATION_ID,
-            AGENT_PROFILE_V4_SCHEMA_VERSION,
-            7,
-        )
-    {
-        return Err(AgentProfileError::Ownership {
-            application_id: ownership.0,
-            user_version: ownership.1,
-            object_count: ownership.2,
-        });
-    }
-    validate_schema_sql(connection, "agent_profiles", AGENT_PROFILES_TABLE_SQL)?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_capabilities",
-        AGENT_PROFILE_CAPABILITIES_TABLE_SQL,
-    )?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_logical_sessions",
-        AGENT_PROFILE_LOGICAL_SESSIONS_TABLE_SQL,
-    )?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_runtime_sessions",
-        AGENT_PROFILE_RUNTIME_SESSIONS_TABLE_SQL,
-    )?;
-    resolver::validate_schema(connection)?;
-    deletion::validate_v4_schema(connection)?;
-    validate_profile_authority_boundary(connection)?;
-    validate_foreign_keys(connection)
-}
-
-fn validate_v5_schema(connection: &Connection) -> Result<(), AgentProfileError> {
-    validate_v5_schema_shape(connection, AGENT_PROFILE_V5_SCHEMA_VERSION, 9)?;
-    validate_foreign_keys(connection)
-}
-
-fn validate_v6_schema(connection: &Connection) -> Result<(), AgentProfileError> {
-    validate_v5_schema_shape(
-        connection,
-        AGENT_PROFILE_V6_SCHEMA_VERSION,
-        AGENT_PROFILE_V6_OBJECT_COUNT,
-    )?;
-    validate_profile_mutation_schema(connection)?;
-    validate_foreign_keys(connection)
-}
-
-fn validate_schema(connection: &Connection) -> Result<(), AgentProfileError> {
-    validate_v5_schema_shape(
-        connection,
-        AGENT_PROFILE_SCHEMA_VERSION,
-        AGENT_PROFILE_OBJECT_COUNT,
-    )?;
-    validate_profile_mutation_schema(connection)?;
-    home_acceptance::schema::validate_schema(connection)?;
-    validate_foreign_keys(connection)
-}
-
-fn validate_profile_mutation_schema(connection: &Connection) -> Result<(), AgentProfileError> {
-    validate_schema_sql(
-        connection,
-        "agent_profile_mutation_receipts",
-        AGENT_PROFILE_MUTATION_RECEIPTS_TABLE_SQL,
-    )?;
-    validate_schema_sql(
-        connection,
-        "agent_profile_mutation_capabilities",
-        AGENT_PROFILE_MUTATION_CAPABILITIES_TABLE_SQL,
-    )?;
     Ok(())
 }
 
-fn validate_v5_schema_shape(
-    connection: &Connection,
-    version: i64,
-    object_count: i64,
-) -> Result<(), AgentProfileError> {
-    let quick: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+fn validate_schema(connection: &Connection) -> Result<(), AgentProfileError> {
+    let quick: String = connection.query_row(QUICK_CHECK_SQL, [], |row| row.get(0))?;
     if quick != "ok" {
         return Err(AgentProfileError::Integrity);
     }
     let ownership = catalog_ownership(connection)?;
-    if ownership != (AGENT_PROFILE_APPLICATION_ID, version, object_count) {
+    if ownership
+        != (
+            AGENT_PROFILE_APPLICATION_ID,
+            AGENT_PROFILE_SCHEMA_VERSION,
+            AGENT_PROFILE_OBJECT_COUNT,
+        )
+    {
         return Err(AgentProfileError::Ownership {
             application_id: ownership.0,
             user_version: ownership.1,
@@ -2360,17 +1699,30 @@ fn validate_v5_schema_shape(
     )?;
     resolver::validate_schema(connection)?;
     deletion::validate_schema(connection)?;
-    validate_profile_authority_boundary(connection)
+    validate_profile_authority_boundary(connection)?;
+    validate_profile_mutation_schema(connection)?;
+    home_acceptance::schema::validate_schema(connection)?;
+    execution_preference::validate_schema(connection)?;
+    validate_foreign_keys(connection)
+}
+
+fn validate_profile_mutation_schema(connection: &Connection) -> Result<(), AgentProfileError> {
+    validate_schema_sql(
+        connection,
+        "agent_profile_mutation_receipts",
+        AGENT_PROFILE_MUTATION_RECEIPTS_TABLE_SQL,
+    )?;
+    validate_schema_sql(
+        connection,
+        "agent_profile_mutation_capabilities",
+        AGENT_PROFILE_MUTATION_CAPABILITIES_TABLE_SQL,
+    )?;
+    Ok(())
 }
 
 fn validate_profile_authority_boundary(connection: &Connection) -> Result<(), AgentProfileError> {
-    let forbidden_columns: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM pragma_table_info('agent_profiles')
-         WHERE name IN ('workspace_id','team_id','participant_id','session_id','agent_id',
-                        'assignment_id','writer_lease_id','vote_id','work_credit')",
-        [],
-        |row| row.get(0),
-    )?;
+    let forbidden_columns: i64 =
+        connection.query_row(COUNT_FORBIDDEN_PROFILE_COLUMNS_SQL, [], |row| row.get(0))?;
     if forbidden_columns != 0 {
         return Err(AgentProfileError::Schema(
             "agent_profiles contains scoped authority columns",
@@ -2381,7 +1733,7 @@ fn validate_profile_authority_boundary(connection: &Connection) -> Result<(), Ag
 
 fn validate_foreign_keys(connection: &Connection) -> Result<(), AgentProfileError> {
     if connection
-        .prepare("PRAGMA foreign_key_check")?
+        .prepare(FOREIGN_KEY_CHECK_SQL)?
         .query([])?
         .next()?
         .is_some()
@@ -2397,11 +1749,7 @@ fn validate_schema_sql(
     expected: &str,
 ) -> Result<(), AgentProfileError> {
     let sql: Option<String> = connection
-        .query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
-            params![name],
-            |row| row.get(0),
-        )
+        .query_row(SELECT_TABLE_SCHEMA_SQL, params![name], |row| row.get(0))
         .optional()?;
     let Some(sql) = sql else {
         return Err(AgentProfileError::Schema(name));
@@ -2430,7 +1778,7 @@ fn profile_id_by_request(
 ) -> Result<Option<AgentProfileId>, AgentProfileError> {
     let raw: Option<Vec<u8>> = connection
         .query_row(
-            "SELECT profile_id FROM agent_profiles WHERE request_id=?1",
+            SELECT_PROFILE_ID_BY_REQUEST_SQL,
             params![request_id.as_bytes()],
             |row| row.get(0),
         )
@@ -2445,7 +1793,7 @@ fn logical_session_link_by_request(
 ) -> Result<Option<AgentProfileLogicalSessionLink>, AgentProfileError> {
     load_logical_session_link(
         connection,
-        "SELECT request_id,profile_id,profile_revision,session_id,session_revision,linked_at_ms FROM agent_profile_logical_sessions WHERE request_id=?1",
+        SELECT_LOGICAL_SESSION_LINK_BY_REQUEST_SQL,
         request_id.as_bytes(),
     )
 }
@@ -2456,7 +1804,7 @@ fn logical_session_link_by_session(
 ) -> Result<Option<AgentProfileLogicalSessionLink>, AgentProfileError> {
     load_logical_session_link(
         connection,
-        "SELECT request_id,profile_id,profile_revision,session_id,session_revision,linked_at_ms FROM agent_profile_logical_sessions WHERE session_id=?1",
+        SELECT_LOGICAL_SESSION_LINK_BY_SESSION_SQL,
         session_id.into_uuid().as_bytes(),
     )
 }
@@ -2508,11 +1856,16 @@ fn decode_logical_session_link(
     })
 }
 
-fn insert_runtime_session(
-    transaction: &rusqlite::Transaction<'_>,
+#[cfg(test)]
+fn insert_historical_runtime_session(
+    connection: &Connection,
     session: &AgentProfileRuntimeSession,
 ) -> Result<(), AgentProfileError> {
-    transaction.execute(
+    let provider_family = match session.provider_family {
+        AgentProfileProviderFamily::ChatGpt => 1,
+        AgentProfileProviderFamily::Unbound => return Err(AgentProfileError::ProviderRetired),
+    };
+    connection.execute(
         "INSERT INTO agent_profile_runtime_sessions(
             runtime_session_id,request_id,profile_id,provider_family,
             provider_conversation_id,state,opened_at_ms,last_seen_at_ms,
@@ -2522,7 +1875,7 @@ fn insert_runtime_session(
             session.id.into_uuid().as_bytes(),
             session.request_id.as_bytes(),
             session.profile_id.into_uuid().as_bytes(),
-            encode_provider(session.provider_family),
+            provider_family,
             session.provider_conversation_id,
             encode_runtime_state(session.state),
             session.opened_at.get(),
@@ -2534,13 +1887,63 @@ fn insert_runtime_session(
     Ok(())
 }
 
+#[cfg(test)]
+struct HistoricalRuntimeFixture {
+    profile_id: AgentProfileId,
+    runtime_id: AgentProfileRuntimeSessionId,
+    request_id: Uuid,
+    conversation_id: Option<String>,
+    state: AgentProfileRuntimeSessionState,
+    opened_at: TimestampMillis,
+    last_seen_at: TimestampMillis,
+    closed_at: Option<TimestampMillis>,
+    revision: i64,
+}
+
+#[cfg(test)]
+fn seed_historical_runtime_session(
+    catalog: &mut AgentProfileCatalog,
+    fixture: HistoricalRuntimeFixture,
+) -> Result<AgentProfileRuntimeSession, AgentProfileError> {
+    let profile = load_profile(&catalog.connection, fixture.profile_id)?
+        .ok_or(AgentProfileError::ProfileMissing(fixture.profile_id))?;
+    if profile.provider_family() != AgentProfileProviderFamily::ChatGpt {
+        let transaction = catalog
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE agent_profiles SET provider_family=1 WHERE profile_id=?1",
+            params![fixture.profile_id.into_uuid().as_bytes()],
+        )?;
+        transaction.execute(
+            "UPDATE agent_profile_mutation_receipts SET provider_family=1 WHERE profile_id=?1",
+            params![fixture.profile_id.into_uuid().as_bytes()],
+        )?;
+        transaction.commit()?;
+    }
+    let session = AgentProfileRuntimeSession {
+        id: fixture.runtime_id,
+        request_id: fixture.request_id,
+        profile_id: fixture.profile_id,
+        provider_family: AgentProfileProviderFamily::ChatGpt,
+        provider_conversation_id: fixture.conversation_id,
+        state: fixture.state,
+        opened_at: fixture.opened_at,
+        last_seen_at: fixture.last_seen_at,
+        closed_at: fixture.closed_at,
+        revision: AgentProfileRuntimeSessionRevision::new(fixture.revision)?,
+    };
+    insert_historical_runtime_session(&catalog.connection, &session)?;
+    Ok(session)
+}
+
 fn runtime_session_by_request(
     connection: &Connection,
     request_id: Uuid,
 ) -> Result<Option<AgentProfileRuntimeSession>, AgentProfileError> {
     let id: Option<Vec<u8>> = connection
         .query_row(
-            "SELECT runtime_session_id FROM agent_profile_runtime_sessions WHERE request_id=?1",
+            SELECT_RUNTIME_SESSION_ID_BY_REQUEST_SQL,
             params![request_id.as_bytes()],
             |row| row.get(0),
         )
@@ -2552,25 +1955,6 @@ fn runtime_session_by_request(
                     .ok_or(AgentProfileError::RuntimeSessionMissing(id))
             },
         )
-    })
-    .transpose()
-}
-
-fn runtime_session_id_by_conversation(
-    connection: &Connection,
-    provider: AgentProfileProviderFamily,
-    conversation_id: &str,
-) -> Result<Option<AgentProfileRuntimeSessionId>, AgentProfileError> {
-    let raw: Option<Vec<u8>> = connection
-        .query_row(
-            "SELECT runtime_session_id FROM agent_profile_runtime_sessions
-             WHERE provider_family=?1 AND provider_conversation_id=?2",
-            params![encode_provider(provider), conversation_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    raw.map(|value| {
-        AgentProfileRuntimeSessionId::from_uuid(decode_uuid("runtime_session_id", &value)?)
     })
     .transpose()
 }
@@ -2595,10 +1979,7 @@ fn load_runtime_session(
 ) -> Result<Option<AgentProfileRuntimeSession>, AgentProfileError> {
     let raw = connection
         .query_row(
-            "SELECT runtime_session_id,request_id,profile_id,provider_family,
-                    provider_conversation_id,state,opened_at_ms,last_seen_at_ms,
-                    closed_at_ms,revision
-             FROM agent_profile_runtime_sessions WHERE runtime_session_id=?1",
+            SELECT_RUNTIME_SESSION_BY_ID_SQL,
             params![id.into_uuid().as_bytes()],
             |row| {
                 Ok(RawRuntimeSession {
@@ -2657,10 +2038,7 @@ fn runtime_session_history(
 ) -> Result<AgentProfileRuntimeSessionHistory, AgentProfileError> {
     let limit = i64::try_from(MAX_AGENT_PROFILE_RUNTIME_SESSIONS + 1)
         .map_err(|_| AgentProfileError::Corrupt("runtime Session history bound"))?;
-    let mut statement = connection.prepare(
-        "SELECT runtime_session_id FROM agent_profile_runtime_sessions
-         WHERE profile_id=?1 ORDER BY opened_at_ms DESC,runtime_session_id DESC LIMIT ?2",
-    )?;
+    let mut statement = connection.prepare(SELECT_RUNTIME_SESSION_HISTORY_IDS_SQL)?;
     let ids = statement
         .query_map(params![profile_id.into_uuid().as_bytes(), limit], |row| {
             row.get::<_, Vec<u8>>(0)
@@ -2690,14 +2068,7 @@ fn runtime_sessions_page(
     let lookahead_limit = i64::try_from(page_size + 1)
         .map_err(|_| AgentProfileError::Corrupt("runtime Session page bound"))?;
     let after_runtime_id = after_runtime_id.map(|id| id.into_uuid().as_bytes().to_vec());
-    let mut statement = connection.prepare(
-        "SELECT runtime_session_id,request_id,profile_id,provider_family,
-                provider_conversation_id,state,opened_at_ms,last_seen_at_ms,
-                closed_at_ms,revision
-         FROM agent_profile_runtime_sessions
-         WHERE profile_id=?1 AND (?2 IS NULL OR runtime_session_id>?2)
-         ORDER BY runtime_session_id ASC LIMIT ?3",
-    )?;
+    let mut statement = connection.prepare(SELECT_RUNTIME_SESSIONS_PAGE_SQL)?;
     let mut rows = statement
         .query_map(
             params![
@@ -2749,26 +2120,6 @@ fn runtime_sessions_page(
     })
 }
 
-fn ensure_runtime_observation(
-    current: &AgentProfileRuntimeSession,
-    observed_at: TimestampMillis,
-) -> Result<(), AgentProfileError> {
-    if observed_at.get() < current.last_seen_at.get() {
-        return Err(AgentProfileError::RuntimeSessionClockRegression);
-    }
-    Ok(())
-}
-
-fn next_runtime_revision(
-    current: AgentProfileRuntimeSessionRevision,
-) -> Result<AgentProfileRuntimeSessionRevision, AgentProfileError> {
-    current
-        .get()
-        .checked_add(1)
-        .ok_or(AgentProfileError::RuntimeSessionRevisionOverflow)
-        .and_then(AgentProfileRuntimeSessionRevision::new)
-}
-
 const fn runtime_state_requires_identity(state: AgentProfileRuntimeSessionState) -> bool {
     matches!(
         state,
@@ -2777,47 +2128,6 @@ const fn runtime_state_requires_identity(state: AgentProfileRuntimeSessionState)
             | AgentProfileRuntimeSessionState::Suspending
             | AgentProfileRuntimeSessionState::Offline
             | AgentProfileRuntimeSessionState::Waking
-    )
-}
-
-const fn runtime_transition_allowed(
-    from: AgentProfileRuntimeSessionState,
-    to: AgentProfileRuntimeSessionState,
-) -> bool {
-    matches!(
-        (from, to),
-        (
-            AgentProfileRuntimeSessionState::Provisioning,
-            AgentProfileRuntimeSessionState::Ready
-                | AgentProfileRuntimeSessionState::Failed
-                | AgentProfileRuntimeSessionState::Closed
-        ) | (
-            AgentProfileRuntimeSessionState::Ready,
-            AgentProfileRuntimeSessionState::Active
-                | AgentProfileRuntimeSessionState::Suspending
-                | AgentProfileRuntimeSessionState::Failed
-                | AgentProfileRuntimeSessionState::Closed
-        ) | (
-            AgentProfileRuntimeSessionState::Active,
-            AgentProfileRuntimeSessionState::Ready
-                | AgentProfileRuntimeSessionState::Suspending
-                | AgentProfileRuntimeSessionState::Failed
-                | AgentProfileRuntimeSessionState::Closed
-        ) | (
-            AgentProfileRuntimeSessionState::Suspending,
-            AgentProfileRuntimeSessionState::Offline
-                | AgentProfileRuntimeSessionState::Failed
-                | AgentProfileRuntimeSessionState::Closed
-        ) | (
-            AgentProfileRuntimeSessionState::Offline | AgentProfileRuntimeSessionState::Failed,
-            AgentProfileRuntimeSessionState::Waking | AgentProfileRuntimeSessionState::Closed
-        ) | (
-            AgentProfileRuntimeSessionState::Waking,
-            AgentProfileRuntimeSessionState::Ready
-                | AgentProfileRuntimeSessionState::Offline
-                | AgentProfileRuntimeSessionState::Failed
-                | AgentProfileRuntimeSessionState::Closed
-        )
     )
 }
 
@@ -2843,6 +2153,7 @@ impl StoredProfileMutationReceipt {
                     && self.profile.preferred_model() == configuration.preferred_model()
                     && self.profile.preferred_reasoning() == configuration.preferred_reasoning()
                     && self.profile.base_capabilities() == configuration.capabilities()
+                    && self.profile.execution_preference() == configuration.execution_preference()
             }
             ProfileMutation::Disable | ProfileMutation::Retire => true,
         }
@@ -2895,11 +2206,7 @@ fn load_raw_profile_mutation_receipt(
 ) -> Result<Option<RawProfileMutationReceipt>, AgentProfileError> {
     connection
         .query_row(
-            "SELECT request_id,profile_id,operation_kind,expected_revision,
-                    creation_request_id,stable_name,display_name,provider_family,
-                    preferred_model,preferred_reasoning,lifecycle_state,creation_origin,
-                    created_at_ms,updated_at_ms,last_used_at_ms,revision
-             FROM agent_profile_mutation_receipts WHERE request_id=?1",
+            SELECT_PROFILE_MUTATION_RECEIPT_SQL,
             params![request_id.as_bytes()],
             |row| {
                 Ok(RawProfileMutationReceipt {
@@ -2965,10 +2272,7 @@ fn decode_profile_mutation_receipt(
         MAX_PROVIDER_PREFERENCE_BYTES,
     )?;
     let mut capabilities = Vec::new();
-    let mut statement = connection.prepare(
-        "SELECT capability FROM agent_profile_mutation_capabilities
-         WHERE request_id=?1 ORDER BY capability",
-    )?;
+    let mut statement = connection.prepare(SELECT_PROFILE_MUTATION_CAPABILITIES_SQL)?;
     let mut rows = statement.query(params![request_id.as_bytes()])?;
     while let Some(row) = rows.next()? {
         if capabilities.len() >= MAX_CAPABILITIES {
@@ -2985,15 +2289,18 @@ fn decode_profile_mutation_receipt(
         }
         capabilities.push(capability);
     }
+    let execution_preference =
+        execution_preference::load_for_mutation_receipt(connection, request_id)?;
     let profile = AgentProfile {
         id: profile_id,
         request_id: creation_request_id,
         stable_name: raw.stable_name,
         display_name: raw.display_name,
-        provider_family: decode_provider(raw.provider_family)?,
+        provider_family: decode_profile_provider(raw.provider_family)?,
         preferred_model: raw.preferred_model,
         preferred_reasoning: raw.preferred_reasoning,
         base_capabilities: capabilities,
+        execution_preference,
         lifecycle_state: decode_lifecycle(raw.lifecycle_state)?,
         creation_origin: decode_origin(raw.creation_origin)?,
         created_at: TimestampMillis::new(raw.created_at)?,
@@ -3025,6 +2332,26 @@ fn insert_profile_mutation_receipt(
     kind: ProfileMutationKind,
     profile: &AgentProfile,
 ) -> Result<(), AgentProfileError> {
+    insert_profile_mutation_receipt_base(
+        transaction,
+        request_id,
+        expected_revision,
+        kind,
+        profile,
+    )?;
+    if let Some(preference) = profile.execution_preference() {
+        execution_preference::insert_for_mutation_receipt(transaction, request_id, preference)?;
+    }
+    Ok(())
+}
+
+fn insert_profile_mutation_receipt_base(
+    transaction: &rusqlite::Transaction<'_>,
+    request_id: Uuid,
+    expected_revision: Option<AgentProfileRevision>,
+    kind: ProfileMutationKind,
+    profile: &AgentProfile,
+) -> Result<(), AgentProfileError> {
     if request_id.is_nil() {
         return Err(AgentProfileError::InvalidIdentity(
             "profile_mutation_request_id",
@@ -3036,12 +2363,7 @@ fn insert_profile_mutation_receipt(
         ));
     }
     transaction.execute(
-        "INSERT INTO agent_profile_mutation_receipts(
-            request_id,profile_id,operation_kind,expected_revision,
-            creation_request_id,stable_name,display_name,provider_family,
-            preferred_model,preferred_reasoning,lifecycle_state,creation_origin,
-            created_at_ms,updated_at_ms,last_used_at_ms,revision
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+        INSERT_PROFILE_MUTATION_RECEIPT_SQL,
         params![
             request_id.as_bytes(),
             profile.id().into_uuid().as_bytes(),
@@ -3050,7 +2372,7 @@ fn insert_profile_mutation_receipt(
             profile.request_id().as_bytes(),
             profile.stable_name(),
             profile.display_name(),
-            encode_provider(profile.provider_family()),
+            encode_profile_provider(profile.provider_family()),
             profile.preferred_model(),
             profile.preferred_reasoning(),
             encode_lifecycle(profile.lifecycle_state()),
@@ -3071,22 +2393,11 @@ fn insert_profile_mutation_capabilities(
 ) -> Result<(), AgentProfileError> {
     for capability in capabilities {
         transaction.execute(
-            "INSERT INTO agent_profile_mutation_capabilities(request_id,capability)
-             VALUES(?1,?2)",
+            INSERT_PROFILE_MUTATION_CAPABILITY_SQL,
             params![request_id.as_bytes(), capability],
         )?;
     }
     Ok(())
-}
-
-fn original_create_snapshot(profile: &AgentProfile) -> AgentProfile {
-    AgentProfile {
-        lifecycle_state: AgentProfileLifecycleState::Active,
-        updated_at: profile.created_at,
-        last_used_at: None,
-        revision: AgentProfileRevision(1),
-        ..profile.clone()
-    }
 }
 
 fn commit_profile_transaction(
@@ -3130,6 +2441,7 @@ fn apply_profile_mutation(
                 preferred_model: configuration.preferred_model().map(str::to_owned),
                 preferred_reasoning: configuration.preferred_reasoning().map(str::to_owned),
                 base_capabilities: configuration.capabilities().to_vec(),
+                execution_preference: configuration.execution_preference().cloned(),
                 updated_at: command.observed_at(),
                 revision: next_profile_revision(current.revision())?,
                 ..current.clone()
@@ -3204,8 +2516,7 @@ fn prepare_profile_retirement(
     }
     ensure_profile_observation(profile, observed_at)?;
     let live_runtimes: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM agent_profile_runtime_sessions
-         WHERE profile_id=?1 AND state IN (1,2,3,4,6)",
+        COUNT_LIVE_RUNTIME_SESSIONS_SQL,
         params![profile.id().into_uuid().as_bytes()],
         |row| row.get(0),
     )?;
@@ -3228,10 +2539,7 @@ fn update_profile(
 ) -> Result<(), AgentProfileError> {
     home_acceptance::ensure_unpinned(transaction, profile.id())?;
     let changed = transaction.execute(
-        "UPDATE agent_profiles
-         SET display_name=?1,preferred_model=?2,preferred_reasoning=?3,
-             lifecycle_state=?4,updated_at_ms=?5,revision=?6
-         WHERE profile_id=?7 AND revision=?8",
+        UPDATE_PROFILE_SQL,
         params![
             profile.display_name(),
             profile.preferred_model(),
@@ -3249,15 +2557,20 @@ fn update_profile(
         ));
     }
     transaction.execute(
-        "DELETE FROM agent_profile_capabilities WHERE profile_id=?1",
+        DELETE_PROFILE_CAPABILITIES_SQL,
         params![profile.id().into_uuid().as_bytes()],
     )?;
     for capability in profile.base_capabilities() {
         transaction.execute(
-            "INSERT INTO agent_profile_capabilities(profile_id,capability) VALUES(?1,?2)",
+            INSERT_PROFILE_CAPABILITY_SQL,
             params![profile.id().into_uuid().as_bytes(), capability],
         )?;
     }
+    execution_preference::replace_for_profile(
+        transaction,
+        profile.id(),
+        profile.execution_preference(),
+    )?;
     let readback = load_profile(transaction, profile.id())?
         .ok_or(AgentProfileError::ProfileMissing(profile.id()))?;
     if readback != *profile {
@@ -3273,17 +2586,13 @@ fn insert_profile(
     profile: &AgentProfile,
 ) -> Result<(), AgentProfileError> {
     transaction.execute(
-        "INSERT INTO agent_profiles(
-            profile_id,request_id,stable_name,display_name,provider_family,
-            preferred_model,preferred_reasoning,lifecycle_state,creation_origin,
-            created_at_ms,updated_at_ms,last_used_at_ms,revision
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+        INSERT_PROFILE_SQL,
         params![
             profile.id.into_uuid().as_bytes(),
             profile.request_id.as_bytes(),
             profile.stable_name,
             profile.display_name,
-            encode_provider(profile.provider_family),
+            encode_profile_provider(profile.provider_family),
             profile.preferred_model,
             profile.preferred_reasoning,
             encode_lifecycle(profile.lifecycle_state),
@@ -3296,14 +2605,28 @@ fn insert_profile(
     )?;
     for capability in &profile.base_capabilities {
         transaction.execute(
-            "INSERT INTO agent_profile_capabilities(profile_id,capability) VALUES(?1,?2)",
+            INSERT_PROFILE_CAPABILITY_SQL,
             params![profile.id.into_uuid().as_bytes(), capability],
         )?;
+    }
+    if let Some(preference) = profile.execution_preference() {
+        execution_preference::insert_for_profile(transaction, profile.id, preference)?;
     }
     Ok(())
 }
 
 fn load_profile(
+    connection: &Connection,
+    id: AgentProfileId,
+) -> Result<Option<AgentProfile>, AgentProfileError> {
+    let Some(mut profile) = load_profile_base(connection, id)? else {
+        return Ok(None);
+    };
+    profile.execution_preference = execution_preference::load_for_profile(connection, id)?;
+    Ok(Some(profile))
+}
+
+fn load_profile_base(
     connection: &Connection,
     id: AgentProfileId,
 ) -> Result<Option<AgentProfile>, AgentProfileError> {
@@ -3324,10 +2647,7 @@ fn load_profile(
         i64,
     )> = connection
         .query_row(
-            "SELECT profile_id,request_id,stable_name,display_name,provider_family,
-                    preferred_model,preferred_reasoning,lifecycle_state,creation_origin,
-                    created_at_ms,updated_at_ms,last_used_at_ms,revision
-             FROM agent_profiles WHERE profile_id=?1",
+            SELECT_PROFILE_BY_ID_SQL,
             params![id.into_uuid().as_bytes()],
             |row| {
                 Ok((
@@ -3352,9 +2672,7 @@ fn load_profile(
         return Ok(None);
     };
     let mut capabilities = Vec::new();
-    let mut statement = connection.prepare(
-        "SELECT capability FROM agent_profile_capabilities WHERE profile_id=?1 ORDER BY capability",
-    )?;
+    let mut statement = connection.prepare(SELECT_PROFILE_CAPABILITIES_SQL)?;
     let mut rows = statement.query(params![id.into_uuid().as_bytes()])?;
     while let Some(row) = rows.next()? {
         if capabilities.len() >= MAX_CAPABILITIES {
@@ -3385,10 +2703,11 @@ fn load_profile(
         request_id,
         stable_name: raw.2,
         display_name: raw.3,
-        provider_family: decode_provider(raw.4)?,
+        provider_family: decode_profile_provider(raw.4)?,
         preferred_model: raw.5,
         preferred_reasoning: raw.6,
         base_capabilities: capabilities,
+        execution_preference: None,
         lifecycle_state: decode_lifecycle(raw.7)?,
         creation_origin: decode_origin(raw.8)?,
         created_at: TimestampMillis::new(raw.9)?,
@@ -3398,31 +2717,13 @@ fn load_profile(
     }))
 }
 
-fn derive_operational_state(
-    connection: &Connection,
-    profile: &AgentProfile,
-) -> Result<AgentProfileOperationalState, AgentProfileError> {
+fn derive_operational_state(profile: &AgentProfile) -> AgentProfileOperationalState {
     if profile.lifecycle_state() == AgentProfileLifecycleState::Retired {
-        return Ok(AgentProfileOperationalState::Retired);
+        return AgentProfileOperationalState::Retired;
     }
-    let (active, online, failed): (i64, i64, i64) = connection.query_row(
-        "SELECT
-            COALESCE(MAX(CASE WHEN state=3 THEN 1 ELSE 0 END),0),
-            COALESCE(MAX(CASE WHEN state IN(2,4) THEN 1 ELSE 0 END),0),
-            COALESCE(MAX(CASE WHEN state=7 THEN 1 ELSE 0 END),0)
-         FROM agent_profile_runtime_sessions WHERE profile_id=?1",
-        params![profile.id().into_uuid().as_bytes()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    )?;
-    Ok(if active != 0 {
-        AgentProfileOperationalState::Busy
-    } else if online != 0 {
-        AgentProfileOperationalState::Online
-    } else if failed != 0 {
-        AgentProfileOperationalState::Error
-    } else {
-        AgentProfileOperationalState::Offline
-    })
+    // ChatGPT RuntimeSession states are preserved as historical evidence. No
+    // provider adapter is registered to make Unbound or historical rows runnable.
+    AgentProfileOperationalState::Offline
 }
 
 fn decode_profile_id(
@@ -3443,9 +2744,18 @@ fn decode_uuid(field: &'static str, bytes: &[u8]) -> Result<Uuid, AgentProfileEr
     Uuid::from_slice(bytes).map_err(|source| AgentProfileError::Uuid { field, source })
 }
 
-const fn encode_provider(value: AgentProfileProviderFamily) -> i64 {
+const fn encode_profile_provider(value: AgentProfileProviderFamily) -> i64 {
     match value {
+        AgentProfileProviderFamily::Unbound => 0,
         AgentProfileProviderFamily::ChatGpt => 1,
+    }
+}
+
+fn decode_profile_provider(value: i64) -> Result<AgentProfileProviderFamily, AgentProfileError> {
+    match value {
+        0 => Ok(AgentProfileProviderFamily::Unbound),
+        1 => Ok(AgentProfileProviderFamily::ChatGpt),
+        _ => Err(AgentProfileError::Corrupt("invalid provider_family")),
     }
 }
 
@@ -3526,6 +2836,8 @@ fn decode_origin(value: i64) -> Result<AgentProfileCreationOrigin, AgentProfileE
 pub enum AgentProfileError {
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
+    #[error("provider RuntimeSession support is retired")]
+    ProviderRetired,
     #[error(transparent)]
     Timestamp(#[from] forge_domain::TimestampMillisError),
     #[error("Agent Profile identity field is invalid: {0}")]
@@ -3781,7 +3093,6 @@ mod tests {
             Uuid::from_u128(request),
             stable_name.to_owned(),
             format!("{stable_name} display"),
-            AgentProfileProviderFamily::ChatGpt,
             Some("gpt-5.6-luna".to_owned()),
             Some("max".to_owned()),
             vec!["backend".to_owned(), "rust".to_owned()],
@@ -3814,500 +3125,168 @@ mod tests {
         )?)
     }
 
-    fn table_rows(
-        connection: &Connection,
-        table: &str,
-    ) -> Result<Vec<Vec<String>>, Box<dyn Error>> {
-        let sql = format!("SELECT * FROM {table} ORDER BY rowid");
-        let mut statement = connection.prepare(&sql)?;
-        let column_count = statement.column_count();
-        let rows = statement
-            .query_map([], |row| {
-                (0..column_count)
-                    .map(|index| {
-                        let value = row.get_ref(index)?;
-                        let encoded = match value {
-                            rusqlite::types::ValueRef::Null => "N".to_owned(),
-                            rusqlite::types::ValueRef::Integer(value) => format!("I{value}"),
-                            rusqlite::types::ValueRef::Real(value) => format!("R{value:?}"),
-                            rusqlite::types::ValueRef::Text(value) => {
-                                format!("T{}", String::from_utf8_lossy(value))
-                            }
-                            rusqlite::types::ValueRef::Blob(value) => {
-                                let digits = b"0123456789abcdef";
-                                let mut hex = String::with_capacity(value.len() * 2);
-                                for byte in value {
-                                    hex.push(digits[usize::from(byte >> 4)] as char);
-                                    hex.push(digits[usize::from(byte & 0x0f)] as char);
-                                }
-                                format!("B{hex}")
-                            }
-                        };
-                        Ok(encoded)
-                    })
-                    .collect::<Result<Vec<_>, rusqlite::Error>>()
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
-    }
-
-    #[test]
-    fn v1_catalog_migrates_additively_and_preserves_profile_identity() -> Result<(), Box<dyn Error>>
-    {
-        let (path, root) = database("v1-migration")?;
-        let mut connection = Connection::open(&path)?;
-        connection.execute_batch(AGENT_PROFILES_TABLE_SQL)?;
-        connection.execute_batch(AGENT_PROFILE_CAPABILITIES_TABLE_SQL)?;
-        connection.execute_batch(AGENT_PROFILE_LOGICAL_SESSIONS_TABLE_SQL)?;
-        connection.pragma_update(None, "application_id", AGENT_PROFILE_APPLICATION_ID)?;
-        connection.pragma_update(None, "user_version", 1)?;
-        let profile_id = AgentProfileId::from_uuid(Uuid::from_u128(0x901))?;
-        let profile = AgentProfile {
+    fn historical_chatgpt_profile(
+        profile_id: AgentProfileId,
+        request_id: Uuid,
+        stable_name: &str,
+    ) -> Result<AgentProfile, Box<dyn Error>> {
+        Ok(AgentProfile {
             id: profile_id,
-            request_id: Uuid::from_u128(0x902),
-            stable_name: "legacy-profile".to_owned(),
-            display_name: "Legacy Profile".to_owned(),
+            request_id,
+            stable_name: stable_name.to_owned(),
+            display_name: format!("{stable_name} display"),
             provider_family: AgentProfileProviderFamily::ChatGpt,
             preferred_model: Some("gpt-5.6-luna".to_owned()),
             preferred_reasoning: Some("max".to_owned()),
-            base_capabilities: vec!["rust".to_owned()],
+            base_capabilities: vec!["backend".to_owned(), "rust".to_owned()],
+            execution_preference: None,
             lifecycle_state: AgentProfileLifecycleState::Active,
             creation_origin: AgentProfileCreationOrigin::UserManual,
             created_at: TimestampMillis::new(10)?,
             updated_at: TimestampMillis::new(10)?,
             last_used_at: None,
             revision: AgentProfileRevision::new(1)?,
-        };
-        let profile_request_id = profile.request_id();
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        insert_profile(&transaction, &profile)?;
-        transaction.commit()?;
-        drop(connection);
-
-        let catalog = AgentProfileCatalog::open(&path)?;
-        assert_eq!(catalog.resolve(profile_id)?, Some(profile));
-        let history = catalog.runtime_session_history(profile_id)?;
-        assert!(history.sessions().is_empty());
-        assert!(!history.truncated());
-        assert_eq!(
-            catalog.profile_deletion_intent_for_profile(profile_id)?,
-            None
-        );
-        let create_receipt = catalog
-            .mutation_receipt(profile_request_id)?
-            .ok_or("v1 create receipt missing")?;
-        assert_eq!(create_receipt.kind(), ProfileMutationKind::OriginalCreate);
-        assert_eq!(
-            create_receipt.profile().lifecycle_state(),
-            AgentProfileLifecycleState::Active
-        );
-        assert_eq!(create_receipt.profile().revision().get(), 1);
-        assert_eq!(create_receipt.profile().base_capabilities(), ["rust"]);
-        let reopened = Connection::open(&path)?;
-        let version: i64 = reopened.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, AGENT_PROFILE_SCHEMA_VERSION);
-        let objects: i64 = reopened.query_row(
-            "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(objects, 20);
-        let receipts: i64 = reopened.query_row(
-            "SELECT COUNT(*) FROM agent_profile_mutation_receipts",
-            [],
-            |row| row.get(0),
-        )?;
-        let receipt_capabilities: i64 = reopened.query_row(
-            "SELECT COUNT(*) FROM agent_profile_mutation_capabilities",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(receipts, 1);
-        assert_eq!(receipt_capabilities, 1);
-        drop(reopened);
-        drop(catalog);
-        fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    const V5_LEGACY_TABLES: [&str; 8] = [
-        "agent_profiles",
-        "agent_profile_capabilities",
-        "agent_profile_logical_sessions",
-        "agent_profile_runtime_sessions",
-        "agent_profile_resolution_claims",
-        "agent_profile_deletion_requests",
-        "agent_profile_deletion_manifests",
-        "agent_profile_deletion_runtime_entries",
-    ];
-
-    struct V5Fixture {
-        profile: AgentProfile,
-        deletion_request_id: Uuid,
-        before: Vec<Vec<Vec<String>>>,
-    }
-
-    fn v5_fixture_profile() -> Result<AgentProfile, Box<dyn Error>> {
-        Ok(AgentProfile {
-            id: AgentProfileId::from_uuid(Uuid::from_u128(0xC501))?,
-            request_id: Uuid::from_u128(0xC502),
-            stable_name: "v5-full-profile".to_owned(),
-            display_name: "V5 Full Profile".to_owned(),
-            provider_family: AgentProfileProviderFamily::ChatGpt,
-            preferred_model: Some("gpt-5.6-luna".to_owned()),
-            preferred_reasoning: Some("max".to_owned()),
-            base_capabilities: vec!["backend".to_owned(), "rust".to_owned()],
-            lifecycle_state: AgentProfileLifecycleState::Disabled,
-            creation_origin: AgentProfileCreationOrigin::UserManual,
-            created_at: TimestampMillis::new(10)?,
-            updated_at: TimestampMillis::new(20)?,
-            last_used_at: None,
-            revision: AgentProfileRevision::new(2)?,
-        })
-    }
-
-    fn insert_v5_fixture_rows(
-        transaction: &rusqlite::Transaction<'_>,
-        profile: &AgentProfile,
-    ) -> Result<Uuid, Box<dyn Error>> {
-        insert_profile(transaction, profile)?;
-        let session_id = forge_domain::AgentSessionId::from_uuid(Uuid::from_u128(0xC503));
-        transaction.execute(
-            "INSERT INTO agent_profile_logical_sessions(
-                request_id,profile_id,profile_revision,session_id,session_revision,linked_at_ms
-             ) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![
-                Uuid::from_u128(0xC504).as_bytes(),
-                profile.id().into_uuid().as_bytes(),
-                profile.revision().get(),
-                session_id.into_uuid().as_bytes(),
-                1_i64,
-                30_i64,
-            ],
-        )?;
-        let runtime = AgentProfileRuntimeSession {
-            id: AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xC505))?,
-            request_id: Uuid::from_u128(0xC506),
-            profile_id: profile.id(),
-            provider_family: AgentProfileProviderFamily::ChatGpt,
-            provider_conversation_id: Some("v5-conversation".to_owned()),
-            state: AgentProfileRuntimeSessionState::Closed,
-            opened_at: TimestampMillis::new(12)?,
-            last_seen_at: TimestampMillis::new(18)?,
-            closed_at: Some(TimestampMillis::new(18)?),
-            revision: AgentProfileRuntimeSessionRevision::new(2)?,
-        };
-        insert_runtime_session(transaction, &runtime)?;
-        transaction.execute(
-            "INSERT INTO agent_profile_resolution_claims(
-                claim_id,agent_request_id,slot_ordinal,claim_kind,profile_id,profile_revision,
-                runtime_session_id,runtime_session_revision,claimed_at_ms,released_at_ms,state,revision
-             ) VALUES(?1,?2,?3,?4,?5,?6,NULL,NULL,?7,?8,?9,?10)",
-            params![
-                Uuid::from_u128(0xC507).as_bytes(),
-                Uuid::from_u128(0xC508).as_bytes(),
-                0_i64,
-                1_i64,
-                profile.id().into_uuid().as_bytes(),
-                profile.revision().get(),
-                31_i64,
-                32_i64,
-                2_i64,
-                2_i64,
-            ],
-        )?;
-        let deletion_request_id = Uuid::from_u128(0xC509);
-        transaction.execute(
-            "INSERT INTO agent_profile_deletion_requests(
-                request_id,profile_id,expected_profile_revision,barrier_profile_revision,requested_at_ms
-             ) VALUES(?1,?2,?3,?4,?5)",
-            params![
-                deletion_request_id.as_bytes(),
-                profile.id().into_uuid().as_bytes(),
-                1_i64,
-                profile.revision().get(),
-                40_i64,
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO agent_profile_deletion_manifests(
-                request_id,profile_id,profile_revision_at_freeze,frozen_at_ms,completed_at_ms,
-                runtime_entry_count,linked_target_count,no_linked_target_count
-             ) VALUES(?1,?2,?3,?4,NULL,?5,?6,?7)",
-            params![
-                deletion_request_id.as_bytes(),
-                profile.id().into_uuid().as_bytes(),
-                profile.revision().get(),
-                50_i64,
-                1_i64,
-                1_i64,
-                0_i64,
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO agent_profile_deletion_runtime_entries(
-                request_id,runtime_session_id,provider_family,provider_conversation_id,
-                original_state,original_revision
-             ) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![
-                deletion_request_id.as_bytes(),
-                runtime.id().into_uuid().as_bytes(),
-                1_i64,
-                "v5-conversation",
-                8_i64,
-                runtime.revision().get(),
-            ],
-        )?;
-        Ok(deletion_request_id)
-    }
-
-    fn stage_v5_fixture(path: &Path) -> Result<V5Fixture, Box<dyn Error>> {
-        let mut connection = Connection::open(path)?;
-        connection.execute_batch(AGENT_PROFILES_TABLE_SQL)?;
-        connection.execute_batch(AGENT_PROFILE_CAPABILITIES_TABLE_SQL)?;
-        connection.execute_batch(AGENT_PROFILE_LOGICAL_SESSIONS_TABLE_SQL)?;
-        connection.execute_batch(AGENT_PROFILE_RUNTIME_SESSIONS_TABLE_SQL)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        resolver::create_schema(&transaction)?;
-        deletion::create_schema(&transaction)?;
-        deletion::create_manifest_schema(&transaction)?;
-        transaction.pragma_update(None, "application_id", AGENT_PROFILE_APPLICATION_ID)?;
-        transaction.pragma_update(None, "user_version", AGENT_PROFILE_V5_SCHEMA_VERSION)?;
-        let profile = v5_fixture_profile()?;
-        let deletion_request_id = insert_v5_fixture_rows(&transaction, &profile)?;
-        transaction.commit()?;
-        let before = V5_LEGACY_TABLES
-            .iter()
-            .map(|table| table_rows(&connection, table))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(V5Fixture {
-            profile,
-            deletion_request_id,
-            before,
         })
     }
 
     #[test]
-    fn v5_catalog_migration_preserves_every_legacy_table_and_backfills_create_receipt()
+    fn fresh_runtime_session_creation_is_rejected_without_persisting_a_row()
     -> Result<(), Box<dyn Error>> {
-        let (path, root) = database("v5-full-migration")?;
-        let fixture = stage_v5_fixture(&path)?;
-        let catalog = AgentProfileCatalog::open(&path)?;
-        let reopened = Connection::open(&path)?;
-        let after = V5_LEGACY_TABLES
-            .iter()
-            .map(|table| table_rows(&reopened, table))
-            .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(fixture.before, after);
-        let create_receipt = catalog
-            .mutation_receipt(fixture.profile.request_id())?
-            .ok_or("v5 create receipt missing")?;
-        assert_eq!(create_receipt.kind(), ProfileMutationKind::OriginalCreate);
-        assert_eq!(
-            create_receipt.profile().lifecycle_state(),
-            AgentProfileLifecycleState::Active
-        );
-        assert_eq!(create_receipt.profile().revision().get(), 1);
-        assert_eq!(
-            create_receipt.profile().base_capabilities(),
-            ["backend", "rust"]
-        );
-        assert!(
-            catalog
-                .profile_deletion_intent(fixture.deletion_request_id)?
-                .is_some()
-        );
-        assert!(
-            catalog
-                .profile_deletion_manifest(fixture.deletion_request_id)?
-                .is_some()
-        );
-        drop(reopened);
-        drop(catalog);
-        fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn v3_catalog_migrates_to_deletion_intents_without_rewriting_history()
-    -> Result<(), Box<dyn Error>> {
-        let (path, root) = database("v3-deletion-migration")?;
-        let mut connection = Connection::open(&path)?;
-        connection.execute_batch(AGENT_PROFILES_TABLE_SQL)?;
-        connection.execute_batch(AGENT_PROFILE_CAPABILITIES_TABLE_SQL)?;
-        connection.execute_batch(AGENT_PROFILE_LOGICAL_SESSIONS_TABLE_SQL)?;
-        connection.execute_batch(AGENT_PROFILE_RUNTIME_SESSIONS_TABLE_SQL)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        resolver::create_schema(&transaction)?;
-        transaction.pragma_update(None, "application_id", AGENT_PROFILE_APPLICATION_ID)?;
-        transaction.pragma_update(None, "user_version", AGENT_PROFILE_V3_SCHEMA_VERSION)?;
-
-        let profile_id = AgentProfileId::from_uuid(Uuid::from_u128(0xA901))?;
-        let profile = AgentProfile {
-            id: profile_id,
-            request_id: Uuid::from_u128(0xA902),
-            stable_name: "v3-retired-profile".to_owned(),
-            display_name: "V3 Retired Profile".to_owned(),
-            provider_family: AgentProfileProviderFamily::ChatGpt,
-            preferred_model: Some("gpt-5.6-luna".to_owned()),
-            preferred_reasoning: Some("max".to_owned()),
-            base_capabilities: vec!["rust".to_owned()],
-            lifecycle_state: AgentProfileLifecycleState::Retired,
-            creation_origin: AgentProfileCreationOrigin::UserManual,
-            created_at: TimestampMillis::new(10)?,
-            updated_at: TimestampMillis::new(30)?,
-            last_used_at: None,
-            revision: AgentProfileRevision::new(2)?,
-        };
-        let profile_request_id = profile.request_id();
-        insert_profile(&transaction, &profile)?;
-        let runtime = AgentProfileRuntimeSession {
-            id: AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xA903))?,
-            request_id: Uuid::from_u128(0xA904),
-            profile_id,
-            provider_family: AgentProfileProviderFamily::ChatGpt,
-            provider_conversation_id: Some("v3-retained-conversation".to_owned()),
-            state: AgentProfileRuntimeSessionState::Closed,
-            opened_at: TimestampMillis::new(20)?,
-            last_seen_at: TimestampMillis::new(25)?,
-            closed_at: Some(TimestampMillis::new(25)?),
-            revision: AgentProfileRuntimeSessionRevision::new(3)?,
-        };
-        insert_runtime_session(&transaction, &runtime)?;
-        transaction.commit()?;
-        drop(connection);
-
-        let catalog = AgentProfileCatalog::open(&path)?;
-        assert_eq!(catalog.resolve(profile_id)?, Some(profile));
-        assert_eq!(
-            catalog.runtime_session(runtime.id())?,
-            Some(runtime.clone())
-        );
-        assert_eq!(
-            catalog.profile_deletion_intent_for_profile(profile_id)?,
-            None
-        );
-        let create_receipt = catalog
-            .mutation_receipt(profile_request_id)?
-            .ok_or("v3 create receipt missing")?;
-        assert_eq!(
-            create_receipt.profile().lifecycle_state(),
-            AgentProfileLifecycleState::Active
-        );
-        assert_eq!(
-            create_receipt.profile().updated_at(),
-            TimestampMillis::new(10)?
-        );
-        assert_eq!(create_receipt.profile().revision().get(), 1);
-        let page = catalog.runtime_sessions_page(profile_id, None, 32)?;
-        assert_eq!(page.sessions(), [runtime]);
-        let reopened = Connection::open(&path)?;
-        let version: i64 = reopened.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, AGENT_PROFILE_SCHEMA_VERSION);
-        let objects: i64 = reopened.query_row(
-            "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-            [],
-            |row| row.get(0),
+        let (path, root) = database("retired-runtime-session-create")?;
+        let mut catalog = AgentProfileCatalog::open(&path)?;
+        let profile = catalog.create_profile(&command(0xF711, 0xF712, "unbound-profile")?)?;
+        let runtime_id = AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xF713))?;
+        let create = CreateAgentProfileRuntimeSession::new(
+            runtime_id,
+            Uuid::from_u128(0xF714),
+            profile.profile().id(),
+            AgentProfileProviderFamily::ChatGpt,
+            TimestampMillis::new(30)?,
         )?;
-        assert_eq!(objects, 20);
-        drop(reopened);
+
+        assert!(matches!(
+            catalog.create_runtime_session(&create),
+            Err(AgentProfileError::ProviderRetired)
+        ));
+        assert_eq!(catalog.runtime_session(runtime_id)?, None);
+        assert_eq!(
+            catalog
+                .runtime_session_history(profile.profile().id())?
+                .sessions(),
+            []
+        );
         drop(catalog);
         fs::remove_dir_all(root)?;
         Ok(())
     }
 
     #[test]
-    fn v4_catalog_adds_manifest_schema_without_rewriting_intent_or_runtime_rows()
+    fn legacy_provider_deletion_intent_and_manifest_writes_are_retired()
     -> Result<(), Box<dyn Error>> {
-        let (path, root) = database("v4-deletion-manifest-migration")?;
+        let (path, root) = database("legacy-provider-deletion-writes")?;
         let mut connection = Connection::open(&path)?;
-        connection.execute_batch(AGENT_PROFILES_TABLE_SQL)?;
-        connection.execute_batch(AGENT_PROFILE_CAPABILITIES_TABLE_SQL)?;
-        connection.execute_batch(AGENT_PROFILE_LOGICAL_SESSIONS_TABLE_SQL)?;
-        connection.execute_batch(AGENT_PROFILE_RUNTIME_SESSIONS_TABLE_SQL)?;
+        create_schema(&mut connection)?;
+        let active = historical_chatgpt_profile(
+            AgentProfileId::from_uuid(Uuid::from_u128(0xF731))?,
+            Uuid::from_u128(0xF732),
+            "legacy-active-profile",
+        )?;
+        let disabled = historical_chatgpt_profile(
+            AgentProfileId::from_uuid(Uuid::from_u128(0xF733))?,
+            Uuid::from_u128(0xF734),
+            "legacy-disabled-profile",
+        )?;
+        let existing_intent_id = Uuid::from_u128(0xF735);
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        resolver::create_schema(&transaction)?;
-        deletion::create_schema(&transaction)?;
-        transaction.pragma_update(None, "application_id", AGENT_PROFILE_APPLICATION_ID)?;
-        transaction.pragma_update(None, "user_version", AGENT_PROFILE_V4_SCHEMA_VERSION)?;
-
-        let profile_id = AgentProfileId::from_uuid(Uuid::from_u128(0xB901))?;
-        let profile = AgentProfile {
-            id: profile_id,
-            request_id: Uuid::from_u128(0xB902),
-            stable_name: "v4-disabled-profile".to_owned(),
-            display_name: "V4 Disabled Profile".to_owned(),
-            provider_family: AgentProfileProviderFamily::ChatGpt,
-            preferred_model: Some("gpt-5.6-luna".to_owned()),
-            preferred_reasoning: Some("max".to_owned()),
-            base_capabilities: vec!["rust".to_owned()],
-            lifecycle_state: AgentProfileLifecycleState::Disabled,
-            creation_origin: AgentProfileCreationOrigin::UserManual,
-            created_at: TimestampMillis::new(10)?,
-            updated_at: TimestampMillis::new(20)?,
-            last_used_at: None,
-            revision: AgentProfileRevision::new(2)?,
-        };
-        insert_profile(&transaction, &profile)?;
-        let runtime = AgentProfileRuntimeSession {
-            id: AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xB903))?,
-            request_id: Uuid::from_u128(0xB904),
-            profile_id,
-            provider_family: AgentProfileProviderFamily::ChatGpt,
-            provider_conversation_id: Some("v4-retained-conversation".to_owned()),
-            state: AgentProfileRuntimeSessionState::Closed,
-            opened_at: TimestampMillis::new(15)?,
-            last_seen_at: TimestampMillis::new(19)?,
-            closed_at: Some(TimestampMillis::new(19)?),
-            revision: AgentProfileRuntimeSessionRevision::new(3)?,
-        };
-        insert_runtime_session(&transaction, &runtime)?;
-        let request_id = Uuid::from_u128(0xB905);
+        for profile in [&active, &disabled] {
+            insert_profile(&transaction, profile)?;
+            insert_profile_mutation_receipt(
+                &transaction,
+                profile.request_id(),
+                None,
+                ProfileMutationKind::OriginalCreate,
+                profile,
+            )?;
+        }
+        transaction.execute(
+            "UPDATE agent_profiles SET lifecycle_state=2,updated_at_ms=20,revision=2
+             WHERE profile_id=?1",
+            params![disabled.id().into_uuid().as_bytes()],
+        )?;
         transaction.execute(
             "INSERT INTO agent_profile_deletion_requests(
                 request_id,profile_id,expected_profile_revision,
                 barrier_profile_revision,requested_at_ms
-             ) VALUES(?1,?2,?3,?4,?5)",
+             ) VALUES(?1,?2,1,2,20)",
             params![
-                request_id.as_bytes(),
-                profile_id.into_uuid().as_bytes(),
-                1_i64,
-                2_i64,
-                20_i64,
+                existing_intent_id.as_bytes(),
+                disabled.id().into_uuid().as_bytes()
             ],
         )?;
         transaction.commit()?;
         drop(connection);
 
-        let catalog = AgentProfileCatalog::open(&path)?;
-        assert_eq!(catalog.resolve(profile_id)?, Some(profile));
-        assert_eq!(
-            catalog.runtime_session(runtime.id())?,
-            Some(runtime.clone())
-        );
-        let intent = catalog
-            .profile_deletion_intent(request_id)?
-            .ok_or("v4 intent missing")?;
-        assert_eq!(intent.profile_id(), profile_id);
-        assert_eq!(intent.barrier_profile_revision().get(), 2);
-        assert_eq!(catalog.profile_deletion_manifest(request_id)?, None);
-        assert_eq!(
-            catalog
-                .runtime_sessions_page(profile_id, None, 32)?
-                .sessions(),
-            [runtime]
-        );
-        let reopened = Connection::open(&path)?;
-        let version: i64 = reopened.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, AGENT_PROFILE_SCHEMA_VERSION);
-        let objects: i64 = reopened.query_row(
-            "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(objects, 20);
-        drop(reopened);
+        let mut catalog = AgentProfileCatalog::open(&path)?;
+        let fresh_request_id = Uuid::from_u128(0xF736);
+        assert!(matches!(
+            catalog.begin_profile_deletion(&AgentProfileDeletionCommand::new(
+                fresh_request_id,
+                active.id(),
+                active.revision(),
+                TimestampMillis::new(11)?,
+            )?),
+            Err(AgentProfileError::ProviderRetired)
+        ));
+        assert_eq!(catalog.profile_deletion_intent(fresh_request_id)?, None);
+        assert!(matches!(
+            catalog.freeze_profile_deletion_targets(
+                existing_intent_id,
+                AgentProfileRevision::new(2)?,
+                TimestampMillis::new(30)?,
+            ),
+            Err(AgentProfileError::ProviderRetired)
+        ));
+        assert_eq!(catalog.profile_deletion_manifest(existing_intent_id)?, None);
         drop(catalog);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn new_profiles_and_create_receipts_use_unbound_provider_metadata() -> Result<(), Box<dyn Error>>
+    {
+        let (path, root) = database("unbound-profile-metadata")?;
+        let mut catalog = AgentProfileCatalog::open(&path)?;
+        let created = catalog.create_profile(&command(0xF721, 0xF722, "new-unbound-profile")?)?;
+        assert!(created.created());
+        assert_eq!(
+            created.profile().provider_family(),
+            AgentProfileProviderFamily::Unbound
+        );
+        let receipt = catalog
+            .mutation_receipt(created.profile().request_id())?
+            .ok_or("new Profile create receipt missing")?;
+        assert_eq!(
+            receipt.profile().provider_family(),
+            AgentProfileProviderFamily::Unbound
+        );
+        let profile_id = created.profile().id();
+        drop(catalog);
+
+        let reopened = AgentProfileCatalog::open(&path)?;
+        assert_eq!(
+            reopened
+                .resolve(profile_id)?
+                .map(|profile| profile.provider_family()),
+            Some(AgentProfileProviderFamily::Unbound)
+        );
+        assert_eq!(
+            reopened
+                .mutation_receipt(Uuid::from_u128(0xF722))?
+                .map(|receipt| receipt.profile().provider_family()),
+            Some(AgentProfileProviderFamily::Unbound)
+        );
+        drop(reopened);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -4317,18 +3296,20 @@ mod tests {
         profile_id: AgentProfileId,
     ) -> Result<(AgentProfileRuntimeSessionId, AgentProfileRuntimeSession), Box<dyn Error>> {
         let runtime_id = AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xA010))?;
-        let first = catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
-            runtime_id,
-            Uuid::from_u128(0xA011),
-            profile_id,
-            AgentProfileProviderFamily::ChatGpt,
-            TimestampMillis::new(20)?,
-        )?)?;
-        assert!(first.created());
-        assert_eq!(
-            first.session().state(),
-            AgentProfileRuntimeSessionState::Provisioning
-        );
+        let ready = seed_historical_runtime_session(
+            catalog,
+            HistoricalRuntimeFixture {
+                profile_id,
+                runtime_id,
+                request_id: Uuid::from_u128(0xA011),
+                conversation_id: Some("conversation-a".to_owned()),
+                state: AgentProfileRuntimeSessionState::Ready,
+                opened_at: TimestampMillis::new(20)?,
+                last_seen_at: TimestampMillis::new(21)?,
+                closed_at: None,
+                revision: 2,
+            },
+        )?;
         let replay = catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
             AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xA012))?,
             Uuid::from_u128(0xA011),
@@ -4337,107 +3318,19 @@ mod tests {
             TimestampMillis::new(20)?,
         )?)?;
         assert!(!replay.created());
-        assert_eq!(replay.session().id(), runtime_id);
-        assert!(matches!(
-            catalog.transition_runtime_session(
-                runtime_id,
-                AgentProfileRuntimeSessionRevision::new(1)?,
-                AgentProfileRuntimeSessionState::Ready,
-                TimestampMillis::new(21)?,
-            ),
-            Err(AgentProfileError::RuntimeSessionIdentityRequired)
-        ));
-        let ready = catalog.confirm_runtime_session_ready(
-            runtime_id,
-            AgentProfileRuntimeSessionRevision::new(1)?,
-            "conversation-a",
-            TimestampMillis::new(21)?,
-        )?;
+        assert_eq!(replay.session(), &ready);
         let replay_ready = catalog.confirm_runtime_session_ready(
             runtime_id,
             AgentProfileRuntimeSessionRevision::new(1)?,
             "conversation-a",
             TimestampMillis::new(21)?,
         )?;
-        assert_eq!(ready.revision().get(), 2);
         assert_eq!(replay_ready.revision(), ready.revision());
         assert_eq!(
             catalog.operational_state(profile_id)?,
-            Some(AgentProfileOperationalState::Online)
+            Some(AgentProfileOperationalState::Offline)
         );
         Ok((runtime_id, ready))
-    }
-
-    fn drive_runtime_to_closed(
-        catalog: &mut AgentProfileCatalog,
-        profile_id: AgentProfileId,
-        runtime_id: AgentProfileRuntimeSessionId,
-        ready: &AgentProfileRuntimeSession,
-    ) -> Result<AgentProfileRuntimeSession, Box<dyn Error>> {
-        let active = catalog.transition_runtime_session(
-            runtime_id,
-            ready.revision(),
-            AgentProfileRuntimeSessionState::Active,
-            TimestampMillis::new(22)?,
-        )?;
-        assert_eq!(
-            catalog.operational_state(profile_id)?,
-            Some(AgentProfileOperationalState::Busy)
-        );
-        assert!(matches!(
-            catalog.transition_runtime_session(
-                runtime_id,
-                ready.revision(),
-                AgentProfileRuntimeSessionState::Suspending,
-                TimestampMillis::new(23)?,
-            ),
-            Err(AgentProfileError::RuntimeSessionRevisionConflict { .. })
-        ));
-        let suspending = catalog.transition_runtime_session(
-            runtime_id,
-            active.revision(),
-            AgentProfileRuntimeSessionState::Suspending,
-            TimestampMillis::new(23)?,
-        )?;
-        assert_eq!(
-            catalog.operational_state(profile_id)?,
-            Some(AgentProfileOperationalState::Online)
-        );
-        let offline = catalog.transition_runtime_session(
-            runtime_id,
-            suspending.revision(),
-            AgentProfileRuntimeSessionState::Offline,
-            TimestampMillis::new(24)?,
-        )?;
-        assert_eq!(
-            catalog.operational_state(profile_id)?,
-            Some(AgentProfileOperationalState::Offline)
-        );
-        let waking = catalog.transition_runtime_session(
-            runtime_id,
-            offline.revision(),
-            AgentProfileRuntimeSessionState::Waking,
-            TimestampMillis::new(25)?,
-        )?;
-        let ready_again = catalog.transition_runtime_session(
-            runtime_id,
-            waking.revision(),
-            AgentProfileRuntimeSessionState::Ready,
-            TimestampMillis::new(26)?,
-        )?;
-        let closed = catalog.transition_runtime_session(
-            runtime_id,
-            ready_again.revision(),
-            AgentProfileRuntimeSessionState::Closed,
-            TimestampMillis::new(27)?,
-        )?;
-        assert_eq!(closed.state(), AgentProfileRuntimeSessionState::Closed);
-        assert_eq!(closed.closed_at(), Some(TimestampMillis::new(27)?));
-        assert_eq!(
-            catalog.operational_state(profile_id)?,
-            Some(AgentProfileOperationalState::Offline)
-        );
-        Ok(closed)
     }
 
     fn resolved_profile_and_state(
@@ -4471,7 +3364,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_state_projection_preserves_session_priority_and_missing_behavior()
+    fn historical_runtime_states_project_unavailable_and_reject_fresh_transitions()
     -> Result<(), Box<dyn Error>> {
         let (path, _root) = database_with_cleanup("profile-state-projection")?;
         let mut catalog = AgentProfileCatalog::open(&path)?;
@@ -4488,46 +3381,66 @@ mod tests {
         assert_eq!(catalog.resolve_with_operational_state(profile_id)?, initial);
 
         let (ready_id, ready) = prepare_ready_runtime(&mut catalog, profile_id)?;
-        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Online)?;
-
         let failed_id = AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xA103))?;
-        let failed = catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
-            failed_id,
-            Uuid::from_u128(0xA104),
-            profile_id,
-            AgentProfileProviderFamily::ChatGpt,
-            TimestampMillis::new(30)?,
-        )?)?;
-        let failed = catalog.transition_runtime_session(
-            failed_id,
-            failed.session().revision(),
-            AgentProfileRuntimeSessionState::Failed,
-            TimestampMillis::new(31)?,
+        let failed = seed_historical_runtime_session(
+            &mut catalog,
+            HistoricalRuntimeFixture {
+                profile_id,
+                runtime_id: failed_id,
+                request_id: Uuid::from_u128(0xA104),
+                conversation_id: None,
+                state: AgentProfileRuntimeSessionState::Failed,
+                opened_at: TimestampMillis::new(30)?,
+                last_seen_at: TimestampMillis::new(31)?,
+                closed_at: None,
+                revision: 1,
+            },
         )?;
         assert_eq!(failed.state(), AgentProfileRuntimeSessionState::Failed);
-        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Online)?;
-
-        let active = catalog.transition_runtime_session(
-            ready_id,
-            ready.revision(),
-            AgentProfileRuntimeSessionState::Active,
-            TimestampMillis::new(32)?,
-        )?;
-        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Busy)?;
-
-        let _failed = catalog.transition_runtime_session(
-            ready_id,
-            active.revision(),
-            AgentProfileRuntimeSessionState::Failed,
-            TimestampMillis::new(33)?,
-        )?;
-        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Error)?;
-        let _retired = catalog.retire_profile(
+        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Offline)?;
+        assert!(matches!(
+            catalog.transition_runtime_session(
+                ready_id,
+                ready.revision(),
+                AgentProfileRuntimeSessionState::Active,
+                TimestampMillis::new(32)?,
+            ),
+            Err(AgentProfileError::ProviderRetired)
+        ));
+        assert!(matches!(
+            catalog.transition_runtime_session(
+                failed_id,
+                failed.revision(),
+                AgentProfileRuntimeSessionState::Closed,
+                TimestampMillis::new(33)?,
+            ),
+            Err(AgentProfileError::ProviderRetired)
+        ));
+        assert_eq!(catalog.runtime_session(ready_id)?, Some(ready));
+        assert_eq!(catalog.runtime_session(failed_id)?, Some(failed));
+        assert!(matches!(
+            catalog.retire_profile(
             profile_id,
             created.profile().revision(),
             TimestampMillis::new(34)?,
+            ),
+            Err(AgentProfileError::LiveRuntimeSessions(id)) if id == profile_id
+        ));
+
+        let no_runtime_profile = catalog
+            .create_profile(&command(0xA106, 0xA107, "retired-without-runtime")?)?
+            .profile()
+            .clone();
+        let _retired = catalog.retire_profile(
+            no_runtime_profile.id(),
+            no_runtime_profile.revision(),
+            TimestampMillis::new(35)?,
         )?;
-        assert_combined_profile_state(&catalog, profile_id, AgentProfileOperationalState::Retired)?;
+        assert_combined_profile_state(
+            &catalog,
+            no_runtime_profile.id(),
+            AgentProfileOperationalState::Retired,
+        )?;
 
         let missing_id = AgentProfileId::from_uuid(Uuid::from_u128(0xA105))?;
         let missing = resolved_profile_and_state(&catalog, missing_id)?;
@@ -4647,7 +3560,8 @@ mod tests {
     }
 
     #[test]
-    fn runtime_session_cas_drives_derived_operational_state() -> Result<(), Box<dyn Error>> {
+    fn native_runtime_mutations_are_retired_and_historical_rows_remain_readable()
+    -> Result<(), Box<dyn Error>> {
         let (path, root) = database("runtime-state")?;
         let mut catalog = AgentProfileCatalog::open(&path)?;
         let profile = catalog.create_profile(&command(0xA001, 0xA002, "reusable-agent")?)?;
@@ -4656,94 +3570,77 @@ mod tests {
             catalog.operational_state(profile_id)?,
             Some(AgentProfileOperationalState::Offline)
         );
-        let (runtime_id, ready) = prepare_ready_runtime(&mut catalog, profile_id)?;
-        let closed = drive_runtime_to_closed(&mut catalog, profile_id, runtime_id, &ready)?;
-        let offline_runtime_id = AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xA020))?;
-        let offline_created =
-            catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
-                offline_runtime_id,
-                Uuid::from_u128(0xA021),
-                profile_id,
-                AgentProfileProviderFamily::ChatGpt,
-                TimestampMillis::new(30)?,
-            )?)?;
-        let offline_ready = catalog.confirm_runtime_session_ready(
-            offline_runtime_id,
-            offline_created.session().revision(),
-            "conversation-offline",
-            TimestampMillis::new(31)?,
-        )?;
-        let suspending = catalog.transition_runtime_session(
-            offline_runtime_id,
-            offline_ready.revision(),
-            AgentProfileRuntimeSessionState::Suspending,
-            TimestampMillis::new(32)?,
-        )?;
-        let offline = catalog.transition_runtime_session(
-            offline_runtime_id,
-            suspending.revision(),
-            AgentProfileRuntimeSessionState::Offline,
-            TimestampMillis::new(33)?,
-        )?;
-        let _retired = catalog.retire_profile(
-            profile_id,
-            profile.profile().revision(),
-            TimestampMillis::new(34)?,
-        )?;
-        assert_eq!(
-            catalog.operational_state(profile_id)?,
-            Some(AgentProfileOperationalState::Retired)
-        );
-
-        let replay = catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
-            AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xA022))?,
+        let fresh_id = AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xA020))?;
+        let fresh = CreateAgentProfileRuntimeSession::new(
+            fresh_id,
             Uuid::from_u128(0xA021),
             profile_id,
             AgentProfileProviderFamily::ChatGpt,
             TimestampMillis::new(30)?,
+        )?;
+        assert!(matches!(
+            catalog.create_runtime_session(&fresh),
+            Err(AgentProfileError::ProviderRetired)
+        ));
+        assert_eq!(catalog.runtime_session(fresh_id)?, None);
+
+        let (runtime_id, ready) = prepare_ready_runtime(&mut catalog, profile_id)?;
+        let replay = catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
+            AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xA022))?,
+            Uuid::from_u128(0xA011),
+            profile_id,
+            AgentProfileProviderFamily::ChatGpt,
+            TimestampMillis::new(20)?,
         )?)?;
         assert!(!replay.created());
-        assert_eq!(replay.session(), &offline);
+        assert_eq!(replay.session(), &ready);
         assert!(matches!(
-            catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
-                AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xA023))?,
-                Uuid::from_u128(0xA024),
-                profile_id,
-                AgentProfileProviderFamily::ChatGpt,
-                TimestampMillis::new(35)?,
-            )?),
-            Err(AgentProfileError::RuntimeSessionProfileRetired(id)) if id == profile_id
+            catalog.confirm_runtime_session_ready(
+                runtime_id,
+                AgentProfileRuntimeSessionRevision::new(1)?,
+                "conversation-a",
+                TimestampMillis::new(31)?,
+            ),
+            Ok(session) if session == ready
+        ));
+        assert_eq!(
+            catalog.confirm_existing_runtime_wake_observed(
+                runtime_id,
+                AgentProfileRuntimeSessionRevision::new(1)?,
+                "conversation-a",
+                TimestampMillis::new(32)?,
+            )?,
+            ready
+        );
+        assert!(matches!(
+            catalog.transition_runtime_session(
+                runtime_id,
+                ready.revision(),
+                AgentProfileRuntimeSessionState::Active,
+                TimestampMillis::new(33)?,
+            ),
+            Err(AgentProfileError::ProviderRetired)
         ));
         assert!(matches!(
             catalog.transition_runtime_session(
-                offline_runtime_id,
-                offline.revision(),
-                AgentProfileRuntimeSessionState::Waking,
+                runtime_id,
+                ready.revision(),
+                AgentProfileRuntimeSessionState::Closed,
                 TimestampMillis::new(34)?,
             ),
-            Err(AgentProfileError::ProfileNotActive {
-                profile_id: id,
-                lifecycle_state: AgentProfileLifecycleState::Retired,
-            }) if id == profile_id
+            Err(AgentProfileError::ProviderRetired)
         ));
-        assert_eq!(
-            catalog.runtime_session(offline_runtime_id)?,
-            Some(offline.clone())
-        );
-        let cleanup = catalog.transition_runtime_session(
-            offline_runtime_id,
-            offline.revision(),
-            AgentProfileRuntimeSessionState::Closed,
-            TimestampMillis::new(35)?,
-        )?;
-        assert_eq!(cleanup.state(), AgentProfileRuntimeSessionState::Closed);
-        assert_eq!(
-            cleanup.provider_conversation_id(),
-            Some("conversation-offline")
-        );
-
+        assert_eq!(catalog.runtime_session(runtime_id)?, Some(ready.clone()));
+        assert!(matches!(
+            catalog.retire_profile(
+                profile_id,
+                profile.profile().revision(),
+                TimestampMillis::new(35)?,
+            ),
+            Err(AgentProfileError::LiveRuntimeSessions(id)) if id == profile_id
+        ));
         let history = catalog.runtime_session_history(profile_id)?;
-        assert_eq!(history.sessions(), [cleanup, closed]);
+        assert_eq!(history.sessions(), [ready]);
         assert!(!history.truncated());
         drop(catalog);
         fs::remove_dir_all(root)?;
@@ -4760,38 +3657,30 @@ mod tests {
         confirmed_at: i64,
     ) -> Result<AgentProfileRuntimeSession, Box<dyn Error>> {
         let id = AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(runtime))?;
-        let created = catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
-            id,
-            Uuid::from_u128(request),
-            profile,
-            AgentProfileProviderFamily::ChatGpt,
-            TimestampMillis::new(opened_at)?,
-        )?)?;
-        Ok(catalog.confirm_runtime_session_ready(
-            id,
-            created.session().revision(),
-            conversation,
-            TimestampMillis::new(confirmed_at)?,
+        Ok(seed_historical_runtime_session(
+            catalog,
+            HistoricalRuntimeFixture {
+                profile_id: profile,
+                runtime_id: id,
+                request_id: Uuid::from_u128(request),
+                conversation_id: Some(conversation.to_owned()),
+                state: AgentProfileRuntimeSessionState::Ready,
+                opened_at: TimestampMillis::new(opened_at)?,
+                last_seen_at: TimestampMillis::new(confirmed_at)?,
+                closed_at: None,
+                revision: 2,
+            },
         )?)
     }
 
-    #[test]
-    fn runtime_session_inventory_pages_all_states_by_profile_and_uuid() -> Result<(), Box<dyn Error>>
-    {
-        let (path, root) = database("runtime-inventory-page")?;
-        let mut catalog = AgentProfileCatalog::open(&path)?;
-        let profile_id = catalog
-            .create_profile(&command(0xE101, 0xE201, "runtime-inventory-primary")?)?
-            .profile()
-            .id();
-        let other_profile_id = catalog
-            .create_profile(&command(0xE102, 0xE202, "runtime-inventory-other")?)?
-            .profile()
-            .id();
-
+    fn seed_runtime_inventory(
+        catalog: &mut AgentProfileCatalog,
+        profile_id: AgentProfileId,
+        other_profile_id: AgentProfileId,
+    ) -> Result<(), Box<dyn Error>> {
         for index in 0..2_u128 {
             let _ = inventory_ready_runtime(
-                &mut catalog,
+                catalog,
                 other_profile_id,
                 0xE080 + index,
                 0xE280 + index,
@@ -4801,30 +3690,47 @@ mod tests {
             )?;
         }
         for index in 0..35_u128 {
-            let ready = inventory_ready_runtime(
-                &mut catalog,
-                profile_id,
-                0xE100 + index,
-                0xE300 + index,
-                &format!("primary-profile-conversation-{index}"),
-                100 + i64::try_from(index)?,
-                200 + i64::try_from(index)?,
-            )?;
-            let terminal = match index {
-                0 => Some(AgentProfileRuntimeSessionState::Closed),
-                1 => Some(AgentProfileRuntimeSessionState::Failed),
-                _ => None,
+            let (state, last_seen_at, closed_at) = match index {
+                0 => (
+                    AgentProfileRuntimeSessionState::Closed,
+                    300 + i64::try_from(index)?,
+                    Some(300 + i64::try_from(index)?),
+                ),
+                1 => (
+                    AgentProfileRuntimeSessionState::Failed,
+                    300 + i64::try_from(index)?,
+                    None,
+                ),
+                _ => (
+                    AgentProfileRuntimeSessionState::Ready,
+                    200 + i64::try_from(index)?,
+                    None,
+                ),
             };
-            if let Some(state) = terminal {
-                let _ = catalog.transition_runtime_session(
-                    ready.id(),
-                    ready.revision(),
+            let _ = seed_historical_runtime_session(
+                catalog,
+                HistoricalRuntimeFixture {
+                    profile_id,
+                    runtime_id: AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(
+                        0xE100 + index,
+                    ))?,
+                    request_id: Uuid::from_u128(0xE300 + index),
+                    conversation_id: Some(format!("primary-profile-conversation-{index}")),
                     state,
-                    TimestampMillis::new(300 + i64::try_from(index)?)?,
-                )?;
-            }
+                    opened_at: TimestampMillis::new(100 + i64::try_from(index)?)?,
+                    last_seen_at: TimestampMillis::new(last_seen_at)?,
+                    closed_at: closed_at.map(TimestampMillis::new).transpose()?,
+                    revision: 3,
+                },
+            )?;
         }
+        Ok(())
+    }
 
+    fn assert_runtime_inventory_page_contract(
+        catalog: &AgentProfileCatalog,
+        profile_id: AgentProfileId,
+    ) -> Result<(), Box<dyn Error>> {
         let first = catalog.runtime_sessions_page(profile_id, None, 32)?;
         assert_eq!(first.sessions().len(), 32);
         assert_eq!(
@@ -4878,6 +3784,26 @@ mod tests {
             catalog.runtime_sessions_page(profile_id, None, 0),
             Err(AgentProfileError::RuntimeSessionPageLimit { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_session_inventory_pages_all_states_by_profile_and_uuid() -> Result<(), Box<dyn Error>>
+    {
+        let (path, root) = database("runtime-inventory-page")?;
+        let mut catalog = AgentProfileCatalog::open(&path)?;
+        let profile_id = catalog
+            .create_profile(&command(0xE101, 0xE201, "runtime-inventory-primary")?)?
+            .profile()
+            .id();
+        let other_profile_id = catalog
+            .create_profile(&command(0xE102, 0xE202, "runtime-inventory-other")?)?
+            .profile()
+            .id();
+
+        seed_runtime_inventory(&mut catalog, profile_id, other_profile_id)?;
+        assert_runtime_inventory_page_contract(&catalog, profile_id)?;
+
         drop(catalog);
         fs::remove_dir_all(root)?;
         Ok(())
@@ -4991,8 +3917,10 @@ mod tests {
             target,
             TimestampMillis::new(41)?,
         )?;
-        assert!(matches!(catalog.reserve_resolution_claims(&[claim]),
-            Err(AgentProfileError::ResolutionClaimConflict(id)) if id == profile.id()));
+        assert!(matches!(
+            catalog.reserve_resolution_claims(&[claim]),
+            Err(AgentProfileError::ProviderRetired)
+        ));
         assert!(matches!(
             catalog.begin_profile_deletion(&AgentProfileDeletionCommand::new(
                 Uuid::from_u128(0xD570),
@@ -5029,7 +3957,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_wake_during_deletion_retains_facts_without_fresh_activation()
+    fn retired_provider_history_cannot_start_deletion_or_reconcile_a_new_wake()
     -> Result<(), Box<dyn Error>> {
         let (path, root) = database("deletion-wake-observation")?;
         let mut catalog = AgentProfileCatalog::open(&path)?;
@@ -5046,83 +3974,37 @@ mod tests {
             20,
             21,
         )?;
-        let suspending = catalog.transition_runtime_session(
-            ready.id(),
-            ready.revision(),
-            AgentProfileRuntimeSessionState::Suspending,
-            TimestampMillis::new(22)?,
-        )?;
-        let offline = catalog.transition_runtime_session(
-            ready.id(),
-            suspending.revision(),
-            AgentProfileRuntimeSessionState::Offline,
-            TimestampMillis::new(23)?,
-        )?;
-        let _ = catalog.begin_profile_deletion(&AgentProfileDeletionCommand::new(
-            Uuid::from_u128(0xD630),
+        let deletion_request_id = Uuid::from_u128(0xD630);
+        let deletion = AgentProfileDeletionCommand::new(
+            deletion_request_id,
             profile.id(),
             profile.revision(),
             TimestampMillis::new(40)?,
-        )?)?;
+        )?;
+        assert!(matches!(
+            catalog.begin_profile_deletion(&deletion),
+            Err(AgentProfileError::ProviderRetired)
+        ));
+        assert_eq!(catalog.profile_deletion_intent(deletion_request_id)?, None);
         assert!(matches!(
             catalog.transition_runtime_session(
-                offline.id(),
-                offline.revision(),
+                ready.id(),
+                ready.revision(),
                 AgentProfileRuntimeSessionState::Waking,
-                TimestampMillis::new(41)?
+                TimestampMillis::new(41)?,
             ),
-            Err(AgentProfileError::ProfileNotActive { .. })
+            Err(AgentProfileError::ProviderRetired)
         ));
-        assert!(matches!(
-            catalog.confirm_existing_runtime_wake_observed(
-                offline.id(),
-                offline.revision(),
-                "different-conversation",
-                TimestampMillis::new(42)?
-            ),
-            Err(AgentProfileError::RuntimeSessionConversationConflict)
-        ));
-        let observed = catalog.confirm_existing_runtime_wake_observed(
-            offline.id(),
-            offline.revision(),
-            "deletion-wake-conversation",
-            TimestampMillis::new(42)?,
-        )?;
-        assert_eq!(observed.state(), AgentProfileRuntimeSessionState::Ready);
-        assert_eq!(
-            catalog.confirm_existing_runtime_wake_observed(
-                offline.id(),
-                offline.revision(),
-                "deletion-wake-conversation",
-                TimestampMillis::new(43)?
-            )?,
-            observed
-        );
         assert!(matches!(
             catalog.transition_runtime_session(
-                observed.id(),
-                observed.revision(),
-                AgentProfileRuntimeSessionState::Active,
-                TimestampMillis::new(43)?
+                ready.id(),
+                ready.revision(),
+                AgentProfileRuntimeSessionState::Closed,
+                TimestampMillis::new(42)?,
             ),
-            Err(AgentProfileError::ProfileNotActive { .. })
+            Err(AgentProfileError::ProviderRetired)
         ));
-        let closed = catalog.transition_runtime_session(
-            observed.id(),
-            observed.revision(),
-            AgentProfileRuntimeSessionState::Closed,
-            TimestampMillis::new(44)?,
-        )?;
-        assert_eq!(
-            closed.provider_conversation_id(),
-            Some("deletion-wake-conversation")
-        );
-        assert_eq!(
-            catalog
-                .runtime_sessions_page(profile.id(), None, 32)?
-                .sessions(),
-            [closed]
-        );
+        assert_eq!(catalog.runtime_session(ready.id())?, Some(ready));
         drop(catalog);
         fs::remove_dir_all(root)?;
         Ok(())
@@ -5132,12 +4014,6 @@ mod tests {
         profile_id: AgentProfileId,
         intent: AgentProfileDeletionIntent,
         manifest: AgentProfileDeletionManifest,
-        already_closed: AgentProfileRuntimeSession,
-        exact_ready: AgentProfileRuntimeSession,
-        offline_before_freeze: AgentProfileRuntimeSession,
-        pending_session: AgentProfileRuntimeSession,
-        logical_session_id: forge_domain::AgentSessionId,
-        original_link: AgentProfileLogicalSessionLink,
     }
 
     fn stage_deletion_manifest_fixture(
@@ -5147,64 +4023,6 @@ mod tests {
             .create_profile(&command(0xD901, 0xD902, "manifest-finalization")?)?
             .profile()
             .clone();
-        let mut already_closed = None;
-        let mut exact_ready = None;
-        let mut offline_before_freeze = None;
-        for index in 0..32_u128 {
-            let ready = inventory_ready_runtime(
-                catalog,
-                profile.id(),
-                0xD700 + index,
-                0xD800 + index,
-                &format!("manifest-conversation-{index}"),
-                10 + i64::try_from(index)?,
-                20 + i64::try_from(index)?,
-            )?;
-            if index == 0 {
-                already_closed = Some(catalog.transition_runtime_session(
-                    ready.id(),
-                    ready.revision(),
-                    AgentProfileRuntimeSessionState::Closed,
-                    TimestampMillis::new(60)?,
-                )?);
-            } else if index == 1 {
-                exact_ready = Some(ready);
-            } else if index == 2 {
-                let suspending = catalog.transition_runtime_session(
-                    ready.id(),
-                    ready.revision(),
-                    AgentProfileRuntimeSessionState::Suspending,
-                    TimestampMillis::new(59)?,
-                )?;
-                offline_before_freeze = Some(catalog.transition_runtime_session(
-                    suspending.id(),
-                    suspending.revision(),
-                    AgentProfileRuntimeSessionState::Offline,
-                    TimestampMillis::new(60)?,
-                )?);
-            }
-        }
-        let pending_runtime_id = AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xD720))?;
-        let pending_session = catalog
-            .create_runtime_session(&CreateAgentProfileRuntimeSession::new(
-                pending_runtime_id,
-                Uuid::from_u128(0xD820),
-                profile.id(),
-                AgentProfileProviderFamily::ChatGpt,
-                TimestampMillis::new(70)?,
-            )?)?
-            .session()
-            .clone();
-        let logical_session_id = forge_domain::AgentSessionId::from_uuid(Uuid::from_u128(0xD840));
-        let original_link = catalog
-            .link_verified_logical_session(
-                Uuid::from_u128(0xD841),
-                profile.id(),
-                logical_session_id,
-                forge_domain::AgentSessionRevision::new(1)?,
-                TimestampMillis::new(80)?,
-            )?
-            .link();
         let intent = catalog.begin_profile_deletion(&AgentProfileDeletionCommand::new(
             Uuid::from_u128(0xD830),
             profile.id(),
@@ -5221,12 +4039,6 @@ mod tests {
             profile_id: profile.id(),
             intent,
             manifest,
-            already_closed: already_closed.ok_or("missing Closed Runtime")?,
-            exact_ready: exact_ready.ok_or("missing Ready Runtime")?,
-            offline_before_freeze: offline_before_freeze.ok_or("missing Offline Runtime")?,
-            pending_session,
-            logical_session_id,
-            original_link,
         })
     }
 
@@ -5234,9 +4046,9 @@ mod tests {
         catalog: &mut AgentProfileCatalog,
         fixture: &DeletionManifestFixture,
     ) -> Result<(), Box<dyn Error>> {
-        assert_eq!(fixture.manifest.runtime_entry_count(), 33);
-        assert_eq!(fixture.manifest.linked_target_count(), 32);
-        assert_eq!(fixture.manifest.no_linked_target_count(), 1);
+        assert_eq!(fixture.manifest.runtime_entry_count(), 0);
+        assert_eq!(fixture.manifest.linked_target_count(), 0);
+        assert_eq!(fixture.manifest.no_linked_target_count(), 0);
         assert_eq!(fixture.manifest.completed_at(), None);
         assert_eq!(
             catalog.freeze_profile_deletion_targets(
@@ -5246,117 +4058,16 @@ mod tests {
             )?,
             fixture.manifest
         );
-
-        let first =
+        let page =
             catalog.profile_deletion_runtime_entries_page(fixture.intent.request_id(), None, 32)?;
-        assert_eq!(first.entries().len(), 32);
-        assert_eq!(
-            catalog.profile_deletion_runtime_entry(
-                fixture.intent.request_id(),
-                first.entries()[0].runtime_session_id(),
-            )?,
-            Some(first.entries()[0].clone())
-        );
-        assert_eq!(
-            catalog.profile_deletion_runtime_entry(
-                fixture.intent.request_id(),
-                AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xD999))?,
-            )?,
-            None
-        );
-        assert!(first.entries().iter().all(|entry| {
-            entry.request_id() == fixture.intent.request_id()
-                && entry.profile_id() == fixture.profile_id
-        }));
-        assert_eq!(
-            first.entries()[0].target(),
-            &AgentProfileDeletionRuntimeTarget::LinkedProviderConversation {
-                conversation_id: "manifest-conversation-0".to_owned(),
-            }
-        );
-        let cursor = first
-            .next_runtime_id()
-            .ok_or("missing frozen-entry cursor")?;
-        let last = catalog.profile_deletion_runtime_entries_page(
-            fixture.intent.request_id(),
-            Some(cursor),
-            32,
-        )?;
-        assert_eq!(last.entries().len(), 1);
-        assert_eq!(
-            last.entries()[0].runtime_session_id(),
-            fixture.pending_session.id()
-        );
-        assert_eq!(
-            last.entries()[0].target(),
-            &AgentProfileDeletionRuntimeTarget::NoLinkedTarget
-        );
-        assert!(matches!(
-            catalog.confirm_runtime_session_ready(
-                fixture.pending_session.id(),
-                fixture.pending_session.revision(),
-                "late-unfrozen-conversation",
-                TimestampMillis::new(121)?,
-            ),
-            Err(AgentProfileError::ProfileDeletionTargetsFrozen(id))
-                if id == fixture.profile_id
-        ));
-        assert_eq!(
-            catalog.confirm_runtime_session_ready(
-                fixture.exact_ready.id(),
-                fixture.exact_ready.revision(),
-                "manifest-conversation-1",
-                TimestampMillis::new(121)?,
-            )?,
-            fixture.exact_ready
-        );
-        assert_frozen_runtime_mutation_contract(catalog, fixture)?;
-        Ok(())
-    }
-
-    fn assert_frozen_runtime_mutation_contract(
-        catalog: &mut AgentProfileCatalog,
-        fixture: &DeletionManifestFixture,
-    ) -> Result<(), Box<dyn Error>> {
-        assert_eq!(
-            catalog.confirm_existing_runtime_wake_observed(
-                fixture.exact_ready.id(),
-                fixture.exact_ready.revision(),
-                "manifest-conversation-1",
-                TimestampMillis::new(122)?,
-            )?,
-            fixture.exact_ready
-        );
-        assert!(matches!(
-            catalog.confirm_existing_runtime_wake_observed(
-                fixture.offline_before_freeze.id(),
-                fixture.offline_before_freeze.revision(),
-                "manifest-conversation-2",
-                TimestampMillis::new(122)?,
-            ),
-            Err(AgentProfileError::ProfileDeletionTargetsFrozen(id))
-                if id == fixture.profile_id
-        ));
-        assert!(matches!(
-            catalog.transition_runtime_session(
-                fixture.offline_before_freeze.id(),
-                fixture.offline_before_freeze.revision(),
-                AgentProfileRuntimeSessionState::Closed,
-                TimestampMillis::new(123)?,
-            ),
-            Err(AgentProfileError::ProfileDeletionTargetsFrozen(id))
-                if id == fixture.profile_id
-        ));
-        assert_eq!(
-            catalog.runtime_session(fixture.offline_before_freeze.id())?,
-            Some(fixture.offline_before_freeze.clone())
-        );
+        assert!(page.entries().is_empty());
+        assert_eq!(page.next_runtime_id(), None);
         Ok(())
     }
 
     #[test]
-    fn deletion_manifest_freezes_all_runtime_rows_and_finalizes_atomically()
-    -> Result<(), Box<dyn Error>> {
+    fn unbound_empty_deletion_manifest_finalizes_locally_and_replays() -> Result<(), Box<dyn Error>>
+    {
         let (path, root) = database("deletion-manifest-finalization")?;
         let mut catalog = AgentProfileCatalog::open(&path)?;
         let fixture = stage_deletion_manifest_fixture(&mut catalog)?;
@@ -5368,10 +4079,6 @@ mod tests {
             reopened.profile_deletion_manifest(fixture.intent.request_id())?,
             Some(fixture.manifest)
         );
-        assert_eq!(
-            reopened.runtime_session(fixture.already_closed.id())?,
-            Some(fixture.already_closed.clone())
-        );
         let completed = reopened
             .finish_profile_deletion(fixture.intent.request_id(), TimestampMillis::new(200)?)?;
         assert_eq!(completed.completed_at(), Some(TimestampMillis::new(200)?));
@@ -5382,36 +4089,16 @@ mod tests {
                 .lifecycle_state(),
             AgentProfileLifecycleState::Retired
         );
-        assert_eq!(
-            reopened.runtime_session(fixture.already_closed.id())?,
-            Some(fixture.already_closed.clone())
-        );
-        let pending = reopened
-            .runtime_session(fixture.pending_session.id())?
-            .ok_or("frozen Runtime row missing")?;
-        assert_eq!(pending.state(), AgentProfileRuntimeSessionState::Closed);
-        assert_eq!(pending.closed_at(), Some(TimestampMillis::new(200)?));
-        assert_eq!(pending.provider_conversation_id(), None);
-        assert_eq!(
-            reopened.logical_session_link(fixture.logical_session_id)?,
-            Some(fixture.original_link)
+        assert!(
+            reopened
+                .runtime_sessions_page(fixture.profile_id, None, 32)?
+                .sessions()
+                .is_empty()
         );
         assert_eq!(
             reopened
                 .finish_profile_deletion(fixture.intent.request_id(), TimestampMillis::new(201)?,)?,
             completed
-        );
-        let first = reopened.runtime_sessions_page(fixture.profile_id, None, 32)?;
-        let second =
-            reopened.runtime_sessions_page(fixture.profile_id, first.next_runtime_id(), 32)?;
-        assert_eq!(
-            first
-                .sessions()
-                .iter()
-                .chain(second.sessions())
-                .filter(|session| session.state() == AgentProfileRuntimeSessionState::Closed)
-                .count(),
-            33
         );
         drop(reopened);
         fs::remove_dir_all(root)?;
@@ -5419,7 +4106,7 @@ mod tests {
     }
 
     #[test]
-    fn disable_during_deletion_preserves_intent_manifest_and_runtime_rows()
+    fn disable_after_local_deletion_intent_preserves_intent_and_manifest()
     -> Result<(), Box<dyn Error>> {
         let (path, root) = database("disable-during-deletion")?;
         let mut catalog = AgentProfileCatalog::open(&path)?;
@@ -5433,9 +4120,6 @@ mod tests {
         let manifest_before = catalog
             .profile_deletion_manifest(fixture.intent.request_id())?
             .ok_or("deletion manifest missing")?;
-        let runtime_before = catalog
-            .runtime_session(fixture.pending_session.id())?
-            .ok_or("pending Runtime Session missing")?;
         let receipt = catalog.mutate_profile(&mutation_command(
             &profile,
             0xD8F0,
@@ -5453,10 +4137,6 @@ mod tests {
         assert_eq!(
             catalog.profile_deletion_manifest(fixture.intent.request_id())?,
             Some(manifest_before)
-        );
-        assert_eq!(
-            catalog.runtime_session(fixture.pending_session.id())?,
-            Some(runtime_before)
         );
         drop(catalog);
         fs::remove_dir_all(root)?;
@@ -5615,7 +4295,6 @@ mod tests {
                 Uuid::from_u128(0xF201),
                 "configuration-replay".to_owned(),
                 "changed create content".to_owned(),
-                AgentProfileProviderFamily::ChatGpt,
                 Some("gpt-5.6-luna".to_owned()),
                 Some("max".to_owned()),
                 vec!["backend".to_owned(), "rust".to_owned()],
@@ -5761,18 +4440,25 @@ mod tests {
         ));
         assert_eq!(catalog.mutation_receipt(stale.request_id())?, None);
 
-        let runtime = catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
-            AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xF604))?,
-            Uuid::from_u128(0xF605),
-            created.profile().id(),
-            AgentProfileProviderFamily::ChatGpt,
-            TimestampMillis::new(21)?,
-        )?)?;
+        let runtime = seed_historical_runtime_session(
+            &mut catalog,
+            HistoricalRuntimeFixture {
+                profile_id: created.profile().id(),
+                runtime_id: AgentProfileRuntimeSessionId::from_uuid(Uuid::from_u128(0xF604))?,
+                request_id: Uuid::from_u128(0xF605),
+                conversation_id: None,
+                state: AgentProfileRuntimeSessionState::Provisioning,
+                opened_at: TimestampMillis::new(21)?,
+                last_seen_at: TimestampMillis::new(21)?,
+                closed_at: None,
+                revision: 1,
+            },
+        )?;
         let disable = mutation_command(created.profile(), 0xF603, ProfileMutation::Disable, 22)?;
         let disabled = catalog.mutate_profile(&disable)?;
         assert_eq!(
-            catalog.runtime_session(runtime.session().id())?,
-            Some(runtime.session().clone())
+            catalog.runtime_session(runtime.id())?,
+            Some(runtime.clone())
         );
         assert!(matches!(
             catalog.create_runtime_session(&CreateAgentProfileRuntimeSession::new(
@@ -5782,7 +4468,7 @@ mod tests {
                 AgentProfileProviderFamily::ChatGpt,
                 TimestampMillis::new(23)?,
             )?),
-            Err(AgentProfileError::ProfileNotActive { .. })
+            Err(AgentProfileError::ProviderRetired)
         ));
         assert!(matches!(
             catalog.mutate_profile(&mutation_command(
@@ -5864,7 +4550,6 @@ mod tests {
             Uuid::from_u128(0xC201),
             "duplicate-capability".to_owned(),
             "Duplicate Capability".to_owned(),
-            AgentProfileProviderFamily::ChatGpt,
             None,
             None,
             vec!["rust".to_owned(), "rust".to_owned()],
@@ -5981,6 +4666,104 @@ mod tests {
         let opened = AgentProfileCatalog::open(&path);
         assert!(matches!(opened, Err(AgentProfileError::Ownership { .. })));
         assert_eq!(fs::read(&path)?, before);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn execution_preference_lifecycle_matrix() -> Result<(), Box<dyn Error>> {
+        let (path, root) = database("execution-preference-matrix")?;
+        let mut catalog = AgentProfileCatalog::open(&path)?;
+        let default_created =
+            catalog.create_profile(&command(0xE901, 0xE902, "default-unbound-profile")?)?;
+        assert_eq!(
+            catalog
+                .resolve(default_created.profile().id())?
+                .and_then(|p| p.execution_preference().cloned()),
+            None,
+            "default profile has None execution_preference (no implicit fallback)"
+        );
+
+        assert!(RolePromptDigest::new([0_u8; 32]).is_err());
+        let malformed_unicode = format!("aé{}", "0".repeat(61));
+        assert_eq!(malformed_unicode.len(), 64);
+        assert!(RolePromptDigest::from_hex(&malformed_unicode).is_err());
+        assert!(CliEngine::parse("unknown-cli").is_err());
+        let prompt_digest = RolePromptDigest::new([0xab_u8; 32])?;
+        assert_eq!(
+            RolePromptDigest::from_hex(&prompt_digest.to_hex())?,
+            prompt_digest
+        );
+
+        let codex_pref = ExecutionPreference::new(
+            CliEngine::Codex,
+            "gpt-6-luna".to_owned(),
+            Some("max".to_owned()),
+            vec!["verify".to_owned(), "rust".to_owned()],
+            Some(prompt_digest),
+        )?;
+        assert_eq!(codex_pref.capabilities(), ["rust", "verify"]);
+
+        let created = catalog.create_profile(
+            &command(0xE911, 0xE912, "codex-worker")?
+                .with_execution_preference(Some(codex_pref.clone())),
+        )?;
+        assert!(created.created());
+        assert_eq!(created.profile().execution_preference(), Some(&codex_pref));
+
+        let agy_pref = ExecutionPreference::new(
+            CliEngine::Agy,
+            "claude-sonnet-5-5-medium".to_owned(),
+            Some("medium".to_owned()),
+            vec!["review".to_owned()],
+            None,
+        )?;
+        let update_cmd = mutation_command(
+            created.profile(),
+            0xE913,
+            ProfileMutation::Update(
+                configuration("Codex->Agy Worker")?
+                    .with_execution_preference(Some(agy_pref.clone())),
+            ),
+            20,
+        )?;
+        let updated = catalog.mutate_profile(&update_cmd)?;
+        assert!(!updated.replayed());
+        assert_eq!(updated.profile().execution_preference(), Some(&agy_pref));
+
+        let replayed = catalog.mutate_profile(&update_cmd)?;
+        assert!(replayed.replayed());
+        assert_eq!(replayed.profile().execution_preference(), Some(&agy_pref));
+
+        let conflicting_replay = mutation_command(
+            created.profile(),
+            0xE913,
+            ProfileMutation::Update(configuration("Codex->Agy Worker")?),
+            20,
+        )?;
+        assert!(matches!(
+            catalog.mutate_profile(&conflicting_replay),
+            Err(AgentProfileError::ProfileMutationReplayConflict(id)) if id == Uuid::from_u128(0xE913)
+        ));
+
+        let create_receipt = catalog
+            .mutation_receipt(Uuid::from_u128(0xE912))?
+            .ok_or("create receipt missing")?;
+        assert_eq!(
+            create_receipt.profile().execution_preference(),
+            Some(&codex_pref),
+            "immutable OriginalCreate receipt retains original execution_preference"
+        );
+
+        let clear_cmd = mutation_command(
+            updated.profile(),
+            0xE914,
+            ProfileMutation::Update(configuration("Cleared Execution Preference")?),
+            30,
+        )?;
+        let cleared = catalog.mutate_profile(&clear_cmd)?;
+        assert_eq!(cleared.profile().execution_preference(), None);
+        drop(catalog);
         fs::remove_dir_all(root)?;
         Ok(())
     }

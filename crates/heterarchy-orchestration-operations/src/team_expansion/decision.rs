@@ -15,7 +15,10 @@ use super::{
 };
 use crate::{team_expansion::workspace_hold, teams};
 
-const DECISION_SELECT: &str = "SELECT d.decision_id,d.request_id,d.workspace_id,d.team_id,d.state,d.approved_count,d.expected_team_revision,d.capacity_revision,d.leadership_revision,d.actor_activity_id,d.actor_agent_id,d.actor_session_id,d.actor_participation_id,d.actor_profile_id,d.actor_participant_id,d.actor_display_name,d.decided_at_ms,a.anchor_at_ms,a.cooldown_until_ms,a.finalized_by_activity_id,a.finalized_by_agent_id,a.finalized_by_session_id,a.finalized_by_participation_id,a.finalized_by_profile_id,a.finalized_by_participant_id,a.finalized_by_display_name,a.finalized_by_leadership_revision FROM ops_team_expansion_decisions AS d LEFT JOIN ops_team_expansion_cooldown_anchors AS a ON a.workspace_id=d.workspace_id AND a.team_id=d.team_id AND a.request_id=d.request_id AND a.decision_id=d.decision_id";
+const DECISION_SELECT_BY_ID_SQL: &str = crate::static_sql::StaticSql::dml(
+    "SELECT d.decision_id,d.request_id,d.workspace_id,d.team_id,d.state,d.approved_count,d.expected_team_revision,d.capacity_revision,d.leadership_revision,d.actor_activity_id,d.actor_agent_id,d.actor_session_id,d.actor_participation_id,d.actor_profile_id,d.actor_participant_id,d.actor_display_name,d.decided_at_ms,a.anchor_at_ms,a.cooldown_until_ms,a.finalized_by_activity_id,a.finalized_by_agent_id,a.finalized_by_session_id,a.finalized_by_participation_id,a.finalized_by_profile_id,a.finalized_by_participant_id,a.finalized_by_display_name,a.finalized_by_leadership_revision FROM ops_team_expansion_decisions AS d LEFT JOIN ops_team_expansion_cooldown_anchors AS a ON a.workspace_id=d.workspace_id AND a.team_id=d.team_id AND a.request_id=d.request_id AND a.decision_id=d.decision_id WHERE d.workspace_id=?1 AND d.decision_id=?2",
+)
+.as_str();
 
 pub(super) fn decide_team_expansion(
     connection: &mut Connection,
@@ -967,10 +970,9 @@ pub(super) fn load_decision_by_id(
     decision_id: Uuid,
     replayed: bool,
 ) -> Result<Option<TeamExpansionDecisionReceipt>, OperationsError> {
-    let sql = format!("{DECISION_SELECT} WHERE d.workspace_id=?1 AND d.decision_id=?2");
     let raw = connection
         .query_row(
-            &sql,
+            DECISION_SELECT_BY_ID_SQL,
             params![workspace_id.into_uuid().as_bytes(), decision_id.as_bytes()],
             decode_decision_raw,
         )

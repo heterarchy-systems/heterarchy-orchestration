@@ -42,6 +42,13 @@ async fn update(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(body): Json<ProfileUpdateRequest>,
 ) -> Result<Json<ProfileMutationResponse>, ApiError> {
+    let execution_preference = body
+        .execution_preference
+        .as_ref()
+        .map(crate::wire::ExecutionPreferenceWire::to_execution_preference)
+        .transpose()
+        .map_err(crate::RuntimeError::from)
+        .map_err(ApiError::Runtime)?;
     let configuration = ProfileConfiguration::new(
         body.display_name,
         body.preferred_model,
@@ -49,7 +56,8 @@ async fn update(
         body.base_capabilities,
     )
     .map_err(crate::RuntimeError::from)
-    .map_err(ApiError::Runtime)?;
+    .map_err(ApiError::Runtime)?
+    .with_execution_preference(execution_preference);
     mutate(
         state,
         principal,

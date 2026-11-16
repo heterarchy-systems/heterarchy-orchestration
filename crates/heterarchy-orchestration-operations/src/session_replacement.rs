@@ -869,8 +869,8 @@ mod tests {
     use super::*;
     use forge_domain::{AgentSessionOpenRequestId, OpenAgentSession};
     use heterarchy_orchestration_sessions::{
-        AgentProfileCatalog, AgentProfileCreationOrigin, AgentProfileProviderFamily,
-        AgentSessionCatalog, CreateAgentProfile, link_existing_logical_session,
+        AgentProfileCatalog, AgentProfileCreationOrigin, AgentSessionCatalog, CreateAgentProfile,
+        link_existing_logical_session,
     };
     use std::error::Error;
 
@@ -907,7 +907,6 @@ mod tests {
             Uuid::from_u128(0xD002),
             "luna-phase-d".to_owned(),
             "Luna Phase D".to_owned(),
-            AgentProfileProviderFamily::ChatGpt,
             Some("gpt-5.6-luna".to_owned()),
             Some("max".to_owned()),
             vec!["rust".to_owned()],
@@ -1438,74 +1437,6 @@ mod tests {
         );
         let root = fixture.root.clone();
         drop(fixture);
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    fn table_sql(connection: &Connection, name: &str) -> Result<String, rusqlite::Error> {
-        connection.query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
-            params![name],
-            |row| row.get(0),
-        )
-    }
-
-    #[test]
-    fn v21_to_v22_adds_only_the_session_rebind_journal() -> Result<(), Box<dyn Error>> {
-        let root = std::env::temp_dir().join(format!(
-            "orchestration-session-rebind-v21-{}",
-            Uuid::now_v7()
-        ));
-        std::fs::create_dir(&root)?;
-        let path = root.join("operations.sqlite3");
-        let destination = Uuid::from_u128(0xD060);
-        let catalog = OperationsCatalog::open(&path, destination)?;
-        let member_sql = table_sql(&catalog.connection, "ops_logical_members")?;
-        let leadership_sql = table_sql(&catalog.connection, "ops_leadership")?;
-        let work_credit_sql = table_sql(&catalog.connection, "ops_work_credit_entries")?;
-        let participation_sql = table_sql(&catalog.connection, "ops_workspace_participations")?;
-        drop(catalog);
-
-        let connection = Connection::open(&path)?;
-        crate::election_subject::drop_schema_for_legacy_fixture(&connection)?;
-        connection.execute(
-            "DROP TABLE ops_workspace_participation_replacement_registrations",
-            [],
-        )?;
-        connection.execute("DROP TABLE ops_workspace_participation_session_rebinds", [])?;
-        connection.pragma_update(None, "user_version", 21_i64)?;
-        drop(connection);
-
-        let migrated = OperationsCatalog::open(&path, destination)?;
-        let version: i64 = migrated
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, crate::catalog::VERSION);
-        assert_eq!(
-            table_sql(&migrated.connection, "ops_logical_members")?,
-            member_sql
-        );
-        crate::catalog::assert_fixture_table_schema(
-            &migrated.connection,
-            "ops_leadership",
-            &leadership_sql,
-        )?;
-        assert_eq!(
-            table_sql(&migrated.connection, "ops_work_credit_entries")?,
-            work_credit_sql
-        );
-        assert_eq!(
-            table_sql(&migrated.connection, "ops_workspace_participations")?,
-            participation_sql
-        );
-        assert!(
-            !table_sql(
-                &migrated.connection,
-                "ops_workspace_participation_session_rebinds"
-            )?
-            .is_empty()
-        );
-        drop(migrated);
         std::fs::remove_dir_all(root)?;
         Ok(())
     }

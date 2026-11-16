@@ -10,24 +10,20 @@ use uuid::Uuid;
 use crate::wire::node_chat::{
     ChatEntryWire, ChatMessageRequest, ChatQueryWire, ChatReceiptWire, ChatSnapshotWire,
     ChatTargetFenceWire, NodeChatQueryRequest, NodeChatQueryResponse, NodeChatRecoverResponse,
-    NodeChatSendRequest, NodeChatSendResponse, NodeChatTargetWire,
+    NodeChatSendRequest, NodeChatTargetWire,
 };
 use crate::wire::node_team::NodeTeamScopeWire;
 
 use super::membership::validate_scope;
-use super::{
-    ClientError, MAX_REVIEW_RESPONSE_BYTES, OrchestrationHttpClient, ReadbackTarget,
-    require_identity,
-};
+use super::{ClientError, MAX_REVIEW_RESPONSE_BYTES, OrchestrationHttpClient, require_identity};
 
 const MAX_NODE_CHAT_MESSAGES: usize = 64;
-const MAX_NODE_CHAT_TARGETS: usize = 8;
 const MAX_PROFILE_NAME_BYTES: usize = 128;
 const MAX_CHAT_ACTOR_LABEL_BYTES: usize = 128;
 const MAX_CHAT_UNAVAILABLE_REASON_BYTES: usize = 512;
 
 impl OrchestrationHttpClient {
-    /// Read the native 64-message Node Chat page and its bounded target set.
+    /// Read the native 64-message Node Chat history page without a current Provider target.
     ///
     /// The response limit matches the already-bounded review projection limit:
     /// a full page of escaped 16 KiB messages can exceed the ordinary response
@@ -54,36 +50,6 @@ impl OrchestrationHttpClient {
             .await?;
         if !valid_query_response(&response, request) {
             return Err(ClientError::Protocol);
-        }
-        Ok(response)
-    }
-
-    /// Send one exact Node Chat intent without retrying an uncertain exchange.
-    ///
-    /// A lost or malformed success response retains the complete caller intent
-    /// for a later explicit recovery read.
-    ///
-    /// # Errors
-    /// Rejects invalid scopes, fences, or message text; returns a typed service
-    /// rejection or an unknown outcome carrying the complete original request.
-    pub async fn node_chat_send(
-        &self,
-        authorization: &HeaderValue,
-        request: &NodeChatSendRequest,
-    ) -> Result<NodeChatSendResponse, ClientError> {
-        validate_send_request(request)?;
-        let readback = ReadbackTarget::NodeChat(Box::new(request.clone()));
-        let response: NodeChatSendResponse = self
-            .call(
-                authorization,
-                Method::POST,
-                node_chat_path(request.scope.workspace_id, "send"),
-                Some(request),
-                Some(readback.clone()),
-            )
-            .await?;
-        if !valid_send_response(&response, request) {
-            return Err(ClientError::UnknownOutcome { readback });
         }
         Ok(response)
     }
@@ -245,44 +211,12 @@ fn valid_snapshot(snapshot: &ChatSnapshotWire, request: &NodeChatQueryRequest) -
         || snapshot.agent_profile_id.is_some()
         || snapshot.node_scope != Some(node_scope)
         || snapshot.before_sequence != request.query.before_sequence
-        || snapshot.targets.len() > MAX_NODE_CHAT_TARGETS
         || snapshot.messages.len() > MAX_NODE_CHAT_MESSAGES
-        || snapshot
-            .targets
-            .iter()
-            .any(|target| !valid_target_fence(target))
-        || snapshot
-            .target
-            .as_ref()
-            .is_some_and(|target| !valid_target_fence(target))
-        || snapshot
+        || !snapshot
             .unavailable_reason
             .as_ref()
-            .is_some_and(|reason| !bounded_nonempty(reason, MAX_CHAT_UNAVAILABLE_REASON_BYTES))
-        || snapshot.target.is_some() != snapshot.unavailable_reason.is_none()
+            .is_some_and(|reason| bounded_nonempty(reason, MAX_CHAT_UNAVAILABLE_REASON_BYTES))
     {
-        return false;
-    }
-
-    // A runtime selector resolves the first exact target; without one, native
-    // Workbench selects only an unambiguous singleton target set.
-    for (index, target) in snapshot.targets.iter().enumerate() {
-        if snapshot.targets[..index]
-            .iter()
-            .any(|previous| previous.runtime_session_id == target.runtime_session_id)
-        {
-            return false;
-        }
-    }
-    let selected = match request.query.runtime_session_id {
-        Some(runtime_session_id) => snapshot
-            .targets
-            .iter()
-            .find(|target| target.runtime_session_id == runtime_session_id),
-        None if snapshot.targets.len() == 1 => snapshot.targets.first(),
-        None => None,
-    };
-    if snapshot.target.as_ref() != selected {
         return false;
     }
 
@@ -328,10 +262,6 @@ fn valid_entry(entry: &ChatEntryWire, node_scope: NodeTeamScopeWire) -> bool {
         && entry.node_id == Some(node_scope.node_id)
         && entry.sequence > 0
         && entry.submitted_at_ms >= 0
-}
-
-fn valid_send_response(response: &NodeChatSendResponse, request: &NodeChatSendRequest) -> bool {
-    response.request == *request && valid_receipt(&response.receipt, request.request.message_id)
 }
 
 fn valid_recover_response(
@@ -469,17 +399,16 @@ mod tests {
         messages: Vec<ChatEntryWire>,
         next_before_sequence: Option<u64>,
     ) -> ChatSnapshotWire {
-        let fence = target_fence();
         ChatSnapshotWire {
             workspace_id: request.scope.workspace_id,
             agent_profile_id: None,
-            targets: vec![fence.clone()],
-            target: Some(fence),
             messages,
             node_scope: request.query.node_scope,
             before_sequence: request.query.before_sequence,
             next_before_sequence,
-            unavailable_reason: None,
+            unavailable_reason: Some(
+                "Provider-backed chat is retired; stored history remains available.".to_owned(),
+            ),
         }
     }
 
@@ -505,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn send_validation_binds_runtime_and_target_role_and_uses_native_text_limits() {
+    fn recovery_intent_validation_binds_runtime_and_target_role_and_uses_native_text_limits() {
         let request = send_request();
         assert!(validate_send_request(&request).is_ok());
 
@@ -566,41 +495,6 @@ mod tests {
         let mut invalid = snapshot;
         invalid.messages.swap(0, 1);
         assert!(!valid_snapshot(&invalid, &request));
-    }
-
-    #[tokio::test]
-    async fn malformed_send_success_keeps_full_intent_for_readback()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let request = send_request();
-        let payload = json!({
-            "request": request.clone(),
-            "receipt": {
-                "messageId": Uuid::from_u128(29),
-                "providerState": "queued"
-            }
-        });
-        let body = payload.to_string();
-        let reply = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let (client, server) = super::super::tests::fixture(Some(reply)).await?;
-        let result = client
-            .node_chat_send(&HeaderValue::from_static(CREDENTIAL), &request)
-            .await;
-        assert_eq!(
-            result.err(),
-            Some(ClientError::UnknownOutcome {
-                readback: ReadbackTarget::NodeChat(Box::new(request.clone()))
-            })
-        );
-        let captured = server.await??;
-        let captured = String::from_utf8(captured)?;
-        assert!(captured.starts_with(
-            "POST /internal/v1/workspaces/00000000-0000-0000-0000-000000000001/node-chat/send HTTP/1.1"
-        ));
-        assert!(captured.contains("authorization: Bearer node-chat-fixture-secret"));
-        Ok(())
     }
 
     #[tokio::test]

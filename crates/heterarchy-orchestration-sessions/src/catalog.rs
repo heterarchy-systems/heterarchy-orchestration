@@ -29,6 +29,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod home_acceptance;
+mod sql;
 pub use home_acceptance::{
     HomeAcceptanceOperationsAdmission, HomeAcceptanceOperationsResolution,
     HomeAcceptanceSessionAcquireOutcome, HomeAcceptanceSessionError,
@@ -36,14 +37,22 @@ pub use home_acceptance::{
     HomeAcceptanceSessionPendingPage, HomeAcceptanceSessionRecord, HomeAcceptanceSessionResolution,
     HomeAcceptanceSessionState,
 };
+use sql::{
+    AGENT_SESSIONS_INDEX_SQL, AGENT_SESSIONS_TABLE_SQL, CLOSE_SESSION_SQL,
+    COUNT_SCHEMA_OBJECTS_SQL, FOREIGN_KEY_CHECK_SQL, INDEX_INFO_STATE_UPDATED_SQL,
+    INDEX_LIST_AGENT_SESSIONS_SQL, INSERT_SESSION_SQL, LIST_SCHEMA_OBJECTS_SQL, LOAD_SESSION_SQL,
+    QUICK_CHECK_SQL, SELECT_SCHEMA_SQL, SELECT_SCHEMA_SQL_LENGTH_SQL,
+    SELECT_SESSION_ID_BY_REQUEST_ANY_PRINCIPAL_SQL, SELECT_SESSION_ID_BY_REQUEST_SQL,
+    TABLE_INFO_AGENT_SESSIONS_SQL,
+};
 
 /// Application identifier written into `PRAGMA application_id` for this
 /// catalog.  It is deliberately distinct from the Location, token, OAuth,
 /// and connection-settings catalogs.
 pub const AGENT_SESSION_APPLICATION_ID: i64 = 0x4846_4153;
-/// Current schema version for the logical Agent session catalog.
-const AGENT_SESSION_SCHEMA_VERSION_V1: i64 = 1;
-pub const AGENT_SESSION_SCHEMA_VERSION: i64 = 2;
+/// Canonical schema version for the logical Agent session catalog.
+pub const AGENT_SESSION_SCHEMA_VERSION: i64 = 1;
+const AGENT_SESSION_OBJECT_COUNT: i64 = 9;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const JOURNAL_MODE_RETRY_LIMIT: usize = 8;
@@ -51,29 +60,6 @@ const JOURNAL_MODE_RETRY_DELAY: Duration = Duration::from_millis(10);
 const MAX_SCHEMA_SQL_BYTES: usize = 16 * 1024;
 const MAX_SCHEMA_METADATA_ROWS: usize = 256;
 const UUID_BYTES: usize = 16;
-
-// This is the one canonical DDL authority for this catalog.  Creation and
-// validation both consume the same string; tests must inspect the live
-// sqlite_schema entry rather than maintain a second DDL copy.
-const AGENT_SESSIONS_TABLE_SQL: &str = r"
-CREATE TABLE agent_sessions (
-    session_id BLOB PRIMARY KEY NOT NULL CHECK(length(session_id) = 16),
-    principal_kind INTEGER NOT NULL CHECK(principal_kind IN (0, 1, 2)),
-    principal_id BLOB NOT NULL CHECK(length(principal_id) = 16),
-    request_id BLOB NOT NULL CHECK(length(request_id) = 16),
-    state INTEGER NOT NULL CHECK(state IN (1, 2)),
-    created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
-    updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
-    revision INTEGER NOT NULL CHECK(revision > 0),
-    UNIQUE(principal_kind, principal_id, request_id),
-    CHECK((principal_kind = 0 AND principal_id = zeroblob(16)) OR principal_kind IN (1, 2))
-);
-";
-
-const AGENT_SESSIONS_INDEX_SQL: &str = r"
-CREATE INDEX agent_sessions_state_updated_idx
-ON agent_sessions(state, updated_at_ms DESC, session_id);
-";
 
 const EXPECTED_COLUMNS: [(&str, &str, i64, i64); 8] = [
     ("session_id", "BLOB", 1, 1),
@@ -254,24 +240,16 @@ impl AgentSessionCatalog {
         {
             let snapshot = catalog.connection.transaction()?;
             let (application_id, user_version, object_count) = catalog_ownership(&snapshot)?;
-            if application_id != AGENT_SESSION_APPLICATION_ID {
+            if application_id != AGENT_SESSION_APPLICATION_ID
+                || user_version != AGENT_SESSION_SCHEMA_VERSION
+            {
                 return Err(AgentSessionCatalogError::Ownership {
                     application_id,
                     user_version,
                     object_count,
                 });
             }
-            match user_version {
-                AGENT_SESSION_SCHEMA_VERSION_V1 => validate_legacy_schema(&snapshot)?,
-                AGENT_SESSION_SCHEMA_VERSION => validate_schema(&snapshot)?,
-                _ => {
-                    return Err(AgentSessionCatalogError::Ownership {
-                        application_id,
-                        user_version,
-                        object_count,
-                    });
-                }
-            }
+            validate_schema(&snapshot)?;
             snapshot.commit()?;
         }
         catalog.ensure_live_binding()?;
@@ -296,9 +274,7 @@ impl AgentSessionCatalog {
         let request_id = command.request_id().into_uuid().into_bytes();
         let existing_id = transaction
             .query_row(
-                "SELECT session_id
-                 FROM agent_sessions
-                 WHERE principal_kind = ?1 AND principal_id = ?2 AND request_id = ?3",
+                SELECT_SESSION_ID_BY_REQUEST_SQL,
                 params![
                     principal_kind,
                     principal_id.as_slice(),
@@ -365,11 +341,14 @@ impl AgentSessionCatalog {
         self.ensure_live_binding()?;
         let (kind, principal_id) = encode_principal(principal);
         let request_id = request.into_uuid().into_bytes();
-        let id = self.connection.query_row(
-            "SELECT session_id FROM agent_sessions WHERE principal_kind=?1 AND principal_id=?2 AND request_id=?3",
-            params![kind, principal_id.as_slice(), request_id.as_slice()],
-            |row| row.get::<_, Vec<u8>>(0),
-        ).optional()?;
+        let id = self
+            .connection
+            .query_row(
+                SELECT_SESSION_ID_BY_REQUEST_SQL,
+                params![kind, principal_id.as_slice(), request_id.as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
         let session = id
             .map(|id| {
                 let id = decode_session_id(&id, "session_id")?;
@@ -381,7 +360,7 @@ impl AgentSessionCatalog {
             let foreign_id = self
                 .connection
                 .query_row(
-                    "SELECT session_id FROM agent_sessions WHERE request_id=?1 LIMIT 1",
+                    SELECT_SESSION_ID_BY_REQUEST_ANY_PRINCIPAL_SQL,
                     params![request_id.as_slice()],
                     |row| row.get::<_, Vec<u8>>(0),
                 )
@@ -429,10 +408,7 @@ impl AgentSessionCatalog {
         let (principal_kind, principal_id) = encode_principal(principal);
         let id_bytes = id.into_uuid().into_bytes();
         let changed = transaction.execute(
-            "UPDATE agent_sessions
-             SET state = ?1, updated_at_ms = ?2, revision = ?3
-             WHERE session_id = ?4 AND principal_kind = ?5 AND principal_id = ?6
-               AND revision = ?7 AND state = ?8",
+            CLOSE_SESSION_SQL,
             params![
                 encode_state(closed.state()),
                 closed.updated_at().get(),
@@ -630,9 +606,6 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<(), AgentSessio
         let ownership = catalog_ownership(&snapshot)?;
         match ownership {
             (0, 0, 0) => {}
-            (AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION_V1, 2) => {
-                validate_legacy_schema(&snapshot)?;
-            }
             (AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION, _) => {
                 validate_schema(&snapshot)?;
             }
@@ -651,8 +624,8 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<(), AgentSessio
         return Ok(());
     }
 
-    // A create/migration writer must recheck because another opener may have
-    // won between the read snapshot and this IMMEDIATE transaction.
+    // A create writer must recheck because another opener may have won
+    // between the read snapshot and this IMMEDIATE transaction.
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     match catalog_ownership(&transaction)? {
         (0, 0, 0) => {
@@ -661,12 +634,6 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<(), AgentSessio
             home_acceptance::schema::create_schema(&transaction)
                 .map_err(|error| AgentSessionCatalogError::HomeAcceptance(Box::new(error)))?;
             transaction.pragma_update(None, "application_id", AGENT_SESSION_APPLICATION_ID)?;
-            transaction.pragma_update(None, "user_version", AGENT_SESSION_SCHEMA_VERSION)?;
-        }
-        (AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION_V1, 2) => {
-            validate_legacy_schema(&transaction)?;
-            home_acceptance::schema::create_schema(&transaction)
-                .map_err(|error| AgentSessionCatalogError::HomeAcceptance(Box::new(error)))?;
             transaction.pragma_update(None, "user_version", AGENT_SESSION_SCHEMA_VERSION)?;
         }
         (AGENT_SESSION_APPLICATION_ID, AGENT_SESSION_SCHEMA_VERSION, _) => {
@@ -691,53 +658,24 @@ pub(super) fn catalog_ownership(
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let user_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let object_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-        [],
-        |row| row.get(0),
-    )?;
+    let object_count: i64 = connection.query_row(COUNT_SCHEMA_OBJECTS_SQL, [], |row| row.get(0))?;
     Ok((application_id, user_version, object_count))
 }
 
 pub(super) fn validate_schema(connection: &Connection) -> Result<(), AgentSessionCatalogError> {
-    validate_schema_contents(connection, 9)?;
+    validate_schema_contents(connection)?;
     home_acceptance::schema::validate_schema(connection)
         .map_err(|error| AgentSessionCatalogError::HomeAcceptance(Box::new(error)))?;
-    validate_catalog_object_names(connection, true)
+    validate_catalog_object_names(connection)
 }
 
-pub(super) fn validate_legacy_schema(
-    connection: &Connection,
-) -> Result<(), AgentSessionCatalogError> {
-    let (application_id, user_version, object_count) = catalog_ownership(connection)?;
-    if application_id != AGENT_SESSION_APPLICATION_ID
-        || user_version != AGENT_SESSION_SCHEMA_VERSION_V1
-        || object_count != 2
-    {
-        return Err(AgentSessionCatalogError::Ownership {
-            application_id,
-            user_version,
-            object_count,
-        });
-    }
-    validate_schema_contents(connection, 2)?;
-    validate_catalog_object_names(connection, false)
-}
-
-fn validate_schema_contents(
-    connection: &Connection,
-    expected_object_count: i64,
-) -> Result<(), AgentSessionCatalogError> {
-    let quick: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+fn validate_schema_contents(connection: &Connection) -> Result<(), AgentSessionCatalogError> {
+    let quick: String = connection.query_row(QUICK_CHECK_SQL, [], |row| row.get(0))?;
     if quick != "ok" {
         return Err(AgentSessionCatalogError::Integrity);
     }
-    let object_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-        [],
-        |row| row.get(0),
-    )?;
-    if object_count != expected_object_count {
+    let object_count: i64 = connection.query_row(COUNT_SCHEMA_OBJECTS_SQL, [], |row| row.get(0))?;
+    if object_count != AGENT_SESSION_OBJECT_COUNT {
         return Err(AgentSessionCatalogError::Schema("object count"));
     }
     validate_schema_sql(
@@ -752,7 +690,7 @@ fn validate_schema_contents(
         "agent_sessions_state_updated_idx",
         AGENT_SESSIONS_INDEX_SQL,
     )?;
-    let mut statement = connection.prepare("PRAGMA table_info(agent_sessions)")?;
+    let mut statement = connection.prepare(TABLE_INFO_AGENT_SESSIONS_SQL)?;
     let mut rows = statement.query([])?;
     let columns = collect_bounded_metadata(&mut rows, "agent_sessions columns", |row| {
         Ok((
@@ -774,7 +712,7 @@ fn validate_schema_contents(
     if !columns_match {
         return Err(AgentSessionCatalogError::Schema("agent_sessions columns"));
     }
-    let mut index_list = connection.prepare("PRAGMA index_list(agent_sessions)")?;
+    let mut index_list = connection.prepare(INDEX_LIST_AGENT_SESSIONS_SQL)?;
     let mut index_rows = index_list.query([])?;
     let indexes = collect_bounded_metadata(&mut index_rows, "agent_sessions indexes", |row| {
         Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
@@ -792,8 +730,7 @@ fn validate_schema_contents(
             "agent_sessions state index uniqueness",
         ));
     }
-    let mut index_info =
-        connection.prepare("PRAGMA index_info(agent_sessions_state_updated_idx)")?;
+    let mut index_info = connection.prepare(INDEX_INFO_STATE_UPDATED_SQL)?;
     let mut index_rows = index_info.query([])?;
     let index_columns = collect_bounded_metadata(
         &mut index_rows,
@@ -806,7 +743,7 @@ fn validate_schema_contents(
         ));
     }
     let foreign_key_violation = connection
-        .prepare("PRAGMA foreign_key_check")?
+        .prepare(FOREIGN_KEY_CHECK_SQL)?
         .query([])?
         .next()?
         .is_some();
@@ -816,13 +753,8 @@ fn validate_schema_contents(
     Ok(())
 }
 
-fn validate_catalog_object_names(
-    connection: &Connection,
-    include_home: bool,
-) -> Result<(), AgentSessionCatalogError> {
-    let mut statement = connection.prepare(
-        "SELECT type,name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name",
-    )?;
+fn validate_catalog_object_names(connection: &Connection) -> Result<(), AgentSessionCatalogError> {
+    let mut statement = connection.prepare(LIST_SCHEMA_OBJECTS_SQL)?;
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -831,9 +763,7 @@ fn validate_catalog_object_names(
         ("index", "agent_sessions_state_updated_idx"),
         ("table", "agent_sessions"),
     ];
-    if include_home {
-        expected.extend(home_acceptance::schema::object_names());
-    }
+    expected.extend(home_acceptance::schema::object_names());
     expected.sort_unstable();
     if actual.len() != expected.len()
         || actual.iter().zip(expected).any(
@@ -855,8 +785,7 @@ fn validate_schema_sql(
 ) -> Result<(), AgentSessionCatalogError> {
     let length: Option<i64> = connection
         .query_row(
-            "SELECT length(CAST(sql AS BLOB))
-             FROM sqlite_schema WHERE type = ?1 AND name = ?2",
+            SELECT_SCHEMA_SQL_LENGTH_SQL,
             params![object_type, name],
             |row| row.get(0),
         )
@@ -872,11 +801,10 @@ fn validate_schema_sql(
             maximum: MAX_SCHEMA_SQL_BYTES,
         });
     }
-    let sql: String = connection.query_row(
-        "SELECT sql FROM sqlite_schema WHERE type = ?1 AND name = ?2",
-        params![object_type, name],
-        |row| row.get(0),
-    )?;
+    let sql: String =
+        connection.query_row(SELECT_SCHEMA_SQL, params![object_type, name], |row| {
+            row.get(0)
+        })?;
     if normalize_sql(&sql) != normalize_sql(expected) {
         return Err(AgentSessionCatalogError::Schema(name));
     }
@@ -925,10 +853,7 @@ fn insert_session(
     let request_id = session.request_id().into_uuid().into_bytes();
     transaction
         .execute(
-            "INSERT INTO agent_sessions(
-                session_id, principal_kind, principal_id, request_id, state,
-                created_at_ms, updated_at_ms, revision
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            INSERT_SESSION_SQL,
             params![
                 session_id.as_slice(),
                 principal_kind,
@@ -962,24 +887,18 @@ fn load_session(
 ) -> Result<Option<RegisteredAgentSession>, AgentSessionCatalogError> {
     let id_bytes = id.into_uuid().into_bytes();
     let raw = connection
-        .query_row(
-            "SELECT session_id, principal_kind, principal_id, request_id, state,
-                    created_at_ms, updated_at_ms, revision
-             FROM agent_sessions WHERE session_id = ?1",
-            params![id_bytes.as_slice()],
-            |row| {
-                Ok(RawAgentSession {
-                    session_id: row.get(0)?,
-                    principal_kind: row.get(1)?,
-                    principal_id: row.get(2)?,
-                    request_id: row.get(3)?,
-                    state: row.get(4)?,
-                    created_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                    revision: row.get(7)?,
-                })
-            },
-        )
+        .query_row(LOAD_SESSION_SQL, params![id_bytes.as_slice()], |row| {
+            Ok(RawAgentSession {
+                session_id: row.get(0)?,
+                principal_kind: row.get(1)?,
+                principal_id: row.get(2)?,
+                request_id: row.get(3)?,
+                state: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                revision: row.get(7)?,
+            })
+        })
         .optional()?;
     raw.map(decode_session).transpose()
 }
@@ -1490,6 +1409,34 @@ mod tests {
             AgentSessionCatalog::open(&hardlink_path),
             Err(AgentSessionCatalogError::DatabasePathHardlink { .. })
         ));
+        cleanup(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn non_v1_schema_version_is_rejected_without_migration() -> Result<(), Box<dyn Error>> {
+        let (root, path) = database("schema-v2-rejected")?;
+        let catalog = AgentSessionCatalog::open(&path)?;
+        catalog
+            .connection
+            .pragma_update(None, "user_version", 2_i64)?;
+        drop(catalog);
+        let database_before = fs::read(&path)?;
+        assert!(matches!(
+            AgentSessionCatalog::open_existing_read_only(&path),
+            Err(AgentSessionCatalogError::Ownership {
+                user_version: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            AgentSessionCatalog::open(&path),
+            Err(AgentSessionCatalogError::Ownership {
+                user_version: 2,
+                ..
+            })
+        ));
+        assert_eq!(fs::read(&path)?, database_before);
         cleanup(root)?;
         Ok(())
     }

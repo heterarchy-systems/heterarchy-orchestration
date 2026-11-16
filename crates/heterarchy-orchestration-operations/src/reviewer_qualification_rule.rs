@@ -79,7 +79,7 @@ impl QualificationDomain {
         &self.0
     }
 
-    fn validate(&self) -> Result<(), OperationsError> {
+    pub(crate) fn validate(&self) -> Result<(), OperationsError> {
         validate_policy_label(&self.0, "qualification domain")
     }
 }

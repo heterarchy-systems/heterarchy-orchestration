@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use axum::{
@@ -27,7 +27,7 @@ use heterarchy_orchestration_auth::{
 };
 use heterarchy_orchestration_backend::{
     CoordinatorAuthority,
-    client::{ClientError, OrchestrationHttpClient, ReadbackTarget},
+    client::{ClientError, OrchestrationHttpClient},
     forge_commands::ForgeCommandHttpClient,
     forge_source::ForgeSourceHttpClient,
     serve_with_runtime,
@@ -43,8 +43,8 @@ use heterarchy_orchestration_backend::{
             NodeAssignmentTargetWire,
         },
         node_chat::{
-            ChatMessageRequest, ChatProviderStateWire, ChatQueryWire, NodeChatQueryRequest,
-            NodeChatSendRequest,
+            ChatMessageRequest, ChatQueryWire, NodeChatQueryRequest, NodeChatSendRequest,
+            NodeChatTargetWire,
         },
         node_team::NodeTeamScopeWire,
         workspace_chat::{
@@ -54,16 +54,14 @@ use heterarchy_orchestration_backend::{
     },
 };
 use heterarchy_orchestration_operations::{
-    AgentRequestEffectScope, AgentRequestIndependence, BrokerClusterConfig,
-    ConfigureAdmissionIssuerCommand, NodeTeamBindingScope, native_session_participation_id,
+    BrokerClusterConfig, ConfigureAdmissionIssuerCommand, NodeTeamBindingScope,
+    native_session_participation_id,
 };
 use heterarchy_orchestration_runtime::{
     OrchestrationRuntime,
     access::OperatorPolicy,
     leadership::member_agent_id,
     node_team::{NodeTeamSet, NodeTeamSourceObservation},
-    provider_chat::{ProviderIncomingCommand, ProviderIncomingRole},
-    provisioning::AgentRequestSubmit,
     teams::{TeamCreateSpec, TeamRosterMemberSpec},
 };
 use hyper::header::HeaderValue;
@@ -83,12 +81,6 @@ type BackendServer = (
     CancellationToken,
     tokio::task::JoinHandle<Result<(), heterarchy_orchestration_backend::BackendError>>,
 );
-
-fn wall_now_ms() -> Result<i64, Box<dyn Error>> {
-    Ok(i64::try_from(
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
-    )?)
-}
 
 #[derive(Clone)]
 struct FakeForgeState {
@@ -525,7 +517,6 @@ struct ComposedFixture {
     node_target_agent: Uuid,
     target_profile: Uuid,
     target_runtime: Uuid,
-    operation_id: Uuid,
 }
 
 struct FixtureIdentities {
@@ -580,120 +571,14 @@ fn seed_identities(
     })
 }
 
-fn submit_fixture_request(
-    runtime: &OrchestrationRuntime,
-    command: AgentRequestSubmit,
-    claimed_at_ms: i64,
-    reserved_at_ms: i64,
-) -> Result<(), Box<dyn Error>> {
-    let request_id = command.request_id;
-    runtime.submit_agent_request(command)?;
-    runtime.reserve_agent_request_resolution(request_id, claimed_at_ms, reserved_at_ms)?;
-    Ok(())
-}
-
-fn provision_routes(
-    runtime: &OrchestrationRuntime,
-    principal: AuthenticatedPrincipal,
-    workspace_id: Uuid,
-    identities: &FixtureIdentities,
-) -> Result<FixtureRoutes, Box<dyn Error>> {
-    let direct_request = Uuid::from_u128(0x606);
-    submit_fixture_request(
-        runtime,
-        AgentRequestSubmit {
-            workspace_id,
-            activity_id: identities.target_activity,
-            requester_agent_id: identities.sender_agent,
-            requester_session_id: identities.sender_session,
-            coordinator_revision: 1,
-            request_id: direct_request,
-            objective: "composed route".to_owned(),
-            capability: "chat".to_owned(),
-            count: 1,
-            effect_scope: AgentRequestEffectScope::ReadOnly,
-            independence: AgentRequestIndependence::None,
-            reason: "HTTP acceptance".to_owned(),
-            created_at_ms: 4,
-        },
-        5,
-        6,
-    )?;
-    let node_request = Uuid::from_u128(0x610);
-    submit_fixture_request(
-        runtime,
-        AgentRequestSubmit {
-            workspace_id,
-            activity_id: identities.sender_activity,
-            requester_agent_id: identities.sender_agent,
-            requester_session_id: identities.sender_session,
-            coordinator_revision: 1,
-            request_id: node_request,
-            objective: "node composed route".to_owned(),
-            capability: "node-chat".to_owned(),
-            count: 1,
-            effect_scope: AgentRequestEffectScope::ReadOnly,
-            independence: AgentRequestIndependence::None,
-            reason: "HTTP node acceptance".to_owned(),
-            created_at_ms: 7,
-        },
-        8,
-        9,
-    )?;
-    let direct_prepared = runtime.prepare_agent_request_effect_targets(direct_request, 10, 11)?;
-    let node_prepared = runtime.prepare_agent_request_effect_targets(node_request, 12, 13)?;
-    let direct_action = runtime
-        .provider_worker_next_provision(principal, 14)?
-        .ok_or("provider action")?;
-    assert_eq!(
-        direct_action.operation().operation_id(),
-        direct_prepared[0].operation_id
-    );
-    let direct = runtime.provider_worker_confirm_provision(
-        principal,
-        direct_action.operation().operation_id(),
-        direct_action.operation().revision(),
-        "conversation-composed",
-        15,
-    )?;
-    let direct_profile = direct.profile_id().ok_or("target profile")?;
-    let direct_runtime = direct.runtime_session_id().ok_or("target runtime")?;
-    runtime.bind_profile_session(
-        direct.operation_id(),
-        direct_profile.into_uuid(),
-        identities.target_session,
-        principal,
-        16,
-    )?;
-    let node_action = runtime
-        .provider_worker_next_provision(principal, 10_016)?
-        .ok_or("node provider action")?;
-    assert_eq!(
-        node_action.operation().operation_id(),
-        node_prepared[0].operation_id
-    );
-    let node = runtime.provider_worker_confirm_provision(
-        principal,
-        node_action.operation().operation_id(),
-        node_action.operation().revision(),
-        "conversation-node-composed",
-        10_017,
-    )?;
-    let node_profile = node.profile_id().ok_or("node profile")?;
-    runtime.bind_profile_session(
-        node.operation_id(),
-        node_profile.into_uuid(),
-        identities.node_target_session,
-        principal,
-        10_018,
-    )?;
-    Ok(FixtureRoutes {
-        direct_operation: direct.operation_id(),
-        direct_profile: direct_profile.into_uuid(),
-        direct_runtime: direct_runtime.into_uuid(),
-        node_operation: node.operation_id(),
-        node_profile: node_profile.into_uuid(),
-    })
+fn provision_routes() -> FixtureRoutes {
+    FixtureRoutes {
+        direct_operation: Uuid::from_u128(0x606),
+        direct_profile: Uuid::from_u128(0x60C),
+        direct_runtime: Uuid::from_u128(0x60D),
+        node_operation: Uuid::from_u128(0x610),
+        node_profile: Uuid::from_u128(0x613),
+    }
 }
 
 fn seed_operations_catalog(
@@ -794,7 +679,7 @@ impl ComposedFixture {
         let runtime = OrchestrationRuntime::open_with_broker_cluster(&root, broker)?
             .with_operator_policy(OperatorPolicy::new(vec![principal])?);
         let identities = seed_identities(&runtime, principal, scope.workspace_id)?;
-        let routes = provision_routes(&runtime, principal, scope.workspace_id, &identities)?;
+        let routes = provision_routes();
         seed_operations_catalog(
             &root,
             &runtime,
@@ -819,7 +704,6 @@ impl ComposedFixture {
             node_target_agent: identities.node_target_agent,
             target_profile: routes.direct_profile,
             target_runtime: routes.direct_runtime,
-            operation_id: routes.direct_operation,
         })
     }
 }
@@ -1086,20 +970,13 @@ fn direct_wire_requires_null_query_keys_and_rejects_node_or_leadership_fields()
 }
 
 #[tokio::test]
-async fn uncertain_direct_send_retains_exact_intent_while_recovery_stays_pure()
--> Result<(), Box<dyn Error>> {
+async fn exact_direct_recovery_stays_pure() -> Result<(), Box<dyn Error>> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let address: SocketAddr = listener.local_addr()?;
     drop(listener);
     let client = OrchestrationHttpClient::new(address, Duration::from_millis(100))?;
     let authorization = HeaderValue::from_static("Bearer test-credential");
     let request = send_request();
-    assert_eq!(
-        client.workspace_chat_send(&authorization, &request).await,
-        Err(ClientError::UnknownOutcome {
-            readback: ReadbackTarget::WorkspaceChat(Box::new(request.clone()))
-        })
-    );
     assert_eq!(
         client
             .workspace_chat_recover(&authorization, &request)
@@ -1110,13 +987,16 @@ async fn uncertain_direct_send_retains_exact_intent_while_recovery_stays_pure()
 }
 
 #[tokio::test]
-async fn changed_profile_fence_is_rejected_before_transport() -> Result<(), Box<dyn Error>> {
+async fn changed_profile_fence_is_rejected_before_recovery_transport() -> Result<(), Box<dyn Error>>
+{
     let client = OrchestrationHttpClient::new("127.0.0.1:9".parse()?, Duration::from_millis(100))?;
     let authorization = HeaderValue::from_static("Bearer test-credential");
     let mut request = send_request();
     request.request.target_fence.profile_id = Uuid::from_u128(10);
     assert_eq!(
-        client.workspace_chat_send(&authorization, &request).await,
+        client
+            .workspace_chat_recover(&authorization, &request)
+            .await,
         Err(ClientError::InvalidRequest)
     );
     Ok(())
@@ -1126,9 +1006,9 @@ async fn changed_profile_fence_is_rejected_before_transport() -> Result<(), Box<
 #[ignore = "requires AGENT_BROKERD_BIN for an isolated native three-node Broker cluster"]
 #[allow(
     clippy::too_many_lines,
-    reason = "One composed fixture proves the frozen HTTP ordering, provider path, restart recovery and detach negative without live product identities."
+    reason = "One composed fixture proves source admission, history-only Chat reads and restart continuity without live product identities."
 )]
-async fn fake_forge_backend_routes_preserve_admit_chat_and_restart_contracts()
+async fn fake_forge_backend_routes_preserve_admission_history_and_restart_contracts()
 -> Result<(), Box<dyn Error>> {
     let cluster = broker_cluster::Cluster::start().await?;
     let broker = cluster.orchestration_config()?;
@@ -1226,15 +1106,66 @@ async fn fake_forge_backend_routes_preserve_admit_chat_and_restart_contracts()
     })
     .await?
     .map_err(|error| format!("initial direct query failed: {error:?}"))?;
-    assert_eq!(
-        first_direct
-            .snapshot
-            .target
-            .as_ref()
-            .ok_or("direct target")?
-            .operation_id,
-        fixture.operation_id
-    );
+    assert!(first_direct.snapshot.unavailable_reason.is_some());
+    assert!(first_direct.snapshot.messages.is_empty());
+    let direct_history_intent = WorkspaceChatSendRequest {
+        scope: scope.clone(),
+        session_id: fixture.sender_session,
+        sender_activity_id: fixture.sender_activity,
+        request: WorkspaceChatMessageRequest {
+            query: direct_query.query.clone(),
+            message_id: Uuid::now_v7(),
+            text: "read-only historical recovery probe".to_owned(),
+            target_fence: WorkspaceChatTargetFenceWire {
+                operation_id: Uuid::from_u128(0x606),
+                profile_id: fixture.target_profile,
+                profile_name: "legacy-profile".to_owned(),
+                participation_id: Uuid::from_u128(0x60B),
+                participation_revision: 1,
+                runtime_session_id: fixture.target_runtime,
+                runtime_revision: 1,
+                provider_conversation_id: "legacy-conversation".to_owned(),
+            },
+        },
+    };
+    let direct_recovery = client
+        .workspace_chat_recover(&fixture.bearer, &direct_history_intent)
+        .await?;
+    assert_eq!(direct_recovery.request, direct_history_intent);
+    assert!(direct_recovery.receipt.is_none());
+    let node_history_intent = NodeChatSendRequest {
+        scope: scope.clone(),
+        session_id: fixture.sender_session,
+        sender_activity_id: fixture.sender_activity,
+        sender_leadership_revision: 1,
+        request: ChatMessageRequest {
+            query: node_query.query.clone(),
+            message_id: Uuid::now_v7(),
+            text: "read-only node history recovery probe".to_owned(),
+            target_fence: heterarchy_orchestration_backend::wire::node_chat::ChatTargetFenceWire {
+                operation_id: Uuid::from_u128(0x610),
+                profile_id: Uuid::from_u128(0x613),
+                profile_name: "legacy-node-profile".to_owned(),
+                participation_id: Uuid::from_u128(0x612),
+                participation_revision: 1,
+                runtime_session_id: fixture.node_target_session,
+                runtime_revision: 1,
+                provider_conversation_id: "legacy-node-conversation".to_owned(),
+                leadership_revision: None,
+                node_target: Some(NodeChatTargetWire::Agent {
+                    assignment_id: fake_state.assignment_id,
+                    assignment_revision: 1,
+                    agent_id: fixture.node_target_agent,
+                    session_id: fixture.node_target_session,
+                }),
+            },
+        },
+    };
+    let node_recovery = client
+        .node_chat_recover(&fixture.bearer, &node_history_intent)
+        .await?;
+    assert_eq!(node_recovery.request, node_history_intent);
+    assert!(node_recovery.receipt.is_none());
     assert_ne!(fixture.sender_activity, fixture.target_activity);
 
     // Create a Session through the authenticated HTTP surface, then establish
@@ -1329,7 +1260,10 @@ async fn fake_forge_backend_routes_preserve_admit_chat_and_restart_contracts()
     let registrations = Connection::open(fixture.root.join("agent-operations.sqlite3"))?;
     let schema_version: i64 =
         registrations.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    assert_eq!(schema_version, 48);
+    assert_eq!(
+        schema_version,
+        heterarchy_orchestration_operations::OPERATIONS_SCHEMA_VERSION
+    );
     let registration_journal_count: i64 = registrations.query_row(
         "SELECT COUNT(*) FROM ops_registration_requests WHERE request_id=?1",
         params![native_request_id.as_bytes()],
@@ -2282,13 +2216,7 @@ async fn fake_forge_backend_routes_preserve_admit_chat_and_restart_contracts()
     );
 
     let missing = client.node_chat_read(&fixture.bearer, &node_query).await?;
-    assert!(missing.snapshot.target.is_none());
-    assert_eq!(
-        missing.snapshot.unavailable_reason.as_deref(),
-        Some(
-            "This node assignment has not been admitted by Orchestration. History remains available."
-        )
-    );
+    assert!(missing.snapshot.unavailable_reason.is_some());
 
     fake_state.assignment_present.store(false, Ordering::SeqCst);
     let admission_request = offer_request(&fixture, &fake_state)?;
@@ -2325,90 +2253,8 @@ async fn fake_forge_backend_routes_preserve_admit_chat_and_restart_contracts()
     assert_eq!(recovered.admission, Some(first.admission.clone()));
     assert!(!recovered.retry_authorized);
     let admitted = client.node_chat_read(&fixture.bearer, &node_query).await?;
-    let node_target = admitted.snapshot.target.ok_or("admitted node target")?;
-    let node_send = NodeChatSendRequest {
-        scope: scope.clone(),
-        session_id: fixture.sender_session,
-        sender_activity_id: fixture.sender_activity,
-        sender_leadership_revision: 1,
-        request: ChatMessageRequest {
-            query: node_query.query.clone(),
-            message_id: Uuid::from_u128(0x790),
-            text: "node research request".to_owned(),
-            target_fence: node_target,
-        },
-    };
-    let node_receipt = client.node_chat_send(&fixture.bearer, &node_send).await?;
-    assert_eq!(
-        node_receipt.receipt.message_id,
-        node_send.request.message_id
-    );
-    let direct_target = first_direct.snapshot.target.ok_or("direct target")?;
-    let direct_send = WorkspaceChatSendRequest {
-        scope: scope.clone(),
-        session_id: fixture.sender_session,
-        sender_activity_id: fixture.sender_activity,
-        request: WorkspaceChatMessageRequest {
-            query: direct_query.query.clone(),
-            message_id: Uuid::from_u128(0x780),
-            text: "direct research request".to_owned(),
-            target_fence: direct_target,
-        },
-    };
-    let direct_receipt = client
-        .workspace_chat_send(&fixture.bearer, &direct_send)
-        .await?;
-    assert_eq!(
-        direct_receipt.receipt.message_id,
-        direct_send.request.message_id
-    );
-    let provider_now = wall_now_ms()?;
-    let node_dispatch = fixture
-        .runtime
-        .provider_worker_next_message(fixture.principal, provider_now)?
-        .ok_or("node dispatch")?;
-    assert_eq!(
-        node_dispatch.outbox.message_id(),
-        node_send.request.message_id
-    );
-    let node_body = node_dispatch.body.ok_or("node dispatch body")?;
-    let _node_delivered = fixture.runtime.provider_worker_confirm_message_delivery(
-        fixture.principal,
-        node_send.request.message_id,
-        node_dispatch.outbox.revision(),
-        "conversation-node-composed",
-        "node-user-turn".to_owned(),
-        node_body,
-        provider_now + 1,
-    )?;
-    let dispatch = fixture
-        .runtime
-        .provider_worker_next_message(fixture.principal, provider_now + 2)?
-        .ok_or("direct dispatch")?;
-    assert_eq!(dispatch.outbox.message_id(), direct_send.request.message_id);
-    let delivered_body = dispatch.body.ok_or("direct dispatch body")?;
-    let _delivered = fixture.runtime.provider_worker_confirm_message_delivery(
-        fixture.principal,
-        direct_send.request.message_id,
-        dispatch.outbox.revision(),
-        "conversation-composed",
-        "user-turn".to_owned(),
-        delivered_body,
-        provider_now + 3,
-    )?;
-    let incoming_command = ProviderIncomingCommand {
-        reply_to_message_id: direct_send.request.message_id,
-        provider_conversation_id: "conversation-composed".to_owned(),
-        provider_turn_id: "assistant-turn".to_owned(),
-        role: ProviderIncomingRole::Assistant,
-        body: "assistant evidence".to_owned(),
-    };
-    let incoming = fixture.runtime.provider_worker_record_incoming(
-        fixture.principal,
-        incoming_command.clone(),
-        provider_now + 4,
-    )?;
-    assert!(incoming.created());
+    assert!(admitted.snapshot.unavailable_reason.is_some());
+    assert!(admitted.snapshot.messages.is_empty());
 
     let native_direct_query = WorkspaceChatQueryRequest {
         scope: scope.clone(),
@@ -2424,94 +2270,8 @@ async fn fake_forge_backend_routes_preserve_admit_chat_and_restart_contracts()
     let native_direct = client
         .workspace_chat_read(&fixture.bearer, &native_direct_query)
         .await?;
-    assert_eq!(
-        native_direct
-            .snapshot
-            .target
-            .as_ref()
-            .ok_or("native sender Profile target")?
-            .operation_id,
-        fixture.operation_id
-    );
-    let native_target_fence = native_direct
-        .snapshot
-        .target
-        .clone()
-        .ok_or("native sender Profile target fence")?;
-    let native_send = WorkspaceChatSendRequest {
-        scope: scope.clone(),
-        session_id: native_session,
-        sender_activity_id: native_activity,
-        request: WorkspaceChatMessageRequest {
-            query: native_direct_query.query.clone(),
-            message_id: Uuid::from_u128(0x781),
-            text: "native sender to the existing Profile recipient".to_owned(),
-            target_fence: native_target_fence,
-        },
-    };
-    let native_receipt = client
-        .workspace_chat_send(&fixture.bearer, &native_send)
-        .await?;
-    let native_replay = client
-        .workspace_chat_send(&fixture.bearer, &native_send)
-        .await?;
-    assert_eq!(native_replay.receipt, native_receipt.receipt);
-    let native_recovery = client
-        .workspace_chat_recover(&fixture.bearer, &native_send)
-        .await?
-        .receipt
-        .ok_or("exact native sender recovery")?;
-    assert_eq!(native_recovery, native_receipt.receipt);
-    assert_eq!(
-        native_receipt.receipt.message_id,
-        native_send.request.message_id
-    );
-    let native_queued = client
-        .workspace_chat_read(&fixture.bearer, &native_direct_query)
-        .await?;
-    let native_entries = native_queued
-        .snapshot
-        .messages
-        .iter()
-        .filter(|entry| entry.id == native_send.request.message_id)
-        .collect::<Vec<_>>();
-    assert_eq!(native_entries.len(), 1);
-    assert_eq!(native_entries[0].actor_label, "Codex Main");
-    assert_eq!(native_entries[0].body, native_send.request.text);
-    assert_eq!(
-        native_entries[0].provider_state,
-        Some(ChatProviderStateWire::Queued)
-    );
-    let native_author = Connection::open(fixture.root.join("agent-operations.sqlite3"))?.query_row(
-        "SELECT author_kind,author_participation_id,author_profile_id,author_participant_id,author_session_id,author_display_name FROM ops_workspace_messages WHERE message_id=?1",
-        params![native_send.request.message_id.as_bytes()],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<Vec<u8>>>(1)?,
-                row.get::<_, Option<Vec<u8>>>(2)?,
-                row.get::<_, Option<Vec<u8>>>(3)?,
-                row.get::<_, Option<Vec<u8>>>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        },
-    )?;
-    assert_eq!(native_author.0, 4);
-    assert_eq!(native_author.1, None);
-    assert_eq!(native_author.2, None);
-    assert_eq!(
-        native_author.3,
-        Some(native_participant.as_bytes().to_vec())
-    );
-    assert_eq!(native_author.4, Some(native_session.as_bytes().to_vec()));
-    assert_eq!(native_author.5, "Codex Main");
-    let native_message_count: i64 =
-        Connection::open(fixture.root.join("agent-operations.sqlite3"))?.query_row(
-            "SELECT COUNT(*) FROM ops_workspace_messages WHERE message_id=?1",
-            params![native_send.request.message_id.as_bytes()],
-            |row| row.get(0),
-        )?;
-    assert_eq!(native_message_count, 1);
+    assert!(native_direct.snapshot.unavailable_reason.is_some());
+    assert!(native_direct.snapshot.messages.is_empty());
 
     cancellation.cancel();
     server.await??;
@@ -2583,38 +2343,16 @@ async fn fake_forge_backend_routes_preserve_admit_chat_and_restart_contracts()
         unassigned_admission_after_restart.admission,
         Some(unassigned_first.admission.clone())
     );
-    let direct_after_restart = restarted
-        .workspace_chat_recover(&bearer, &direct_send)
-        .await?
-        .receipt
-        .ok_or("restart direct receipt")?;
-    assert_eq!(
-        direct_after_restart.message_id,
-        direct_send.request.message_id
-    );
-    let native_after_restart = restarted
-        .workspace_chat_recover(&bearer, &native_send)
-        .await?
-        .receipt
-        .ok_or("reopened native sender receipt")?;
-    assert_eq!(native_after_restart, native_receipt.receipt);
     let native_history_after_restart = restarted
         .workspace_chat_read(&bearer, &native_direct_query)
         .await?;
-    let native_reopened_entries = native_history_after_restart
-        .snapshot
-        .messages
-        .iter()
-        .filter(|entry| entry.id == native_send.request.message_id)
-        .collect::<Vec<_>>();
-    assert_eq!(native_reopened_entries.len(), 1);
-    assert_eq!(
-        native_reopened_entries[0].provider_state,
-        Some(ChatProviderStateWire::Queued)
+    assert!(native_history_after_restart.snapshot.messages.is_empty());
+    assert!(
+        native_history_after_restart
+            .snapshot
+            .unavailable_reason
+            .is_some()
     );
-    let duplicate =
-        reopened.provider_worker_record_incoming(principal, incoming_command, provider_now + 5)?;
-    assert!(!duplicate.created());
     let detach = Connection::open(root.join("agent-operations.sqlite3"))?;
     assert_eq!(
         detach.execute(
@@ -2635,7 +2373,6 @@ async fn fake_forge_backend_routes_preserve_admit_chat_and_restart_contracts()
             },
         )
         .await?;
-    assert!(unavailable.snapshot.target.is_none());
     assert!(unavailable.snapshot.unavailable_reason.is_some());
 
     restarted_cancel.cancel();

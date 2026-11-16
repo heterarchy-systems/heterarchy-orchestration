@@ -1,6 +1,6 @@
 use super::super::{
-    AgentProfileCreationOrigin, AgentProfileDeletionCommand, AgentProfileProviderFamily,
-    CreateAgentProfile, ProfileMutation, ProfileMutationCommand,
+    AgentProfileCreationOrigin, AgentProfileDeletionCommand, CreateAgentProfile, ProfileMutation,
+    ProfileMutationCommand,
 };
 use super::*;
 use crate::catalog::{AgentSessionCatalog, HomeAcceptanceSessionAcquireOutcome};
@@ -52,7 +52,6 @@ fn created_profile(
             Uuid::from_u128(seed + 2),
             stable_name.to_owned(),
             format!("{stable_name} display"),
-            AgentProfileProviderFamily::ChatGpt,
             None,
             None,
             vec!["backend".to_owned()],
@@ -276,79 +275,47 @@ fn multiple_profile_pins_block_mutations_without_changing_profile() -> Result<()
 }
 
 #[test]
-fn current_profile_and_v6_to_v7_migration_preserve_logical_link_history()
+fn current_profile_reopen_preserves_logical_link_history_without_fabricating_pins()
 -> Result<(), Box<dyn Error>> {
-    let fixture = profile_fixture("v6-profile-migration")?;
+    let fixture = profile_fixture("canonical-profile-reopen")?;
     let history_before = fixture
         .profiles
         .logical_session_history(fixture.profile.id())?;
     assert_eq!(history_before.links().len(), 1);
-    crate::profile_catalog::home_acceptance::schema::downgrade_empty_to_v6_for_test(
-        &fixture.profiles.connection,
-    )?;
     assert_eq!(
         fixture
             .profiles
             .connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        super::super::AGENT_PROFILE_V6_SCHEMA_VERSION,
+        super::super::AGENT_PROFILE_SCHEMA_VERSION,
     );
     drop(fixture.profiles);
     let profile_path = fixture.root.0.join("profiles.sqlite");
 
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
-    let mut migrations = Vec::new();
-    for _ in 0..2 {
-        let path = profile_path.clone();
-        let barrier = std::sync::Arc::clone(&barrier);
-        migrations.push(std::thread::spawn(move || {
-            let mut connection = match rusqlite::Connection::open(path) {
-                Ok(connection) => connection,
-                Err(error) => return Err(error.to_string()),
-            };
-            if let Err(error) = connection.busy_timeout(crate::profile_catalog::BUSY_TIMEOUT) {
-                return Err(error.to_string());
-            }
-            barrier.wait();
-            crate::profile_catalog::migrate_v6_to_v7(&mut connection)
-                .map_err(|error| error.to_string())
-        }));
-    }
-    barrier.wait();
-    for migration in migrations {
-        let result = migration
-            .join()
-            .map_err(|_| std::io::Error::other("Profile migration worker panicked"))?;
-        assert!(
-            result.is_ok(),
-            "concurrent Profile migration failed: {result:?}"
-        );
-    }
-
-    let migrated = AgentProfileCatalog::open(profile_path)?;
+    let reopened = AgentProfileCatalog::open(profile_path)?;
     assert_eq!(
-        migrated
+        reopened
             .connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
         super::super::AGENT_PROFILE_SCHEMA_VERSION,
     );
     assert_eq!(
-        migrated.resolve(fixture.profile.id())?.as_ref(),
+        reopened.resolve(fixture.profile.id())?.as_ref(),
         Some(&fixture.profile)
     );
     assert_eq!(
-        migrated.logical_session_link(fixture.session.id())?,
+        reopened.logical_session_link(fixture.session.id())?,
         Some(history_before.links()[0])
     );
     assert_eq!(
-        migrated.logical_session_history(fixture.profile.id())?,
+        reopened.logical_session_history(fixture.profile.id())?,
         history_before
     );
-    let pin_count: i64 = migrated.connection.query_row(
+    let pin_count: i64 = reopened.connection.query_row(
         "SELECT COUNT(*) FROM agent_profile_home_acceptance_pins",
         [],
         |row| row.get(0),
     )?;
-    assert_eq!(pin_count, 0, "v6 migration fabricates no Home pin");
+    assert_eq!(pin_count, 0, "canonical reopen fabricates no Home pin");
     Ok(())
 }

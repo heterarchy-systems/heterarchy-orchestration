@@ -1,22 +1,21 @@
-//! Official no-retry client for Profile-direct Workspace Chat.
+//! Official client for Profile-direct Workspace Chat history and recovery.
 
 use hyper::Method;
 use hyper::header::HeaderValue;
 
 use crate::wire::workspace_chat::{
     WorkspaceChatQueryRequest, WorkspaceChatQueryResponse, WorkspaceChatQueryWire,
-    WorkspaceChatRecoverResponse, WorkspaceChatSendRequest, WorkspaceChatSendResponse,
-    WorkspaceChatSnapshotWire, WorkspaceChatTargetFenceWire,
+    WorkspaceChatRecoverResponse, WorkspaceChatSendRequest, WorkspaceChatSnapshotWire,
+    WorkspaceChatTargetFenceWire,
 };
 
 use super::membership::validate_scope;
-use super::{ClientError, OrchestrationHttpClient, ReadbackTarget, require_identity};
+use super::{ClientError, OrchestrationHttpClient, require_identity};
 
-const MAX_TARGETS: usize = 8;
 const MAX_MESSAGES: usize = 64;
 
 impl OrchestrationHttpClient {
-    /// Read one exact Profile-direct route and bounded direct history.
+    /// Read bounded Profile-direct history for one exact Workspace/Profile selector.
     ///
     /// # Errors
     /// Rejects malformed requests, typed service failures and foreign or
@@ -38,34 +37,6 @@ impl OrchestrationHttpClient {
             .await?;
         if response.request != *request || !valid_snapshot(&response.snapshot, &request.query) {
             return Err(ClientError::Protocol);
-        }
-        Ok(response)
-    }
-
-    /// Append and enqueue one immutable Profile-direct message without retry.
-    ///
-    /// # Errors
-    /// Rejects malformed requests and service failures. Transport uncertainty
-    /// retains the complete original request for pure recovery.
-    pub async fn workspace_chat_send(
-        &self,
-        authorization: &HeaderValue,
-        request: &WorkspaceChatSendRequest,
-    ) -> Result<WorkspaceChatSendResponse, ClientError> {
-        validate_send_request(request)?;
-        let readback = ReadbackTarget::WorkspaceChat(Box::new(request.clone()));
-        let response: WorkspaceChatSendResponse = self
-            .call(
-                authorization,
-                Method::POST,
-                path(request.scope.workspace_id, "send"),
-                Some(request),
-                Some(readback.clone()),
-            )
-            .await?;
-        if response.request != *request || response.receipt.message_id != request.request.message_id
-        {
-            return Err(ClientError::UnknownOutcome { readback });
         }
         Ok(response)
     }
@@ -170,20 +141,11 @@ fn valid_snapshot(snapshot: &WorkspaceChatSnapshotWire, query: &WorkspaceChatQue
     snapshot.workspace_id == query.workspace_id
         && snapshot.agent_profile_id == query.agent_profile_id
         && snapshot.before_sequence == query.before_sequence
-        && snapshot.targets.len() <= MAX_TARGETS
         && snapshot.messages.len() <= MAX_MESSAGES
-        && snapshot.targets.iter().all(|fence| {
-            validate_fence(fence, query.agent_profile_id).is_ok()
-                && query
-                    .runtime_session_id
-                    .is_none_or(|runtime| fence.runtime_session_id == runtime)
-        })
-        && snapshot.target.as_ref().is_none_or(|target| {
-            snapshot.targets.contains(target)
-                && query
-                    .runtime_session_id
-                    .is_none_or(|runtime| target.runtime_session_id == runtime)
-        })
+        && snapshot
+            .unavailable_reason
+            .as_ref()
+            .is_some_and(|reason| !reason.is_empty() && reason.len() <= 512)
         && snapshot.messages.iter().all(|entry| {
             !entry.id.is_nil()
                 && entry.activity_id.is_none()

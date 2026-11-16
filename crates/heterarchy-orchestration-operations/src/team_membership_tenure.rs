@@ -1425,13 +1425,31 @@ fn insert_anchor(
     Ok(())
 }
 
+macro_rules! select_anchor_sql {
+    () => {
+        "SELECT workspace_id,team_id,participation_id,profile_id,membership_revision,membership_request_id,membership_state,membership_observed_at_ms,membership_event_digest,source_kind,source_digest,anchored_at_ms,actor_activity_id,actor_agent_id,actor_session_id,actor_participant_id,actor_display_name FROM ops_team_membership_tenure_anchors"
+    };
+}
+
+const SELECT_ANCHOR_BY_REVISION_SQL: crate::static_sql::StaticSql =
+    crate::static_sql::StaticSql::dml(concat!(
+        select_anchor_sql!(),
+        " WHERE workspace_id=?1 AND team_id=?2 AND participation_id=?3 AND membership_revision=?4 LIMIT 1"
+    ));
+
+const SELECT_ANCHOR_BY_REQUEST_SQL: crate::static_sql::StaticSql =
+    crate::static_sql::StaticSql::dml(concat!(
+        select_anchor_sql!(),
+        " WHERE workspace_id=?1 AND team_id=?2 AND participation_id=?3 AND membership_request_id=?4 LIMIT 1"
+    ));
+
 fn load_anchor_by_membership(
     connection: &Connection,
     command: &TeamMembershipTenureAnchorCommand,
 ) -> Result<Option<TeamMembershipTenureAnchor>, OperationsError> {
     load_anchor(
         connection,
-        "workspace_id=?1 AND team_id=?2 AND participation_id=?3 AND membership_revision=?4",
+        SELECT_ANCHOR_BY_REVISION_SQL,
         params![
             command.workspace_id.into_uuid().as_bytes(),
             command.team_id.as_bytes(),
@@ -1448,7 +1466,7 @@ fn load_anchor_by_request(
 ) -> Result<Option<TeamMembershipTenureAnchor>, OperationsError> {
     load_anchor(
         connection,
-        "workspace_id=?1 AND team_id=?2 AND participation_id=?3 AND membership_request_id=?4",
+        SELECT_ANCHOR_BY_REQUEST_SQL,
         params![
             command.workspace_id.into_uuid().as_bytes(),
             command.team_id.as_bytes(),
@@ -1467,7 +1485,7 @@ fn load_anchor_by_identity(
 ) -> Result<Option<TeamMembershipTenureAnchor>, OperationsError> {
     load_anchor(
         connection,
-        "workspace_id=?1 AND team_id=?2 AND participation_id=?3 AND membership_revision=?4",
+        SELECT_ANCHOR_BY_REVISION_SQL,
         params![
             workspace_id.into_uuid().as_bytes(),
             team_id.as_bytes(),
@@ -1480,14 +1498,11 @@ fn load_anchor_by_identity(
 
 fn load_anchor(
     connection: &Connection,
-    selector: &str,
+    sql: crate::static_sql::StaticSql,
     values: impl rusqlite::Params,
 ) -> Result<Option<TeamMembershipTenureAnchor>, OperationsError> {
-    let sql = format!(
-        "SELECT workspace_id,team_id,participation_id,profile_id,membership_revision,membership_request_id,membership_state,membership_observed_at_ms,membership_event_digest,source_kind,source_digest,anchored_at_ms,actor_activity_id,actor_agent_id,actor_session_id,actor_participant_id,actor_display_name FROM ops_team_membership_tenure_anchors WHERE {selector} LIMIT 1"
-    );
     connection
-        .query_row(&sql, values, decode_anchor_row)
+        .query_row(sql.as_str(), values, decode_anchor_row)
         .optional()
         .map_err(Into::into)
 }

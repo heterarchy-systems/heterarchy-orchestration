@@ -14,6 +14,8 @@ pub struct ProfileUpdateRequest {
     pub preferred_model: Option<String>,
     pub preferred_reasoning: Option<String>,
     pub base_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_preference: Option<super::autonomy_loop::ExecutionPreferenceWire>,
 }
 
 /// Profile lifecycle mutation request.

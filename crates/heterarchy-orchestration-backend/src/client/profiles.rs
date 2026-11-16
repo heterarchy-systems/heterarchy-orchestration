@@ -304,12 +304,19 @@ fn positive_revision(value: i64) -> Result<i64, ClientError> {
 fn profile_configuration(
     request: &ProfileUpdateRequest,
 ) -> Result<ProfileConfiguration, ClientError> {
+    let execution_preference = request
+        .execution_preference
+        .as_ref()
+        .map(crate::wire::ExecutionPreferenceWire::to_execution_preference)
+        .transpose()
+        .map_err(|_| ClientError::InvalidRequest)?;
     ProfileConfiguration::new(
         request.display_name.clone(),
         request.preferred_model.clone(),
         request.preferred_reasoning.clone(),
         request.base_capabilities.clone(),
     )
+    .map(|config| config.with_execution_preference(execution_preference))
     .map_err(|_| ClientError::InvalidRequest)
 }
 
@@ -369,6 +376,11 @@ fn valid_update_response(
         && response.profile.preferred_model.as_deref() == configuration.preferred_model()
         && response.profile.preferred_reasoning.as_deref() == configuration.preferred_reasoning()
         && response.profile.base_capabilities == configuration.capabilities()
+        && response.profile.execution_preference.as_ref()
+            == configuration
+                .execution_preference()
+                .map(crate::wire::ExecutionPreferenceWire::from_execution_preference)
+                .as_ref()
 }
 
 fn valid_lifecycle_response(
@@ -448,6 +460,7 @@ mod tests {
             updated_at_ms: 2,
             last_used_at_ms: None,
             revision,
+            execution_preference: None,
         }
     }
 
@@ -620,6 +633,7 @@ mod tests {
             preferred_model: Some("gpt-5.6-luna".to_owned()),
             preferred_reasoning: Some("max".to_owned()),
             base_capabilities: vec!["backend".to_owned(), "rust".to_owned()],
+            execution_preference: None,
         };
         assert!(validate_update_request(&request).is_ok());
 
@@ -672,6 +686,7 @@ mod tests {
             preferred_model: Some("gpt-5.6-luna".to_owned()),
             preferred_reasoning: Some("max".to_owned()),
             base_capabilities: vec!["backend".to_owned(), "rust".to_owned()],
+            execution_preference: None,
         };
         assert_eq!(
             client

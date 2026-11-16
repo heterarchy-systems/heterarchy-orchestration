@@ -51,7 +51,8 @@ use super::{
 };
 
 const RECOVERY_PROXY_MAX_REQUEST_BYTES: usize = 72 * 1024;
-const FIXTURE_OPERATIONS_SCHEMA_VERSION: i64 = 62;
+const FIXTURE_OPERATIONS_SCHEMA_VERSION: i64 =
+    heterarchy_orchestration_operations::OPERATIONS_SCHEMA_VERSION;
 
 fn stage<T, E: std::fmt::Debug>(name: &str, result: Result<T, E>) -> Result<T, String> {
     result.map_err(|error| format!("stage={name}: {error:?}"))

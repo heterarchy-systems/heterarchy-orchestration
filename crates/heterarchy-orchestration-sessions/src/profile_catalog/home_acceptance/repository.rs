@@ -14,6 +14,7 @@ use super::model::{
     HomeAcceptanceProfilePinReference, HomeAcceptanceProfileState,
 };
 use super::schema;
+use super::sql::{INSERT_PIN_SQL, LOAD_PIN_SQL, SELECT_PENDING_IDS_SQL, UPDATE_PIN_SQL};
 use crate::HomeAcceptanceSessionHoldReference;
 use crate::profile_catalog::{
     AgentProfileCatalog, AgentProfileId, AgentProfileLifecycleState, AgentProfileRevision,
@@ -229,12 +230,7 @@ pub(super) fn pending(
     let page_limit = usize::from(limit);
     let sql_limit = i64::try_from(page_limit + 1).map_err(|_| Error::PageLimit)?;
     let raw_ids = {
-        let mut statement = transaction.prepare(
-            "SELECT substr(acceptance_id,1,17),length(acceptance_id)
-             FROM agent_profile_home_acceptance_pins
-             WHERE issuer_id=?1 AND state=1 AND (?2 IS NULL OR acceptance_id>?2)
-             ORDER BY acceptance_id LIMIT ?3",
-        )?;
+        let mut statement = transaction.prepare(SELECT_PENDING_IDS_SQL)?;
         statement
             .query_map(
                 params![
@@ -396,15 +392,7 @@ fn insert_pin(
         .map(|pin| i64::from(pin.is_some()));
     let resolved_at = record.resolved_at().map(TimestampMillis::get);
     let changed = transaction.execute(
-        "INSERT INTO agent_profile_home_acceptance_pins(
-            acceptance_id,issuer_id,request_digest,request_snapshot,state,
-            profile_id,profile_revision,logical_session_request_id,
-            linked_profile_revision,linked_session_revision,acquired_at_ms,
-            source_outcome,source_payload_digest,source_observed_at_ms,
-            operations_resolution_id,operations_resolution_digest,
-            operations_admission_id,operations_admission_digest,
-            operations_profile_pin_present,created_at_ms,resolved_at_ms
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+        INSERT_PIN_SQL,
         params![
             record.acceptance_id().as_bytes(),
             record.issuer().into_uuid().as_bytes(),
@@ -446,60 +434,42 @@ fn load_pin(
         return Err(Error::Invalid("acceptance identity"));
     }
     let raw = connection
-        .query_row(
-            "SELECT substr(acceptance_id,1,17),length(acceptance_id),
-                    substr(issuer_id,1,17),length(issuer_id),
-                    substr(request_digest,1,33),length(request_digest),
-                    substr(request_snapshot,1,321),length(request_snapshot),state,
-                    substr(profile_id,1,17),length(profile_id),profile_revision,
-                    substr(logical_session_request_id,1,17),length(logical_session_request_id),
-                    linked_profile_revision,linked_session_revision,acquired_at_ms,
-                    source_outcome,substr(source_payload_digest,1,33),length(source_payload_digest),
-                    source_observed_at_ms,substr(operations_resolution_id,1,17),
-                    length(operations_resolution_id),substr(operations_resolution_digest,1,33),
-                    length(operations_resolution_digest),substr(operations_admission_id,1,17),
-                    length(operations_admission_id),substr(operations_admission_digest,1,33),
-                    length(operations_admission_digest),operations_profile_pin_present,
-                    created_at_ms,resolved_at_ms
-             FROM agent_profile_home_acceptance_pins WHERE acceptance_id=?1",
-            [acceptance_id.as_bytes()],
-            |row| {
-                Ok(RawPin {
-                    acceptance_id: row.get(0)?,
-                    acceptance_id_len: row.get(1)?,
-                    issuer_id: row.get(2)?,
-                    issuer_id_len: row.get(3)?,
-                    request_digest: row.get(4)?,
-                    request_digest_len: row.get(5)?,
-                    request_snapshot: row.get(6)?,
-                    request_snapshot_len: row.get(7)?,
-                    state: row.get(8)?,
-                    profile_id: row.get(9)?,
-                    profile_id_len: row.get(10)?,
-                    profile_revision: row.get(11)?,
-                    link_request_id: row.get(12)?,
-                    link_request_id_len: row.get(13)?,
-                    link_profile_revision: row.get(14)?,
-                    link_session_revision: row.get(15)?,
-                    acquired_at: row.get(16)?,
-                    source_outcome: row.get(17)?,
-                    source_payload_digest: row.get(18)?,
-                    source_payload_digest_len: row.get(19)?,
-                    source_at: row.get(20)?,
-                    operations_resolution_id: row.get(21)?,
-                    operations_resolution_id_len: row.get(22)?,
-                    operations_resolution_digest: row.get(23)?,
-                    operations_resolution_digest_len: row.get(24)?,
-                    operations_admission_id: row.get(25)?,
-                    operations_admission_id_len: row.get(26)?,
-                    operations_admission_digest: row.get(27)?,
-                    operations_admission_digest_len: row.get(28)?,
-                    operations_profile_pin_present: row.get(29)?,
-                    created_at: row.get(30)?,
-                    resolved_at: row.get(31)?,
-                })
-            },
-        )
+        .query_row(LOAD_PIN_SQL, [acceptance_id.as_bytes()], |row| {
+            Ok(RawPin {
+                acceptance_id: row.get(0)?,
+                acceptance_id_len: row.get(1)?,
+                issuer_id: row.get(2)?,
+                issuer_id_len: row.get(3)?,
+                request_digest: row.get(4)?,
+                request_digest_len: row.get(5)?,
+                request_snapshot: row.get(6)?,
+                request_snapshot_len: row.get(7)?,
+                state: row.get(8)?,
+                profile_id: row.get(9)?,
+                profile_id_len: row.get(10)?,
+                profile_revision: row.get(11)?,
+                link_request_id: row.get(12)?,
+                link_request_id_len: row.get(13)?,
+                link_profile_revision: row.get(14)?,
+                link_session_revision: row.get(15)?,
+                acquired_at: row.get(16)?,
+                source_outcome: row.get(17)?,
+                source_payload_digest: row.get(18)?,
+                source_payload_digest_len: row.get(19)?,
+                source_at: row.get(20)?,
+                operations_resolution_id: row.get(21)?,
+                operations_resolution_id_len: row.get(22)?,
+                operations_resolution_digest: row.get(23)?,
+                operations_resolution_digest_len: row.get(24)?,
+                operations_admission_id: row.get(25)?,
+                operations_admission_id_len: row.get(26)?,
+                operations_admission_digest: row.get(27)?,
+                operations_admission_digest_len: row.get(28)?,
+                operations_profile_pin_present: row.get(29)?,
+                created_at: row.get(30)?,
+                resolved_at: row.get(31)?,
+            })
+        })
         .optional()?;
     raw.as_ref().map(decode_pin).transpose()
 }
@@ -850,12 +820,7 @@ fn update_pin(
         .map(HomeAcceptanceProfileOperationsResolution::profile_pin)
         .map(|pin| i64::from(pin.is_some()));
     let changed = transaction.execute(
-        "UPDATE agent_profile_home_acceptance_pins
-         SET state=?1,source_outcome=?2,source_payload_digest=?3,source_observed_at_ms=?4,
-             operations_resolution_id=?5,operations_resolution_digest=?6,
-             operations_admission_id=?7,operations_admission_digest=?8,
-             operations_profile_pin_present=?9,resolved_at_ms=?10
-         WHERE acceptance_id=?11 AND state=?12",
+        UPDATE_PIN_SQL,
         params![
             encode_profile_state(record.state()),
             source_outcome,
@@ -1160,7 +1125,7 @@ mod tests {
     -> Result<(), Box<dyn Error>> {
         let mut connection = Connection::open_in_memory()?;
         connection.pragma_update(None, "foreign_keys", true)?;
-        crate::profile_catalog::create_schema(&mut connection)?;
+        crate::profile_catalog::initialize_or_validate(&mut connection)?;
         let fixture = aborted_pin_fixture()?;
         insert_fixture_owner_rows(&connection, &fixture)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1196,7 +1161,7 @@ mod tests {
         // Synthetic resolution data exercises the local postcommit error
         // boundary, not external Source/Operations receipt authenticity.
         let mut connection = Connection::open_in_memory()?;
-        crate::profile_catalog::create_schema(&mut connection)?;
+        crate::profile_catalog::initialize_or_validate(&mut connection)?;
         let fixture = aborted_pin_fixture()?;
         insert_fixture_owner_rows(&connection, &fixture)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;

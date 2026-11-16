@@ -1,10 +1,10 @@
-//! Authenticated exact node conversations over the canonical Runtime operation.
+//! Authenticated Node chat history and exact historical recovery.
 
 use crate::{
     ApiError, BackendState, RuntimeError,
     wire::node_chat::{
         ChatMessageRequest, ChatQueryWire, NodeChatQueryRequest, NodeChatQueryResponse,
-        NodeChatRecoverResponse, NodeChatSendRequest, NodeChatSendResponse,
+        NodeChatRecoverResponse, NodeChatSendRequest,
     },
 };
 use axum::{
@@ -25,10 +25,6 @@ pub(crate) fn routes() -> Router<BackendState> {
         .route(
             "/internal/v1/workspaces/{workspace_id}/node-chat/query",
             post(query),
-        )
-        .route(
-            "/internal/v1/workspaces/{workspace_id}/node-chat/send",
-            post(send),
         )
         .route(
             "/internal/v1/workspaces/{workspace_id}/node-chat/recover",
@@ -138,59 +134,6 @@ async fn query(
             Ok(Json(NodeChatQueryResponse {
                 request: body,
                 snapshot: project_snapshot(&snapshot),
-            }))
-        })
-        .await
-}
-
-async fn send(
-    State(state): State<BackendState>,
-    Path(path): Path<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    Json(body): Json<NodeChatSendRequest>,
-) -> Result<Json<NodeChatSendResponse>, ApiError> {
-    let target = caller(&path, &body.scope, body.session_id, body.sender_activity_id)?;
-    validate_send(&body)?;
-    let request = domain_send(&body.request).map_err(ApiError::Runtime)?;
-    let owner = state.clone();
-    state
-        .run_owned(async move {
-            let frozen = request.clone();
-            let fence = body.sender_leadership_revision;
-            let existing = owner
-                .catalog_job(move |runtime| {
-                    runtime
-                        .recover_chat(target, principal, &frozen, fence)
-                        .map_err(chat_runtime_error)
-                })
-                .await?;
-            if let Some(receipt) = existing {
-                return Ok(Json(NodeChatSendResponse {
-                    request: body,
-                    receipt: project_receipt(&receipt),
-                }));
-            }
-            let ws = request.query.workspace_id;
-            owner
-                .catalog_job(move |runtime| {
-                    runtime
-                        .authorize_chat_sender(target, principal, ws)
-                        .map_err(chat_runtime_error)
-                })
-                .await?;
-            owner.workspace_scope_proof(body.scope.clone()).await?;
-            let source = source(&owner, &body.scope, &request.query).await?;
-            let now = now()?;
-            let receipt = owner
-                .catalog_job(move |runtime| {
-                    runtime
-                        .send_chat(target, principal, &request, source.as_ref(), fence, now)
-                        .map_err(chat_runtime_error)
-                })
-                .await?;
-            Ok(Json(NodeChatSendResponse {
-                request: body,
-                receipt: project_receipt(&receipt),
             }))
         })
         .await

@@ -1,5 +1,14 @@
 //! Durable consumer cursor and read-only projection for Forge-owned effect facts.
+mod dag_settlement;
 mod input_validation;
+
+pub use dag_settlement::{
+    DagSettledFact, DagSettledProjectionRow, DagSettlementGovernanceLink, NodeLifecycleAuthority,
+    WorkspaceDagSettlementAuthority,
+};
+pub(crate) use dag_settlement::{
+    create_schema as create_dag_settlement_schema, schema_objects as dag_settlement_schema_objects,
+};
 
 use crate::{OperationsError, catalog, wire, work_credit};
 use forge_domain::{
@@ -18,65 +27,10 @@ const MAX_PAGE_SIZE: usize = 64;
 const CONSUMERS_SQL: &str = "CREATE TABLE ops_effect_fact_consumers (migration_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_imports(migration_id) CHECK(length(migration_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), destination_id BLOB NOT NULL REFERENCES ops_catalog_identity(destination_id) CHECK(length(destination_id)=16), last_sequence INTEGER NOT NULL CHECK(last_sequence>=0), applied_count INTEGER NOT NULL CHECK(applied_count>=0))";
 const EXECUTIONS_SQL: &str = "CREATE TABLE ops_execution_terminal_projection (migration_id BLOB NOT NULL REFERENCES ops_effect_fact_consumers(migration_id) CHECK(length(migration_id)=16), source_sequence INTEGER NOT NULL CHECK(source_sequence>=1), fact_digest BLOB NOT NULL CHECK(length(fact_digest)=32), execution_id BLOB NOT NULL CHECK(length(execution_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), activity_id BLOB NOT NULL CHECK(length(activity_id)=16), execution_revision INTEGER NOT NULL CHECK(execution_revision>=1), execution_state INTEGER NOT NULL CHECK(execution_state IN(2,3,4,5,6)), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0), agent_id BLOB NOT NULL CHECK(length(agent_id)=16), agent_revision INTEGER NOT NULL CHECK(agent_revision>=1), session_id BLOB CHECK(session_id IS NULL OR length(session_id)=16), goal_id BLOB NOT NULL CHECK(length(goal_id)=16), goal_revision INTEGER NOT NULL CHECK(goal_revision>=1), dag_revision INTEGER NOT NULL CHECK(dag_revision>=1), node_id BLOB NOT NULL CHECK(length(node_id)=16), node_revision INTEGER NOT NULL CHECK(node_revision>=1), verification_input_id BLOB CHECK(verification_input_id IS NULL OR length(verification_input_id)=16), verification_input_fingerprint BLOB CHECK(verification_input_fingerprint IS NULL OR length(verification_input_fingerprint)=32), verification_disposition INTEGER CHECK(verification_disposition IS NULL OR verification_disposition BETWEEN 0 AND 3), verification_output_integrity INTEGER CHECK(verification_output_integrity IS NULL OR verification_output_integrity BETWEEN 0 AND 3), verification_output_fingerprint BLOB CHECK(verification_output_fingerprint IS NULL OR length(verification_output_fingerprint)=32), PRIMARY KEY(migration_id,source_sequence), UNIQUE(migration_id,execution_id), CHECK((verification_input_id IS NULL AND verification_input_fingerprint IS NULL AND verification_disposition IS NULL AND verification_output_integrity IS NULL AND verification_output_fingerprint IS NULL) OR (verification_input_id IS NOT NULL AND verification_input_fingerprint IS NOT NULL AND verification_disposition IS NOT NULL AND ((verification_output_integrity IS NULL AND verification_output_fingerprint IS NULL) OR (verification_output_integrity IS NOT NULL AND verification_output_fingerprint IS NOT NULL)))))";
 const CHANGE_SETS_SQL: &str = "CREATE TABLE ops_change_set_projection (migration_id BLOB NOT NULL REFERENCES ops_effect_fact_consumers(migration_id) CHECK(length(migration_id)=16), source_sequence INTEGER NOT NULL CHECK(source_sequence>=1), fact_digest BLOB NOT NULL CHECK(length(fact_digest)=32), change_set_id BLOB NOT NULL CHECK(length(change_set_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), activity_id BLOB NOT NULL CHECK(length(activity_id)=16), change_set_revision INTEGER NOT NULL CHECK(change_set_revision>=1), state TEXT NOT NULL CHECK(state IN('Applied','Failed')), failure_code TEXT CHECK(failure_code IS NULL OR failure_code IN('InvalidPath','ProtectedPath','PathConflict','StaleWrite','CapacityExceeded','IoFailure')), diff_id BLOB NOT NULL CHECK(length(diff_id)=16), diff_state TEXT NOT NULL CHECK(diff_state IN('Ready','SummaryOnly','Abandoned')), diff_revision INTEGER NOT NULL CHECK(diff_revision>=1), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0), producer_agent_id BLOB CHECK(producer_agent_id IS NULL OR length(producer_agent_id)=16), producer_session_id BLOB CHECK(producer_session_id IS NULL OR length(producer_session_id)=16), digest_version INTEGER NOT NULL DEFAULT 0 CHECK(digest_version IN(0,2)), PRIMARY KEY(migration_id,source_sequence), UNIQUE(migration_id,change_set_id), CHECK((state='Applied' AND failure_code IS NULL) OR (state='Failed' AND failure_code IS NOT NULL)))";
-/// Additive `v13` to `v14` producer-attribution columns. `SQLite` rewrites the
-/// stored schema text by appending these column definitions in order, which is
-/// exactly their position in [`CHANGE_SETS_SQL`], so migrated and freshly
-/// created tables share one normalized shape. The columns stay nullable so
-/// the additive `ALTER` can run over legacy rows; a `NULL` producer means the
-/// source fact predates attribution and is excluded from provenance joins.
-const CHANGE_SET_PRODUCER_AGENT_COLUMN_SQL: &str =
-    "producer_agent_id BLOB CHECK(producer_agent_id IS NULL OR length(producer_agent_id)=16)";
-const CHANGE_SET_PRODUCER_SESSION_COLUMN_SQL: &str =
-    "producer_session_id BLOB CHECK(producer_session_id IS NULL OR length(producer_session_id)=16)";
-const CHANGE_SET_DIGEST_VERSION_COLUMN_SQL: &str =
-    "digest_version INTEGER NOT NULL DEFAULT 0 CHECK(digest_version IN(0,2))";
-
-/// Exact `v13` shape of the change-set projection, derived from the current
-/// canonical definition so there is only one hand-written authority for the
-/// table contract.
-pub(crate) fn change_sets_sql_v13() -> String {
-    change_sets_sql_v17()
-        .replace(&format!(", {CHANGE_SET_PRODUCER_AGENT_COLUMN_SQL}"), "")
-        .replace(&format!(", {CHANGE_SET_PRODUCER_SESSION_COLUMN_SQL}"), "")
-}
-
-pub(crate) fn change_sets_sql_v17() -> String {
-    CHANGE_SETS_SQL.replace(&format!(", {CHANGE_SET_DIGEST_VERSION_COLUMN_SQL}"), "")
-}
-
-/// One additive `v13` -> `v14` in-place upgrade of an existing change-set
-/// projection. No durable row is rewritten or fabricated.
-pub(crate) fn add_change_set_producer_columns(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    connection.execute_batch(
-        "ALTER TABLE ops_change_set_projection ADD COLUMN producer_agent_id BLOB CHECK(producer_agent_id IS NULL OR length(producer_agent_id)=16)",
-    )?;
-    connection.execute_batch(
-        "ALTER TABLE ops_change_set_projection ADD COLUMN producer_session_id BLOB CHECK(producer_session_id IS NULL OR length(producer_session_id)=16)",
-    )?;
-    Ok(())
-}
-
-pub(crate) fn add_change_set_digest_version_column(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    connection.execute_batch(
-        "ALTER TABLE ops_change_set_projection ADD COLUMN digest_version INTEGER NOT NULL DEFAULT 0 CHECK(digest_version IN(0,2))",
-    )?;
-    Ok(())
-}
 const ASSIGNMENT_REVIEWS_SQL: &str = "CREATE TABLE ops_assignment_review_projection (migration_id BLOB NOT NULL REFERENCES ops_effect_fact_consumers(migration_id) CHECK(length(migration_id)=16), source_sequence INTEGER NOT NULL CHECK(source_sequence>=1), fact_digest BLOB NOT NULL CHECK(length(fact_digest)=32), assignment_id BLOB NOT NULL CHECK(length(assignment_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), activity_id BLOB NOT NULL CHECK(length(activity_id)=16), goal_id BLOB NOT NULL CHECK(length(goal_id)=16), node_id BLOB NOT NULL CHECK(length(node_id)=16), target_agent_id BLOB NOT NULL CHECK(length(target_agent_id)=16), target_session_id BLOB CHECK(target_session_id IS NULL OR length(target_session_id)=16), outcome TEXT NOT NULL CHECK(outcome IN('Accepted','Rejected')), credit_budget INTEGER CHECK(credit_budget IS NULL OR credit_budget IN(1,3,5)), reviewer_agent_id BLOB NOT NULL CHECK(length(reviewer_agent_id)=16), result_digest BLOB CHECK(result_digest IS NULL OR length(result_digest)=32), observed_at_ms INTEGER NOT NULL CHECK(observed_at_ms>=0), PRIMARY KEY(migration_id,source_sequence), UNIQUE(migration_id,assignment_id))";
 const ASSIGNMENT_OFFERS_SQL: &str = "CREATE TABLE ops_assignment_offer_projection (migration_id BLOB NOT NULL REFERENCES ops_effect_fact_consumers(migration_id) CHECK(length(migration_id)=16), source_sequence INTEGER NOT NULL CHECK(source_sequence>=1), fact_digest BLOB NOT NULL CHECK(length(fact_digest)=32), assignment_id BLOB NOT NULL CHECK(length(assignment_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), activity_id BLOB NOT NULL CHECK(length(activity_id)=16), goal_id BLOB NOT NULL CHECK(length(goal_id)=16), node_id BLOB NOT NULL CHECK(length(node_id)=16), target_agent_id BLOB NOT NULL CHECK(length(target_agent_id)=16), target_session_id BLOB CHECK(target_session_id IS NULL OR length(target_session_id)=16), credit_budget INTEGER CHECK(credit_budget IS NULL OR credit_budget IN(1,3,5)), offered_at_ms INTEGER NOT NULL CHECK(offered_at_ms>=0), PRIMARY KEY(migration_id,source_sequence), UNIQUE(migration_id,assignment_id))";
-
-const SOURCE_REFS_RECORDED_COLUMN_SQL: &str =
-    "source_refs_recorded INTEGER NOT NULL DEFAULT 0 CHECK(source_refs_recorded IN(0,1))";
 const ASSIGNMENT_SUBMITS_SQL: &str = "CREATE TABLE ops_assignment_submit_projection (migration_id BLOB NOT NULL REFERENCES ops_effect_fact_consumers(migration_id) CHECK(length(migration_id)=16), source_sequence INTEGER NOT NULL CHECK(source_sequence>=1), fact_digest BLOB NOT NULL CHECK(length(fact_digest)=32), assignment_id BLOB NOT NULL CHECK(length(assignment_id)=16), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), activity_id BLOB NOT NULL CHECK(length(activity_id)=16), goal_id BLOB NOT NULL CHECK(length(goal_id)=16), node_id BLOB NOT NULL CHECK(length(node_id)=16), target_agent_id BLOB NOT NULL CHECK(length(target_agent_id)=16), target_session_id BLOB CHECK(target_session_id IS NULL OR length(target_session_id)=16), source_count INTEGER NOT NULL CHECK(source_count>=0), source_digests BLOB CHECK(source_digests IS NULL OR length(source_digests)=32), source_kinds BLOB, result_digest BLOB CHECK(result_digest IS NULL OR length(result_digest)=32), submitted_at_ms INTEGER NOT NULL CHECK(submitted_at_ms>=0), source_refs_recorded INTEGER NOT NULL DEFAULT 0 CHECK(source_refs_recorded IN(0,1)), PRIMARY KEY(migration_id,source_sequence), UNIQUE(migration_id,assignment_id))";
 const ASSIGNMENT_SUBMIT_SOURCE_REFS_SQL: &str = "CREATE TABLE ops_assignment_submit_source_refs (migration_id BLOB NOT NULL REFERENCES ops_effect_fact_consumers(migration_id) CHECK(length(migration_id)=16), source_sequence INTEGER NOT NULL CHECK(source_sequence>=1), ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 31), evidence_kind INTEGER NOT NULL CHECK(evidence_kind BETWEEN 0 AND 3), evidence_id BLOB NOT NULL CHECK(length(evidence_id)=16), PRIMARY KEY(migration_id,source_sequence,ordinal), FOREIGN KEY(migration_id,source_sequence) REFERENCES ops_assignment_submit_projection(migration_id,source_sequence))";
-
-pub(crate) fn assignment_submits_sql_v16() -> String {
-    ASSIGNMENT_SUBMITS_SQL.replace(&format!(", {SOURCE_REFS_RECORDED_COLUMN_SQL}"), "")
-}
 
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -501,6 +455,7 @@ pub enum TerminalFact<'a> {
     AssignmentReviewed(AssignmentReviewedFact),
     AssignmentOffered(AssignmentOfferedFact),
     AssignmentSubmitted(AssignmentSubmittedFact<'a>),
+    DagSettled(DagSettledFact),
 }
 /// Transport-neutral application input; this value alone is not source authority.
 pub type EffectFactInput<'a> = TerminalFact<'a>;
@@ -513,6 +468,7 @@ impl TerminalFact<'_> {
             Self::AssignmentReviewed(fact) => fact.sequence,
             Self::AssignmentOffered(fact) => fact.sequence,
             Self::AssignmentSubmitted(fact) => fact.sequence,
+            Self::DagSettled(fact) => fact.sequence,
         }
     }
     const fn migration_id(self) -> Uuid {
@@ -522,6 +478,7 @@ impl TerminalFact<'_> {
             Self::AssignmentReviewed(fact) => fact.migration_id,
             Self::AssignmentOffered(fact) => fact.migration_id,
             Self::AssignmentSubmitted(fact) => fact.migration_id,
+            Self::DagSettled(fact) => fact.migration_id,
         }
     }
     const fn destination_id(self) -> Uuid {
@@ -531,6 +488,7 @@ impl TerminalFact<'_> {
             Self::AssignmentReviewed(fact) => fact.destination_id,
             Self::AssignmentOffered(fact) => fact.destination_id,
             Self::AssignmentSubmitted(fact) => fact.destination_id,
+            Self::DagSettled(fact) => fact.destination_id,
         }
     }
     const fn workspace_id(self) -> WorkspaceId {
@@ -540,6 +498,7 @@ impl TerminalFact<'_> {
             Self::AssignmentReviewed(fact) => fact.workspace_id,
             Self::AssignmentOffered(fact) => fact.workspace_id,
             Self::AssignmentSubmitted(fact) => fact.workspace_id,
+            Self::DagSettled(fact) => fact.workspace_id,
         }
     }
 }
@@ -676,6 +635,28 @@ fn decode_assignment_submitted<'a>(
     }
 }
 
+fn decode_dag_settled(
+    entry: &EffectFactOutboxEntry,
+    fact: &forge_persistence::DagSettledEffectFact,
+) -> DagSettledFact {
+    DagSettledFact {
+        sequence: entry.sequence(),
+        migration_id: entry.migration_id(),
+        destination_id: entry.destination_id(),
+        settlement_id: fact.settlement_id(),
+        workspace_id: entry.workspace_id(),
+        activity_id: fact.activity_id(),
+        goal_id: fact.goal_id(),
+        goal_revision: fact.goal_revision().get(),
+        dag_revision: fact.dag_revision().get(),
+        settled_file_count: fact.settled_file_count(),
+        settled_tree_digest: fact.settled_tree_digest(),
+        coordinator_agent_id: fact.coordinator_agent_id(),
+        coordinator_session_id: fact.coordinator_session_id(),
+        settled_at_ms: fact.settled_at().get(),
+    }
+}
+
 impl<'a> TryFrom<&'a EffectFactOutboxEntry> for TerminalFact<'a> {
     type Error = OperationsError;
     fn try_from(entry: &'a EffectFactOutboxEntry) -> Result<Self, Self::Error> {
@@ -772,6 +753,10 @@ impl<'a> TryFrom<&'a EffectFactOutboxEntry> for TerminalFact<'a> {
             }
             EffectFact::AssignmentSubmitted(fact) => Ok(Self::AssignmentSubmitted(
                 decode_assignment_submitted(entry, fact),
+            )),
+            EffectFact::DagSettled(fact) => Ok(Self::DagSettled(decode_dag_settled(entry, fact))),
+            EffectFact::SwarmSettled(_) => Err(OperationsError::Conflict(
+                "swarm settled outbox fact is unsupported in core effect fact input",
             )),
         }
     }
@@ -974,56 +959,9 @@ impl crate::OperationsCatalog {
 }
 
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsError> {
-    connection.execute_batch(CONSUMERS_SQL)?;
-    connection.execute_batch(EXECUTIONS_SQL)?;
-    create_change_set_schema(connection)?;
-    create_assignment_review_schema(connection)?;
-    create_assignment_offer_schema(connection)?;
-    create_assignment_submit_schema(connection)?;
-    connection.execute_batch(ASSIGNMENT_SUBMIT_SOURCE_REFS_SQL)?;
-    Ok(())
-}
-
-pub(crate) fn create_change_set_schema(connection: &Connection) -> Result<(), OperationsError> {
-    connection.execute_batch(CHANGE_SETS_SQL)?;
-    Ok(())
-}
-
-pub(crate) fn create_assignment_review_schema(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    connection.execute_batch(ASSIGNMENT_REVIEWS_SQL)?;
-    Ok(())
-}
-
-pub(crate) fn create_assignment_offer_schema(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    connection.execute_batch(ASSIGNMENT_OFFERS_SQL)?;
-    Ok(())
-}
-
-pub(crate) fn create_assignment_submit_schema(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    connection.execute_batch(ASSIGNMENT_SUBMITS_SQL)?;
-    Ok(())
-}
-
-pub(crate) fn create_assignment_submit_source_refs_schema(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    connection.execute_batch(&format!(
-        "ALTER TABLE ops_assignment_submit_projection ADD COLUMN {SOURCE_REFS_RECORDED_COLUMN_SQL}"
-    ))?;
-    connection.execute_batch(ASSIGNMENT_SUBMIT_SOURCE_REFS_SQL)?;
-    Ok(())
-}
-
-pub(crate) fn create_assignment_submit_source_refs_table(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    connection.execute_batch(ASSIGNMENT_SUBMIT_SOURCE_REFS_SQL)?;
+    for (_, _, sql) in schema_objects() {
+        connection.execute_batch(sql)?;
+    }
     Ok(())
 }
 
@@ -1062,142 +1000,6 @@ pub(crate) fn schema_objects() -> [(&'static str, &'static str, &'static str); 7
             ASSIGNMENT_SUBMIT_SOURCE_REFS_SQL,
         ),
     ]
-}
-
-pub(crate) fn schema_objects_v16() -> Vec<(&'static str, &'static str, String)> {
-    schema_objects()
-        .into_iter()
-        .filter(|(_, name, _)| *name != "ops_assignment_submit_source_refs")
-        .map(|(kind, name, sql)| {
-            (
-                kind,
-                name,
-                if name == "ops_assignment_submit_projection" {
-                    assignment_submits_sql_v16()
-                } else if name == "ops_change_set_projection" {
-                    change_sets_sql_v17()
-                } else {
-                    sql.to_owned()
-                },
-            )
-        })
-        .collect()
-}
-
-pub(crate) fn schema_objects_v17() -> Vec<(&'static str, &'static str, String)> {
-    schema_objects()
-        .into_iter()
-        .map(|(kind, name, sql)| {
-            (
-                kind,
-                name,
-                if name == "ops_change_set_projection" {
-                    change_sets_sql_v17()
-                } else {
-                    sql.to_owned()
-                },
-            )
-        })
-        .collect()
-}
-
-/// Schema objects as they existed at catalog version 9, before `ChangeSet`
-/// terminal facts gained a durable projection.
-pub(crate) fn schema_objects_v9() -> Vec<(&'static str, &'static str, String)> {
-    vec![
-        (
-            "table",
-            "ops_effect_fact_consumers",
-            CONSUMERS_SQL.to_owned(),
-        ),
-        (
-            "table",
-            "ops_execution_terminal_projection",
-            EXECUTIONS_SQL.to_owned(),
-        ),
-    ]
-}
-
-/// Schema objects as they existed at catalog version 10, before assignment
-/// reviews gained a durable projection and work credits gained a ledger. The
-/// change-set projection still predates the producer columns.
-pub(crate) fn schema_objects_v10() -> Vec<(&'static str, &'static str, String)> {
-    vec![
-        (
-            "table",
-            "ops_effect_fact_consumers",
-            CONSUMERS_SQL.to_owned(),
-        ),
-        (
-            "table",
-            "ops_execution_terminal_projection",
-            EXECUTIONS_SQL.to_owned(),
-        ),
-        ("table", "ops_change_set_projection", change_sets_sql_v13()),
-    ]
-}
-
-/// Schema objects as they existed at catalog version 11, before assignment
-/// offers gained a durable projection and leadership gained its journal.
-pub(crate) fn schema_objects_v11() -> Vec<(&'static str, &'static str, String)> {
-    vec![
-        (
-            "table",
-            "ops_effect_fact_consumers",
-            CONSUMERS_SQL.to_owned(),
-        ),
-        (
-            "table",
-            "ops_execution_terminal_projection",
-            EXECUTIONS_SQL.to_owned(),
-        ),
-        ("table", "ops_change_set_projection", change_sets_sql_v13()),
-        (
-            "table",
-            "ops_assignment_review_projection",
-            ASSIGNMENT_REVIEWS_SQL.to_owned(),
-        ),
-    ]
-}
-
-/// Schema objects as they existed at catalog version 12, before assignment
-/// submissions gained a durable projection.
-pub(crate) fn schema_objects_v12() -> Vec<(&'static str, &'static str, String)> {
-    vec![
-        (
-            "table",
-            "ops_effect_fact_consumers",
-            CONSUMERS_SQL.to_owned(),
-        ),
-        (
-            "table",
-            "ops_execution_terminal_projection",
-            EXECUTIONS_SQL.to_owned(),
-        ),
-        ("table", "ops_change_set_projection", change_sets_sql_v13()),
-        (
-            "table",
-            "ops_assignment_review_projection",
-            ASSIGNMENT_REVIEWS_SQL.to_owned(),
-        ),
-        (
-            "table",
-            "ops_assignment_offer_projection",
-            ASSIGNMENT_OFFERS_SQL.to_owned(),
-        ),
-    ]
-}
-
-/// Schema objects as they existed at catalog version 13, before the
-/// change-set projection gained producer attribution.
-pub(crate) fn schema_objects_v13() -> Vec<(&'static str, &'static str, String)> {
-    let mut objects = schema_objects_v12();
-    objects.push((
-        "table",
-        "ops_assignment_submit_projection",
-        assignment_submits_sql_v16(),
-    ));
-    objects
 }
 
 fn apply_page(
@@ -1244,6 +1046,9 @@ fn apply_page(
             if !replay_matches(&tx, fact)? {
                 return Err(OperationsError::Conflict("effect fact replay"));
             }
+            if let TerminalFact::DagSettled(settled) = fact {
+                dag_settlement::derive_dag_settlement_governance(&tx, settled)?;
+            }
             continue;
         }
         let expected = progress
@@ -1255,6 +1060,9 @@ fn apply_page(
         }
         insert_projection(&tx, fact)?;
         derive_work_credit(&tx, fact)?;
+        if let TerminalFact::DagSettled(settled) = fact {
+            dag_settlement::derive_dag_settlement_governance(&tx, settled)?;
+        }
         progress.last_sequence = fact.sequence();
         progress.applied_count = progress
             .applied_count
@@ -1351,6 +1159,13 @@ fn replay_matches(
         TerminalFact::AssignmentSubmitted(fact) => transaction
             .query_row(
                 "SELECT substr(fact_digest,1,33) FROM ops_assignment_submit_projection WHERE migration_id=?1 AND source_sequence=?2",
+                params![fact.migration_id.as_bytes(), signed(fact.sequence)?],
+                |row| row.get(0),
+            )
+            .optional()?,
+        TerminalFact::DagSettled(fact) => transaction
+            .query_row(
+                "SELECT substr(fact_digest,1,33) FROM ops_dag_settlement_projection WHERE migration_id=?1 AND source_sequence=?2",
                 params![fact.migration_id.as_bytes(), signed(fact.sequence)?],
                 |row| row.get(0),
             )
@@ -1531,6 +1346,9 @@ fn insert_projection(
         TerminalFact::AssignmentSubmitted(fact) => {
             insert_assignment_submit_projection(transaction, fact)
         }
+        TerminalFact::DagSettled(fact) => {
+            dag_settlement::insert_dag_settled_projection(transaction, fact)
+        }
     }
 }
 
@@ -1571,7 +1389,9 @@ fn derive_work_credit(
             },
             fact.outcome,
         ),
-        TerminalFact::ChangeSet(_) | TerminalFact::AssignmentSubmitted(_) => Ok(()),
+        TerminalFact::ChangeSet(_)
+        | TerminalFact::AssignmentSubmitted(_)
+        | TerminalFact::DagSettled(_) => Ok(()),
         TerminalFact::AssignmentOffered(fact) => crate::leadership::bootstrap_from_offer(
             transaction,
             crate::leadership::OfferBootstrapObservation {
@@ -1933,6 +1753,7 @@ fn fact_digest(fact: &TerminalFact<'_>) -> [u8; 32] {
         TerminalFact::AssignmentReviewed(fact) => assignment_review_digest(fact),
         TerminalFact::AssignmentOffered(fact) => assignment_offer_digest(fact),
         TerminalFact::AssignmentSubmitted(fact) => assignment_submit_digest(fact),
+        TerminalFact::DagSettled(fact) => dag_settlement::dag_settled_digest(fact),
     }
 }
 
@@ -2998,16 +2819,12 @@ mod tests {
         0x37, 0xcc,
     ];
 
-    fn reopen_v17_digest_fixture(name: &str) -> Result<DigestFixture, Box<dyn std::error::Error>> {
+    fn seeded_legacy_digest_fixture(
+        name: &str,
+    ) -> Result<DigestFixture, Box<dyn std::error::Error>> {
         let (root, catalog, migration, workspace) = catalog_fixture(name)?;
         let destination = catalog.destination_id();
-        let path = root.join("catalog.sqlite3");
-        drop(catalog);
-        let connection = Connection::open(&path)?;
-        crate::workspace_participation::drop_schema_for_legacy_fixture(&connection)?;
-        connection.execute_batch("DROP TABLE ops_change_set_projection;")?;
-        connection.execute_batch(&crate::effect_fact::change_sets_sql_v17())?;
-        connection.execute(
+        catalog.connection.execute(
             "INSERT INTO ops_effect_fact_consumers(migration_id,workspace_id,destination_id,last_sequence,applied_count) VALUES(?1,?2,?3,2,2)",
             params![
                 migration.as_bytes(),
@@ -3025,18 +2842,15 @@ mod tests {
         };
         assert_eq!(change_set_digest_v1(first_row), HISTORICAL_V1_FIRST_DIGEST);
         insert_legacy_change_set_projection(
-            &connection,
+            &catalog.connection,
             first_row,
             change_set_digest_v1(first_row),
         )?;
         insert_legacy_change_set_projection(
-            &connection,
+            &catalog.connection,
             second_row,
             change_set_digest(second_row),
         )?;
-        connection.pragma_update(None, "user_version", 17_i64)?;
-        drop(connection);
-        let catalog = crate::OperationsCatalog::open(&path, destination)?;
         Ok(DigestFixture {
             root,
             catalog,
@@ -3062,60 +2876,6 @@ mod tests {
             ),
             Err(OperationsError::Conflict("effect fact replay"))
         ));
-    }
-
-    #[test]
-    fn catalog_v9_migrates_additively_without_fabricating_effect_progress()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (root, catalog, migration, workspace) = catalog_fixture("v9-migration")?;
-        let destination = catalog.destination_id();
-        let path = root.join("catalog.sqlite3");
-        assert_eq!(
-            catalog
-                .progress(migration)?
-                .map(|progress| progress.workspace_id()),
-            Some(workspace)
-        );
-        drop(catalog);
-
-        let connection = Connection::open(&path)?;
-        connection.pragma_update(None, "foreign_keys", true)?;
-        crate::workspace_participation::drop_schema_for_legacy_fixture(&connection)?;
-        connection.execute_batch("DROP TABLE ops_admission_records; DROP TABLE ops_approval_requests; DROP TABLE ops_approval_policy; DROP TABLE ops_issuer_config; DROP TABLE ops_leadership_confirm_intents; DROP TABLE ops_ballots; DROP TABLE ops_election_electorate; DROP TABLE ops_leadership_elections; DROP TABLE ops_leadership_receipts; DROP TABLE ops_leadership; DROP TABLE ops_work_credit_entries; DROP TABLE ops_assignment_submit_source_refs; DROP TABLE ops_assignment_submit_projection; DROP TABLE ops_assignment_offer_projection; DROP TABLE ops_assignment_review_projection; DROP TABLE ops_change_set_projection;")?;
-        connection.pragma_update(None, "user_version", 9_i64)?;
-        drop(connection);
-
-        let migrated = crate::OperationsCatalog::open(&path, destination)?;
-        let version: i64 = migrated
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, crate::catalog::VERSION);
-        let import = migrated
-            .progress(migration)?
-            .ok_or("verified import disappeared")?;
-        assert_eq!(import.workspace_id(), workspace);
-        assert_eq!(import.destination_id(), destination);
-        assert_eq!(import.phase(), crate::ImportPhase::Verified);
-        assert!(
-            migrated.effect_fact_progress(migration)?.is_none(),
-            "legacy migration must not fabricate consumer acknowledgement"
-        );
-        assert!(
-            migrated.change_set_projection(migration)?.is_empty(),
-            "legacy migration must recreate the change set projection additively"
-        );
-        let source_ref_count: i64 = migrated.connection.query_row(
-            "SELECT COUNT(*) FROM ops_assignment_submit_source_refs",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(
-            source_ref_count, 0,
-            "legacy migrations fabricate no source refs"
-        );
-        drop(migrated);
-        std::fs::remove_dir_all(root)?;
-        Ok(())
     }
 
     fn reject_partial_producer(
@@ -3162,7 +2922,7 @@ mod tests {
     #[test]
     fn change_set_digest_marker_upgrades_only_from_source_witnessed_replay()
     -> Result<(), Box<dyn std::error::Error>> {
-        let mut fixture = reopen_v17_digest_fixture("change-set-digest-marker")?;
+        let mut fixture = seeded_legacy_digest_fixture("change-set-digest-marker")?;
         let destination = fixture.catalog.destination_id();
         let _ = apply_page(
             &mut fixture.catalog.connection,

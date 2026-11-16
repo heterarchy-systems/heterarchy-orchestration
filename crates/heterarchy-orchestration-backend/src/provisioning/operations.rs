@@ -1,40 +1,25 @@
-//! Source-fenced Agent provision operation reads and cancellation.
+//! Source-fenced readback for historical Agent provision operations.
 
 use axum::extract::{Extension, Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use forge_domain::AuthenticatedPrincipal;
-use heterarchy_orchestration_runtime::provisioning::operations::{
-    ProvisionOperationFullSummary, ProvisionOperationUncertaintyRetirement,
-};
+use heterarchy_orchestration_runtime::provisioning::operations::ProvisionOperationFullSummary;
 use uuid::Uuid;
 
+use crate::BackendState;
 use crate::app_support::{LaneError, validate_workspace_reference};
-use crate::catalog_execution::CatalogLane;
 use crate::wire::WorkspaceQueryScope;
 use crate::wire::provisioning_operations::{
-    ProvisionOperationCancelRequest, ProvisionOperationCancelResponse,
     ProvisionOperationQueryRequest, ProvisionOperationQueryResponse,
-    ProvisionOperationUncertaintyRetirementRequest,
-    ProvisionOperationUncertaintyRetirementResponse, ProvisionOperationUncertaintyRetirementWire,
-    ProvisionOperationWire,
+    ProvisionOperationUncertaintyRetirementWire, ProvisionOperationWire,
 };
-use crate::{BackendState, RealtimeEventKind, ScopedMutationAuthority};
 
 pub(super) fn routes() -> Router<BackendState> {
-    Router::new()
-        .route(
-            "/internal/v1/workspaces/{workspace_id}/provision-operations/query",
-            post(query),
-        )
-        .route(
-            "/internal/v1/workspaces/{workspace_id}/provision-operations/cancel",
-            post(cancel),
-        )
-        .route(
-            "/internal/v1/workspaces/{workspace_id}/provision-operations/retire-unobserved",
-            post(retire_unobserved),
-        )
+    Router::new().route(
+        "/internal/v1/workspaces/{workspace_id}/provision-operations/query",
+        post(query),
+    )
 }
 
 async fn query(
@@ -60,111 +45,6 @@ async fn query(
     Ok(Json(ProvisionOperationQueryResponse {
         scope: body.scope,
         operation: operation.as_ref().map(operation_wire),
-    }))
-}
-
-async fn cancel(
-    State(state): State<BackendState>,
-    Path(workspace): Path<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    Json(body): Json<ProvisionOperationCancelRequest>,
-) -> Result<Json<ProvisionOperationCancelResponse>, LaneError> {
-    validate_scope(&workspace, &body.scope, Some(body.session_id))?;
-    if body.operation_id.is_nil() || body.expected_revision == 0 {
-        return Err(LaneError::InvalidIdentity);
-    }
-    let scope = body.scope.clone();
-    let workspace_id = scope.workspace_id;
-    let operation_id = body.operation_id;
-    let expected_revision = body.expected_revision;
-    let publisher = state.clone();
-    let outcome = state
-        .run_workspace_reference_mutation(
-            body.scope,
-            body.session_id,
-            principal,
-            ScopedMutationAuthority::Operator,
-            CatalogLane::Control,
-            move |runtime, now| {
-                let outcome = runtime.cancel_provision_operation(
-                    workspace_id,
-                    operation_id,
-                    expected_revision,
-                    now,
-                )?;
-                if outcome.changed {
-                    publisher.publish_state_changed(
-                        RealtimeEventKind::ProvisioningStateChanged,
-                        outcome.operation.operation_id,
-                        outcome.operation.revision,
-                        Some(workspace_id),
-                    );
-                }
-                Ok(outcome)
-            },
-        )
-        .await?;
-    Ok(Json(ProvisionOperationCancelResponse {
-        scope,
-        operation: operation_wire(&outcome.operation),
-        changed: outcome.changed,
-    }))
-}
-
-async fn retire_unobserved(
-    State(state): State<BackendState>,
-    Path(workspace): Path<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    Json(body): Json<ProvisionOperationUncertaintyRetirementRequest>,
-) -> Result<Json<ProvisionOperationUncertaintyRetirementResponse>, LaneError> {
-    validate_scope(&workspace, &body.scope, Some(body.session_id))?;
-    if body.retirement_id.is_nil()
-        || body.operation_id.is_nil()
-        || body.expected_revision == 0
-        || body.recovery_version != 1
-    {
-        return Err(LaneError::InvalidIdentity);
-    }
-    let scope = body.scope.clone();
-    let workspace_id = scope.workspace_id;
-    let publisher = state.clone();
-    let outcome = state
-        .run_workspace_reference_mutation(
-            body.scope,
-            body.session_id,
-            principal,
-            ScopedMutationAuthority::Operator,
-            CatalogLane::Control,
-            move |runtime, now| {
-                let outcome = runtime.retire_unobserved_provision_operation(
-                    ProvisionOperationUncertaintyRetirement {
-                        principal,
-                        workspace_id,
-                        requester_session_id: body.session_id,
-                        retirement_id: body.retirement_id,
-                        operation_id: body.operation_id,
-                        expected_unknown_revision: body.expected_revision,
-                        recovery_version: body.recovery_version,
-                        retired_at_ms: now,
-                    },
-                )?;
-                if outcome.changed {
-                    publisher.publish_state_changed(
-                        RealtimeEventKind::ProvisioningStateChanged,
-                        outcome.operation.operation_id,
-                        outcome.operation.revision,
-                        Some(workspace_id),
-                    );
-                }
-                Ok(outcome)
-            },
-        )
-        .await?;
-    Ok(Json(ProvisionOperationUncertaintyRetirementResponse {
-        scope,
-        operation: operation_wire(&outcome.operation),
-        retirement: ProvisionOperationUncertaintyRetirementWire::from(&outcome.retirement),
-        changed: outcome.changed,
     }))
 }
 

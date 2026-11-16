@@ -155,38 +155,6 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsErr
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn drop_schema_for_legacy_fixture(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    crate::catalog::drop_v53_mission_schema_for_legacy_fixture(connection)?;
-    let has_table: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ops_import_handoff_seals')",
-        [],
-        |row| row.get(0),
-    )?;
-    if has_table {
-        let seal_count: i64 =
-            connection.query_row("SELECT COUNT(*) FROM ops_import_handoff_seals", [], |row| {
-                row.get(0)
-            })?;
-        if seal_count != 0 {
-            return Err(OperationsError::Conflict(
-                "legacy fixture contains handoff seals",
-            ));
-        }
-    }
-    connection.execute_batch(
-        "DROP TRIGGER IF EXISTS ops_import_handoff_sealed_import_no_delete;
-         DROP TRIGGER IF EXISTS ops_import_handoff_sealed_import_no_update;
-         DROP TRIGGER IF EXISTS ops_import_handoff_seals_no_delete;
-         DROP TRIGGER IF EXISTS ops_import_handoff_seals_no_update;
-         DROP TRIGGER IF EXISTS ops_import_handoff_seals_validate_insert;
-         DROP TABLE IF EXISTS ops_import_handoff_seals;",
-    )?;
-    Ok(())
-}
-
 impl OperationsCatalog {
     /// Seal one verified import and return Source-owned immutable evidence.
     ///
@@ -767,7 +735,7 @@ mod tests {
                 .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))?,
             VERSION
         );
-        assert_eq!(VERSION, 69);
+        assert_eq!(VERSION, crate::OPERATIONS_SCHEMA_VERSION);
         let object_count: i64 = catalog.connection.query_row(
             "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'ops_import_handoff_%' OR name LIKE 'ops_import_handoff_sealed_import_%'",
             [],
@@ -775,52 +743,6 @@ mod tests {
         )?;
         assert_eq!(object_count, 6);
         drop(catalog);
-        fixture.cleanup()?;
-        Ok(())
-    }
-
-    #[test]
-    fn catalog_v51_upgrades_additively_to_v52() -> Result<(), Box<dyn Error>> {
-        let (fixture, initial) = Fixture::new("v51-upgrade")?;
-        let path = fixture.path.clone();
-        let destination = fixture.destination_id;
-        drop(initial);
-
-        let connection = Connection::open(&path)?;
-        drop_schema_for_legacy_fixture(&connection)?;
-        connection.pragma_update(None, "user_version", 51_i64)?;
-        drop(connection);
-
-        let upgraded = OperationsCatalog::open(&path, destination)?;
-        assert_eq!(
-            upgraded
-                .connection
-                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))?,
-            VERSION
-        );
-        let progress = upgraded
-            .progress(fixture.migration_id)?
-            .ok_or("verified v51 import history missing")?;
-        assert_eq!(progress.phase(), ImportPhase::Verified);
-        assert_eq!(progress.page_count(), 5);
-        assert_eq!(progress.digest(), fixture.digest);
-        let issuer = upgraded
-            .admission_issuer_config()?
-            .ok_or("v51 issuer configuration missing")?;
-        assert_eq!(issuer.issuer().into_uuid(), Uuid::from_u128(0xA540));
-        assert_eq!(issuer.backend_id().into_uuid(), Uuid::from_u128(0xA550));
-        let seals: i64 = upgraded.connection.query_row(
-            "SELECT COUNT(*) FROM ops_import_handoff_seals",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(seals, 0);
-        let foreign_key_violation: Option<String> = upgraded
-            .connection
-            .query_row("PRAGMA foreign_key_check", [], |row| row.get(0))
-            .optional()?;
-        assert!(foreign_key_violation.is_none());
-        drop(upgraded);
         fixture.cleanup()?;
         Ok(())
     }

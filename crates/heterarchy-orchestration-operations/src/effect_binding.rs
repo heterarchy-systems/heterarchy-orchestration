@@ -137,16 +137,6 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsErr
     Ok(())
 }
 
-/// Backfill only registrations that already have a real Forge activation
-/// witness. No readiness is inferred from membership commit alone.
-pub(crate) fn migrate_from_v5(connection: &Connection) -> Result<(), OperationsError> {
-    connection.execute(
-        "INSERT INTO ops_current_effect_bindings(workspace_id,participant_id,activity_id,session_id,agent_id,source_kind,source_request_id) SELECT b.workspace_id,b.participant_id,b.activity_id,b.session_id,b.agent_id,0,b.request_id FROM ops_logical_bindings b JOIN ops_binding_activations a ON a.request_id=b.request_id",
-        [],
-    )?;
-    Ok(())
-}
-
 pub(crate) fn record_registration(
     tx: &Transaction<'_>,
     workspace_id: WorkspaceId,

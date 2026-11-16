@@ -6,7 +6,7 @@
 use crate::{
     OperationsCatalog, OperationsError, WorkspaceParticipationId,
     leadership::{
-        CURRENT_LEADERSHIP_AUTHORITY_PREDICATE, LeadershipScope, NEW_MEMBER_PROBATION_MS,
+        LeadershipScope, NEW_MEMBER_PROBATION_MS, current_leadership_authority_predicate,
     },
     wire,
 };
@@ -19,43 +19,23 @@ use uuid::Uuid;
 const MAX_VOTER_SOURCES: usize = 64;
 const CUTOVER_DIGEST_DOMAIN: &[u8] = b"heterarchy.election-voter-subject-cutover.v2\0";
 
-const CUTOVERS_SQL_V31: &str = "CREATE TABLE ops_election_subject_cutovers (election_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_leadership_elections(election_id) CHECK(length(election_id)=16 AND election_id != zeroblob(16)), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1)), activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16), source_leadership_revision INTEGER NOT NULL CHECK(source_leadership_revision>=1), result_leadership_revision INTEGER NOT NULL CHECK(result_leadership_revision=source_leadership_revision+1), subject_revision INTEGER NOT NULL CHECK(subject_revision=1), source_participant_count INTEGER NOT NULL CHECK(source_participant_count BETWEEN 1 AND 64), voter_subject_count INTEGER NOT NULL CHECK(voter_subject_count BETWEEN 1 AND source_participant_count), electorate_digest BLOB NOT NULL CHECK(length(electorate_digest)=32 AND electorate_digest != zeroblob(32)), created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0), CHECK((scope_kind=0 AND activity_id IS NULL) OR (scope_kind=1 AND activity_id IS NOT NULL)))";
 const CUTOVERS_SQL: &str = "CREATE TABLE ops_election_subject_cutovers (election_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_leadership_elections(election_id) CHECK(length(election_id)=16 AND election_id != zeroblob(16)), workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16), scope_kind INTEGER NOT NULL CHECK(scope_kind IN(0,1,2)), activity_id BLOB CHECK(activity_id IS NULL OR length(activity_id)=16), team_id BLOB CHECK(team_id IS NULL OR length(team_id)=16), source_leadership_revision INTEGER NOT NULL CHECK(source_leadership_revision>=1), result_leadership_revision INTEGER NOT NULL CHECK(result_leadership_revision=source_leadership_revision+1), subject_revision INTEGER NOT NULL CHECK(subject_revision=1), source_participant_count INTEGER NOT NULL CHECK(source_participant_count BETWEEN 1 AND 64), voter_subject_count INTEGER NOT NULL CHECK(voter_subject_count BETWEEN 1 AND source_participant_count), electorate_digest BLOB NOT NULL CHECK(length(electorate_digest)=32 AND electorate_digest != zeroblob(32)), created_at_ms INTEGER NOT NULL CHECK(created_at_ms>=0), CHECK((scope_kind=0 AND activity_id IS NULL AND team_id IS NULL) OR (scope_kind=1 AND activity_id IS NOT NULL AND team_id IS NULL) OR (scope_kind=2 AND activity_id IS NULL AND team_id IS NOT NULL)))";
 const SUBJECTS_SQL: &str = "CREATE TABLE ops_election_voter_subjects (election_id BLOB NOT NULL REFERENCES ops_election_subject_cutovers(election_id) CHECK(length(election_id)=16), subject_kind INTEGER NOT NULL CHECK(subject_kind IN(0,1)), subject_id BLOB NOT NULL CHECK(length(subject_id)=16 AND subject_id != zeroblob(16)), agent_profile_id BLOB CHECK(agent_profile_id IS NULL OR (length(agent_profile_id)=16 AND agent_profile_id != zeroblob(16))), participation_revision INTEGER CHECK(participation_revision IS NULL OR participation_revision>0), source_participant_count INTEGER NOT NULL CHECK(source_participant_count BETWEEN 1 AND 64), PRIMARY KEY(election_id,subject_kind,subject_id), CHECK((subject_kind=0 AND agent_profile_id IS NOT NULL AND participation_revision IS NOT NULL) OR (subject_kind=1 AND agent_profile_id IS NULL AND participation_revision IS NULL AND source_participant_count=1)))";
 const SOURCES_SQL: &str = "CREATE TABLE ops_election_voter_sources (election_id BLOB NOT NULL CHECK(length(election_id)=16), participant_id BLOB NOT NULL CHECK(length(participant_id)=16 AND participant_id != zeroblob(16)), membership_revision INTEGER NOT NULL CHECK(membership_revision>0), team_membership_revision INTEGER CHECK(team_membership_revision IS NULL OR team_membership_revision>0), subject_kind INTEGER NOT NULL CHECK(subject_kind IN(0,1)), subject_id BLOB NOT NULL CHECK(length(subject_id)=16 AND subject_id != zeroblob(16)), PRIMARY KEY(election_id,participant_id), FOREIGN KEY(election_id,subject_kind,subject_id) REFERENCES ops_election_voter_subjects(election_id,subject_kind,subject_id))";
-const SOURCES_SQL_V34: &str = "CREATE TABLE ops_election_voter_sources (election_id BLOB NOT NULL CHECK(length(election_id)=16), participant_id BLOB NOT NULL CHECK(length(participant_id)=16 AND participant_id != zeroblob(16)), membership_revision INTEGER NOT NULL CHECK(membership_revision>0), subject_kind INTEGER NOT NULL CHECK(subject_kind IN(0,1)), subject_id BLOB NOT NULL CHECK(length(subject_id)=16 AND subject_id != zeroblob(16)), PRIMARY KEY(election_id,participant_id), FOREIGN KEY(election_id,subject_kind,subject_id) REFERENCES ops_election_voter_subjects(election_id,subject_kind,subject_id))";
 const BALLOTS_SQL: &str = "CREATE TABLE ops_election_subject_ballots (election_id BLOB NOT NULL CHECK(length(election_id)=16), subject_kind INTEGER NOT NULL CHECK(subject_kind IN(0,1)), subject_id BLOB NOT NULL CHECK(length(subject_id)=16 AND subject_id != zeroblob(16)), cast_by_participant_id BLOB NOT NULL CHECK(length(cast_by_participant_id)=16 AND cast_by_participant_id != zeroblob(16)), choice TEXT NOT NULL CHECK(choice IN('YES','NO','ABSTAIN')), ballot_revision INTEGER NOT NULL CHECK(ballot_revision=1), cast_at_ms INTEGER NOT NULL CHECK(cast_at_ms>=0), PRIMARY KEY(election_id,subject_kind,subject_id), FOREIGN KEY(election_id,subject_kind,subject_id) REFERENCES ops_election_voter_subjects(election_id,subject_kind,subject_id))";
 const TEAM_LEADER_SOURCES_SQL: &str = "CREATE TABLE ops_election_team_leader_sources (election_id BLOB NOT NULL REFERENCES ops_election_subject_cutovers(election_id) CHECK(length(election_id)=16), team_id BLOB NOT NULL CHECK(length(team_id)=16 AND team_id != zeroblob(16)), leader_participant_id BLOB NOT NULL CHECK(length(leader_participant_id)=16 AND leader_participant_id != zeroblob(16)), leader_participation_id BLOB NOT NULL CHECK(length(leader_participation_id)=16 AND leader_participation_id != zeroblob(16)), team_revision INTEGER NOT NULL CHECK(team_revision>0), leadership_revision INTEGER NOT NULL CHECK(leadership_revision>0), team_membership_revision INTEGER NOT NULL CHECK(team_membership_revision>0), PRIMARY KEY(election_id,team_id))";
 
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
-    let mut objects = schema_objects_v34();
-    objects.retain(|(kind, name, _)| *kind != "table" || *name != "ops_election_voter_sources");
-    objects.push(("table", "ops_election_voter_sources", SOURCES_SQL));
-    objects.push((
-        "table",
-        "ops_election_team_leader_sources",
-        TEAM_LEADER_SOURCES_SQL,
-    ));
-    objects
-}
-
-/// Exact election-subject schema objects before Workspace electorate
-/// provenance was added at catalog version 35.
-pub(crate) fn schema_objects_v34() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         ("table", "ops_election_subject_cutovers", CUTOVERS_SQL),
         ("table", "ops_election_voter_subjects", SUBJECTS_SQL),
-        ("table", "ops_election_voter_sources", SOURCES_SQL_V34),
+        ("table", "ops_election_voter_sources", SOURCES_SQL),
         ("table", "ops_election_subject_ballots", BALLOTS_SQL),
-    ]
-}
-
-pub(crate) fn schema_objects_v31() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
-        ("table", "ops_election_subject_cutovers", CUTOVERS_SQL_V31),
-        ("table", "ops_election_voter_subjects", SUBJECTS_SQL),
-        ("table", "ops_election_voter_sources", SOURCES_SQL_V34),
-        ("table", "ops_election_subject_ballots", BALLOTS_SQL),
+        (
+            "table",
+            "ops_election_team_leader_sources",
+            TEAM_LEADER_SOURCES_SQL,
+        ),
     ]
 }
 
@@ -63,82 +43,6 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsErr
     for (_, _, sql) in schema_objects() {
         connection.execute_batch(sql)?;
     }
-    Ok(())
-}
-
-pub(crate) fn migrate_v34_to_v35(tx: &Transaction<'_>) -> Result<(), OperationsError> {
-    if !table_has_column(tx, "ops_election_voter_sources", "team_membership_revision")? {
-        tx.execute_batch(&SOURCES_SQL.replacen(
-            "CREATE TABLE ops_election_voter_sources ",
-            "CREATE TABLE ops_election_voter_sources_v35 ",
-            1,
-        ))?;
-        tx.execute(
-            "INSERT INTO ops_election_voter_sources_v35(election_id,participant_id,membership_revision,team_membership_revision,subject_kind,subject_id) SELECT election_id,participant_id,membership_revision,NULL,subject_kind,subject_id FROM ops_election_voter_sources",
-            [],
-        )?;
-        tx.execute_batch("DROP TABLE ops_election_voter_sources; ALTER TABLE ops_election_voter_sources_v35 RENAME TO ops_election_voter_sources")?;
-    }
-    let exists = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='ops_election_team_leader_sources')",
-        [],
-        |row| row.get::<_, bool>(0),
-    )?;
-    if !exists {
-        tx.execute_batch(TEAM_LEADER_SOURCES_SQL)?;
-    }
-    Ok(())
-}
-
-/// Rebuild the one changed election-subject table from catalog v31. The
-/// catalog migration owner disables foreign-key enforcement only outside its
-/// IMMEDIATE transaction, rebuilds the parent election table in the same
-/// migration, runs `foreign_key_check`, and restores enforcement before
-/// returning. This helper never toggles connection-wide pragmas itself.
-pub(crate) fn migrate_v31_to_v32(tx: &Transaction<'_>) -> Result<(), OperationsError> {
-    if table_has_column(tx, "ops_election_subject_cutovers", "team_id")? {
-        return Ok(());
-    }
-    tx.execute_batch(&CUTOVERS_SQL.replacen(
-        "CREATE TABLE ops_election_subject_cutovers ",
-        "CREATE TABLE ops_election_subject_cutovers_v32 ",
-        1,
-    ))?;
-    tx.execute(
-        "INSERT INTO ops_election_subject_cutovers_v32(election_id,workspace_id,scope_kind,activity_id,team_id,source_leadership_revision,result_leadership_revision,subject_revision,source_participant_count,voter_subject_count,electorate_digest,created_at_ms) SELECT election_id,workspace_id,scope_kind,activity_id,NULL,source_leadership_revision,result_leadership_revision,subject_revision,source_participant_count,voter_subject_count,electorate_digest,created_at_ms FROM ops_election_subject_cutovers",
-        [],
-    )?;
-    tx.execute("DROP TABLE ops_election_subject_cutovers", [])?;
-    tx.execute_batch(
-        "ALTER TABLE ops_election_subject_cutovers_v32 RENAME TO ops_election_subject_cutovers",
-    )?;
-    Ok(())
-}
-
-fn table_has_column(
-    connection: &Connection,
-    table: &str,
-    column: &str,
-) -> Result<bool, OperationsError> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(1)?;
-        if name == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-#[cfg(test)]
-pub(crate) fn drop_schema_for_legacy_fixture(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    crate::work_credit_subject::drop_schema_for_legacy_fixture(connection)?;
-    connection.execute_batch(
-        "DROP TABLE IF EXISTS ops_election_team_leader_sources;          DROP TABLE IF EXISTS ops_election_subject_ballots;          DROP TABLE IF EXISTS ops_election_voter_sources;          DROP TABLE IF EXISTS ops_election_voter_subjects;          DROP TABLE IF EXISTS ops_election_subject_cutovers;",
-    )?;
     Ok(())
 }
 
@@ -522,7 +426,9 @@ fn ready_team_voter_candidates(
 // gate itself is owned by leadership.rs and is appended by both callers.
 // Age and fulfillment are frozen only by the start path. Mapping Sessions are
 // immutable origin evidence; the logical member owns the current Session.
-const CURRENT_CONFIRMED_TEAM_LEADER_FROM: &str = "FROM ops_teams t
+macro_rules! current_confirmed_team_leader_from {
+    () => {
+        "FROM ops_teams t
          JOIN ops_leadership l
            ON l.workspace_id=t.workspace_id AND l.scope_kind=2 AND l.team_id=t.team_id
          JOIN ops_workspace_participation_mappings m
@@ -536,7 +442,39 @@ const CURRENT_CONFIRMED_TEAM_LEADER_FROM: &str = "FROM ops_teams t
          JOIN ops_logical_members lm
            ON lm.workspace_id=m.workspace_id AND lm.participant_id=m.participant_id
               AND lm.membership_revision=m.participant_membership_revision
-         WHERE t.workspace_id=?1 AND t.state='ACTIVE'";
+         WHERE t.workspace_id=?1 AND t.state='ACTIVE'"
+    };
+}
+
+const EXISTS_LOST_TEAM_LEADERSHIP_SQL: &str = crate::static_sql::StaticSql::dml(concat!(
+    "SELECT EXISTS(SELECT 1 FROM ops_election_voter_subjects s
+            WHERE s.election_id=?2 AND (s.subject_kind!=0 OR NOT EXISTS(
+                SELECT 1 ",
+    current_confirmed_team_leader_from!(),
+    "
+                AND (",
+    current_leadership_authority_predicate!(),
+    ")
+                AND p.participation_id=s.subject_id)))"
+))
+.as_str();
+
+const SELECT_READY_WORKSPACE_TEAM_LEADERS_SQL: &str = crate::static_sql::StaticSql::dml(concat!(
+    "SELECT DISTINCT substr(t.team_id,1,17),substr(l.leader_participant_id,1,17),
+                substr(tm.participation_id,1,17),tm.revision,t.revision,l.leadership_revision,
+                lm.membership_revision,lm.created_at_ms
+         ",
+    current_confirmed_team_leader_from!(),
+    "
+         AND (",
+    current_leadership_authority_predicate!(),
+    ")
+         AND (",
+    crate::teams::formed_team_admission_predicate!(),
+    ")
+         ORDER BY t.team_id LIMIT ?2"
+))
+.as_str();
 
 pub(crate) fn workspace_electorate_lost_team_leadership(
     connection: &Connection,
@@ -551,13 +489,7 @@ pub(crate) fn workspace_electorate_lost_team_leadership(
     // The outer snapshot is bounded by MAX_VOTER_SOURCES. An Agent with
     // multiple Teams or source aliases retains its seat until its last role is lost.
     Ok(connection.query_row(
-        &format!(
-            "SELECT EXISTS(SELECT 1 FROM ops_election_voter_subjects s
-            WHERE s.election_id=?2 AND (s.subject_kind!=0 OR NOT EXISTS(
-                SELECT 1 {CURRENT_CONFIRMED_TEAM_LEADER_FROM}
-                AND ({CURRENT_LEADERSHIP_AUTHORITY_PREDICATE})
-                AND p.participation_id=s.subject_id)))"
-        ),
+        EXISTS_LOST_TEAM_LEADERSHIP_SQL,
         params![workspace.into_uuid().as_bytes(), election.as_bytes()],
         |row| row.get(0),
     )?)
@@ -569,16 +501,7 @@ fn ready_workspace_team_leaders(
 ) -> Result<Vec<(Uuid, u64, i64, TeamLeaderSource)>, OperationsError> {
     let limit = i64::try_from(MAX_VOTER_SOURCES + 1)
         .map_err(|_| OperationsError::Bounds("leadership electorate"))?;
-    let mut statement = connection.prepare(&format!(
-        "SELECT DISTINCT substr(t.team_id,1,17),substr(l.leader_participant_id,1,17),
-                substr(tm.participation_id,1,17),tm.revision,t.revision,l.leadership_revision,
-                lm.membership_revision,lm.created_at_ms
-         {CURRENT_CONFIRMED_TEAM_LEADER_FROM}
-         AND ({CURRENT_LEADERSHIP_AUTHORITY_PREDICATE})
-         AND ({formation})
-         ORDER BY t.team_id LIMIT ?2",
-        formation = crate::teams::FORMED_TEAM_ADMISSION_PREDICATE
-    ))?;
+    let mut statement = connection.prepare(SELECT_READY_WORKSPACE_TEAM_LEADERS_SQL)?;
     let rows = statement
         .query_map(params![workspace_id.into_uuid().as_bytes(), limit], |row| {
             Ok((
@@ -1417,14 +1340,6 @@ mod tests {
         participation_id: WorkspaceParticipationId,
     }
 
-    fn table_sql(connection: &Connection, name: &str) -> Result<String, Box<dyn Error>> {
-        Ok(connection.query_row(
-            "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?1",
-            params![name],
-            |row| row.get(0),
-        )?)
-    }
-
     fn subject_fixture() -> Result<SubjectFixture, Box<dyn Error>> {
         let root =
             std::env::temp_dir().join(format!("heterarchy-election-subject-{}", Uuid::now_v7()));
@@ -1935,66 +1850,6 @@ mod tests {
         transaction.commit()?;
         drop(fixture.catalog);
         fs::remove_dir_all(fixture.root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn v23_to_v24_adds_only_election_subject_authority_tables() -> Result<(), Box<dyn Error>> {
-        let root = std::env::temp_dir().join(format!(
-            "heterarchy-election-subject-migration-{}",
-            Uuid::now_v7()
-        ));
-        fs::create_dir(&root)?;
-        let path = root.join("operations.sqlite3");
-        let destination = Uuid::from_u128(0xE590);
-        let catalog = OperationsCatalog::open(&path, destination)?;
-        drop(catalog);
-        let connection = Connection::open(&path)?;
-        let leadership_before = table_sql(&connection, "ops_leadership")?;
-        let electorate_before = table_sql(&connection, "ops_election_electorate")?;
-        let ballots_before = table_sql(&connection, "ops_ballots")?;
-        let credit_before = table_sql(&connection, "ops_work_credit_entries")?;
-        drop_schema_for_legacy_fixture(&connection)?;
-        connection.pragma_update(None, "user_version", 23_i64)?;
-        drop(connection);
-
-        let migrated = OperationsCatalog::open(&path, destination)?;
-        let version: i64 = migrated
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, crate::catalog::VERSION);
-        crate::catalog::assert_fixture_table_schema(
-            &migrated.connection,
-            "ops_leadership",
-            &leadership_before,
-        )?;
-        assert_eq!(
-            table_sql(&migrated.connection, "ops_election_electorate")?,
-            electorate_before
-        );
-        assert_eq!(
-            table_sql(&migrated.connection, "ops_ballots")?,
-            ballots_before
-        );
-        assert_eq!(
-            table_sql(&migrated.connection, "ops_work_credit_entries")?,
-            credit_before
-        );
-        for table in [
-            "ops_election_subject_cutovers",
-            "ops_election_voter_subjects",
-            "ops_election_voter_sources",
-            "ops_election_subject_ballots",
-        ] {
-            let count: i64 = migrated.connection.query_row(
-                "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name=?1",
-                params![table],
-                |row| row.get(0),
-            )?;
-            assert_eq!(count, 1, "missing v24 table {table}");
-        }
-        drop(migrated);
-        fs::remove_dir_all(root)?;
         Ok(())
     }
 

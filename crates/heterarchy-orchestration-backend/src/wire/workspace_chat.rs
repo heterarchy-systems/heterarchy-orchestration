@@ -30,7 +30,7 @@ pub struct WorkspaceChatQueryRequest {
     pub query: WorkspaceChatQueryWire,
 }
 
-/// Provider route fence returned by a direct query and frozen by send.
+/// Historical Provider route fence retained inside an exact recovery intent.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceChatTargetFenceWire {
@@ -44,7 +44,7 @@ pub struct WorkspaceChatTargetFenceWire {
     pub provider_conversation_id: String,
 }
 
-/// Immutable direct message intent.
+/// Immutable historical direct message intent used for recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceChatMessageRequest {
@@ -54,7 +54,7 @@ pub struct WorkspaceChatMessageRequest {
     pub target_fence: WorkspaceChatTargetFenceWire,
 }
 
-/// Caller-owned direct send/recovery request.
+/// Caller-owned direct intent selector for exact historical recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceChatSendRequest {
@@ -64,15 +64,12 @@ pub struct WorkspaceChatSendRequest {
     pub request: WorkspaceChatMessageRequest,
 }
 
-/// Exact current direct route and bounded direct-channel history.
+/// Bounded direct-channel history without a current Provider route projection.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkspaceChatSnapshotWire {
     pub workspace_id: Uuid,
     pub agent_profile_id: Uuid,
-    pub targets: Vec<WorkspaceChatTargetFenceWire>,
-    #[serde(deserialize_with = "deserialize_required_option")]
-    pub target: Option<WorkspaceChatTargetFenceWire>,
     pub messages: Vec<ChatEntryWire>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub before_sequence: Option<u64>,
@@ -88,14 +85,6 @@ pub struct WorkspaceChatSnapshotWire {
 pub struct WorkspaceChatQueryResponse {
     pub request: WorkspaceChatQueryRequest,
     pub snapshot: WorkspaceChatSnapshotWire,
-}
-
-/// Exact direct send echo and durable outbox receipt.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkspaceChatSendResponse {
-    pub request: WorkspaceChatSendRequest,
-    pub receipt: ChatReceiptWire,
 }
 
 /// Pure direct recovery; absence never authorizes a resend.

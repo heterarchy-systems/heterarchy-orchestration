@@ -24,9 +24,9 @@ acceptance status is tracked in
 
 The Rust backend declares `GET /health` and `GET /ready`. Its `/internal/v1/*`
 routes are behind bearer authentication. The current source includes profile
-and logical-session operations; provisioning and Agent-request workflows;
+and logical-session operations; Agent-request intent and historical recovery;
 membership, presence, inbox, handoff, and departure; teams and leadership;
-approval; work-credit; Node-Team and Node-Chat; and global and Workspace event
+approval; work-credit; Node-Team and historical Node/Workspace chat reads; and global and Workspace event
 streams. Selected Forge read operations are exposed through
 `/internal/v1/forge/*` and `/internal/v1/workspaces/{workspace_id}/forge/*`.
 The operator-only operations import lifecycle is exposed through
@@ -37,6 +37,21 @@ This is a route inventory only. The repair matrix records which requirements
 still need authoritative Forge or Broker behavior, a real consumer, and
 executed acceptance. No capability is considered complete because a handler,
 client type, or test fixture exists in source.
+
+## Execution provider retirement
+
+ChatGPT provider execution is retired. New Profiles are `unbound`: their identity,
+capability preferences and organizational membership do not imply a runnable
+provider. Existing `chatgpt` values identify historical records only. The backend
+does not create, wake, dispatch to, or confirm ChatGPT conversations, and it does
+not send new provider-backed Workspace or Node chat messages.
+
+Existing identities, messages, receipts and unresolved outcomes remain available
+through authorized history reads. Removing a provider does not prove that a
+previous external effect stopped or completed. Codex and Antigravity execution
+adapters are not implemented by this retirement. Profile schema 8 preserves
+legacy provider values and identity links while allowing new unbound Profiles.
+The retirement plan and verification record are maintained in Alexandria.
 
 ## Admission issuer startup
 

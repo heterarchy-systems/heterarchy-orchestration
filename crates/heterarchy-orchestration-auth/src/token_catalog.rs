@@ -19,35 +19,18 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use thiserror::Error;
 use uuid::Uuid;
 
+mod sql;
+
+use self::sql::{
+    COUNT_SCHEMA_OBJECTS_SQL, DELETE_TOKEN_SQL, FIND_ACTIVE_BY_DIGEST_SQL, INSERT_TOKEN_SQL,
+    LIST_TOKEN_IDS_SQL, LOAD_TOKEN_SQL, PRAGMA_FOREIGN_KEY_CHECK_SQL, PRAGMA_QUICK_CHECK_SQL,
+    SELECT_SCHEMA_SQL, TOKENS_INDEX_SQL, TOKENS_TABLE_SQL, UPDATE_TERMINAL_TOKEN_SQL,
+};
+
 const APPLICATION_ID: i64 = 0x4846_544b;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 1;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_MCP_TOKEN_CATALOG_RESULTS: usize = 256;
-
-const TOKENS_TABLE_SQL: &str = r"
-CREATE TABLE mcp_tokens (
-    token_id BLOB PRIMARY KEY NOT NULL CHECK(length(token_id) = 16),
-    token_digest BLOB NOT NULL UNIQUE CHECK(length(token_digest) = 32),
-    state INTEGER NOT NULL CHECK(state IN (1, 2, 3)),
-    label TEXT NOT NULL CHECK(length(CAST(label AS BLOB)) BETWEEN 1 AND 128),
-    created_at_ms INTEGER NOT NULL,
-    disabled_at_ms INTEGER,
-    replacement_token_id BLOB REFERENCES mcp_tokens(token_id),
-    revision INTEGER NOT NULL CHECK(revision > 0),
-    CHECK(
-        (state = 1 AND disabled_at_ms IS NULL AND replacement_token_id IS NULL)
-        OR (state = 2 AND disabled_at_ms IS NOT NULL AND replacement_token_id IS NULL)
-        OR (state = 3 AND disabled_at_ms IS NOT NULL AND replacement_token_id IS NOT NULL)
-    ),
-    CHECK(disabled_at_ms IS NULL OR disabled_at_ms >= created_at_ms),
-    CHECK(replacement_token_id IS NULL OR replacement_token_id != token_id)
-);
-";
-
-const TOKENS_INDEX_SQL: &str = r"
-CREATE INDEX mcp_tokens_state_created_idx
-ON mcp_tokens(state, created_at_ms DESC, token_id);
-";
 
 #[derive(Debug)]
 pub struct McpTokenCatalog {
@@ -105,7 +88,7 @@ impl McpTokenCatalog {
         let id = self
             .connection
             .query_row(
-                "SELECT token_id FROM mcp_tokens WHERE token_digest = ?1 AND state = 1",
+                FIND_ACTIVE_BY_DIGEST_SQL,
                 params![digest.into_bytes().as_slice()],
                 |row| row.get::<_, Vec<u8>>(0),
             )
@@ -125,9 +108,7 @@ impl McpTokenCatalog {
             return Err(McpTokenCatalogError::InvalidLimit(limit));
         }
         let limit = i64::try_from(limit).map_err(|_| McpTokenCatalogError::InvalidLimit(limit))?;
-        let mut statement = self.connection.prepare(
-            "SELECT token_id FROM mcp_tokens ORDER BY created_at_ms DESC, token_id LIMIT ?1",
-        )?;
+        let mut statement = self.connection.prepare(LIST_TOKEN_IDS_SQL)?;
         let ids = statement
             .query_map(params![limit], |row| row.get::<_, Vec<u8>>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -153,7 +134,7 @@ impl McpTokenCatalog {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let changed = transaction.execute(
-            "DELETE FROM mcp_tokens WHERE token_id = ?1 AND revision = ?2",
+            DELETE_TOKEN_SQL,
             params![id.into_uuid().as_bytes(), expected_revision.get()],
         )?;
         if changed != 1 {
@@ -261,11 +242,7 @@ fn initialize_or_validate(connection: &mut Connection) -> Result<(), McpTokenCat
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let user_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    let object_count: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
-        [],
-        |row| row.get(0),
-    )?;
+    let object_count: i64 = connection.query_row(COUNT_SCHEMA_OBJECTS_SQL, [], |row| row.get(0))?;
     match (application_id, user_version, object_count) {
         (0, 0, 0) => create_schema(connection),
         (APPLICATION_ID, SCHEMA_VERSION, _) => validate_schema(connection),
@@ -287,7 +264,7 @@ fn create_schema(connection: &mut Connection) -> Result<(), McpTokenCatalogError
 }
 
 fn validate_schema(connection: &Connection) -> Result<(), McpTokenCatalogError> {
-    let quick: String = connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    let quick: String = connection.query_row(PRAGMA_QUICK_CHECK_SQL, [], |row| row.get(0))?;
     if quick != "ok" {
         return Err(McpTokenCatalogError::Integrity);
     }
@@ -299,7 +276,7 @@ fn validate_schema(connection: &Connection) -> Result<(), McpTokenCatalogError> 
         TOKENS_INDEX_SQL,
     )?;
     let foreign_key_violation = connection
-        .prepare("PRAGMA foreign_key_check")?
+        .prepare(PRAGMA_FOREIGN_KEY_CHECK_SQL)?
         .query([])?
         .next()?
         .is_some();
@@ -316,11 +293,9 @@ fn validate_schema_sql(
     expected: &str,
 ) -> Result<(), McpTokenCatalogError> {
     let actual = connection
-        .query_row(
-            "SELECT sql FROM sqlite_schema WHERE type = ?1 AND name = ?2",
-            params![object_type, name],
-            |row| row.get::<_, String>(0),
-        )
+        .query_row(SELECT_SCHEMA_SQL, params![object_type, name], |row| {
+            row.get::<_, String>(0)
+        })
         .optional()?;
     if actual.as_deref().map(normalize_sql) == Some(normalize_sql(expected)) {
         Ok(())
@@ -346,7 +321,7 @@ fn insert_token(
     token: &RegisteredMcpToken,
 ) -> Result<(), McpTokenCatalogError> {
     transaction.execute(
-        "INSERT INTO mcp_tokens(token_id, token_digest, state, label, created_at_ms, disabled_at_ms, replacement_token_id, revision) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        INSERT_TOKEN_SQL,
         params![
             token.id().into_uuid().as_bytes(),
             token.digest().into_bytes().as_slice(),
@@ -354,7 +329,9 @@ fn insert_token(
             token.label().as_str(),
             token.created_at().get(),
             token.disabled_at().map(TimestampMillis::get),
-            token.replacement_token_id().map(|id| id.into_uuid().as_bytes().to_vec()),
+            token
+                .replacement_token_id()
+                .map(|id| id.into_uuid().as_bytes().to_vec()),
             token.revision().get(),
         ],
     )?;
@@ -367,11 +344,13 @@ fn update_terminal(
     expected_revision: McpTokenRevision,
 ) -> Result<(), McpTokenCatalogError> {
     let changed = transaction.execute(
-        "UPDATE mcp_tokens SET state = ?1, disabled_at_ms = ?2, replacement_token_id = ?3, revision = ?4 WHERE token_id = ?5 AND revision = ?6 AND state = 1",
+        UPDATE_TERMINAL_TOKEN_SQL,
         params![
             encode_state(token.state()),
             token.disabled_at().map(TimestampMillis::get),
-            token.replacement_token_id().map(|id| id.into_uuid().as_bytes().to_vec()),
+            token
+                .replacement_token_id()
+                .map(|id| id.into_uuid().as_bytes().to_vec()),
             token.revision().get(),
             token.id().into_uuid().as_bytes(),
             expected_revision.get(),
@@ -388,21 +367,17 @@ fn load_token(
     id: McpTokenId,
 ) -> Result<Option<RegisteredMcpToken>, McpTokenCatalogError> {
     let raw = connection
-        .query_row(
-            "SELECT token_digest, state, label, created_at_ms, disabled_at_ms, replacement_token_id, revision FROM mcp_tokens WHERE token_id = ?1",
-            params![id.into_uuid().as_bytes()],
-            |row| {
-                Ok(RawToken {
-                    digest: row.get(0)?,
-                    state: row.get(1)?,
-                    label: row.get(2)?,
-                    created_at: row.get(3)?,
-                    disabled_at: row.get(4)?,
-                    replacement_token_id: row.get(5)?,
-                    revision: row.get(6)?,
-                })
-            },
-        )
+        .query_row(LOAD_TOKEN_SQL, params![id.into_uuid().as_bytes()], |row| {
+            Ok(RawToken {
+                digest: row.get(0)?,
+                state: row.get(1)?,
+                label: row.get(2)?,
+                created_at: row.get(3)?,
+                disabled_at: row.get(4)?,
+                replacement_token_id: row.get(5)?,
+                revision: row.get(6)?,
+            })
+        })
         .optional()?;
     raw.map(|raw| decode_token(id, raw)).transpose()
 }
@@ -610,18 +585,18 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_is_rejected_without_compatibility_migration()
+    fn non_v1_schema_version_is_rejected_without_compatibility_migration()
     -> Result<(), Box<dyn std::error::Error>> {
-        let database = path("mcp-token-schema-v1");
+        let database = path("mcp-token-schema-v2");
         let catalog = McpTokenCatalog::open(&database)?;
         catalog
             .connection
-            .pragma_update(None, "user_version", 1_i64)?;
+            .pragma_update(None, "user_version", 2_i64)?;
         drop(catalog);
         assert!(matches!(
             McpTokenCatalog::open(&database),
             Err(McpTokenCatalogError::Ownership {
-                user_version: 1,
+                user_version: 2,
                 ..
             })
         ));

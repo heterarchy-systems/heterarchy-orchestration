@@ -2,8 +2,8 @@ use forge_domain::TimestampMillis;
 use uuid::Uuid;
 
 use super::{
-    AgentProfile, AgentProfileError, AgentProfileId, AgentProfileRevision, MAX_CAPABILITIES,
-    MAX_CAPABILITY_BYTES, MAX_PROFILE_NAME_BYTES, MAX_PROVIDER_PREFERENCE_BYTES,
+    AgentProfile, AgentProfileError, AgentProfileId, AgentProfileRevision, ExecutionPreference,
+    MAX_CAPABILITIES, MAX_CAPABILITY_BYTES, MAX_PROFILE_NAME_BYTES, MAX_PROVIDER_PREFERENCE_BYTES,
     validate_optional_text, validate_text,
 };
 
@@ -14,10 +14,12 @@ pub struct ProfileConfiguration {
     preferred_model: Option<String>,
     preferred_reasoning: Option<String>,
     capabilities: Vec<String>,
+    execution_preference: Option<Box<ExecutionPreference>>,
 }
 
 impl ProfileConfiguration {
-    /// Build a configuration with canonical capability ordering.
+    /// Build a configuration with canonical capability ordering and no CLI
+    /// execution preference bound by default.
     ///
     /// # Errors
     /// Rejects empty or oversized text, too many capabilities, and duplicate
@@ -57,7 +59,19 @@ impl ProfileConfiguration {
             preferred_model,
             preferred_reasoning,
             capabilities,
+            execution_preference: None,
         })
+    }
+
+    /// Attach or clear the reusable CLI execution preference on this
+    /// configuration.
+    #[must_use]
+    pub fn with_execution_preference(
+        mut self,
+        execution_preference: Option<ExecutionPreference>,
+    ) -> Self {
+        self.execution_preference = execution_preference.map(Box::new);
+        self
     }
 
     #[must_use]
@@ -78,6 +92,11 @@ impl ProfileConfiguration {
     #[must_use]
     pub fn capabilities(&self) -> &[String] {
         &self.capabilities
+    }
+
+    #[must_use]
+    pub fn execution_preference(&self) -> Option<&ExecutionPreference> {
+        self.execution_preference.as_deref()
     }
 }
 

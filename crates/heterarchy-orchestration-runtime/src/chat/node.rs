@@ -1,20 +1,17 @@
-//! Exact Forge node recipient routing for shared Runtime chat operations.
+//! Historical exact Forge node-route evidence for chat recovery.
 
 use forge_domain::{
-    ActivityId, AgentAssignmentId, AgentAssignmentRevision, AgentAssignmentState, AgentInstanceId,
-    AgentSessionId, DagRevisionNumber, TimestampMillis, WorkspaceId,
+    AgentAssignmentId, AgentAssignmentRevision, AgentAssignmentState, AgentInstanceId,
+    AgentSessionId, DagRevisionNumber,
 };
 use heterarchy_orchestration_operations::{
-    AssignmentAffinityDisposition, LeadershipScope, NodeMessageRouteTarget,
-    NodeMessageRouteWitness, NodeTeamBinding, NodeTeamBindingScope, OperationalActor,
-    OperationsCatalog,
+    NodeMessageRouteTarget, NodeMessageRouteWitness, NodeTeamBindingScope, OperationalActor,
 };
-use heterarchy_orchestration_sessions::{AgentProfileCatalog, AgentProfileId};
 use uuid::Uuid;
 
-use super::{ChatError, ChatQuery, ChatTargetFence, ResolvedChat, resolve_chat};
+use super::{ChatError, ChatQuery, ChatTargetFence, ResolvedChat};
 
-/// Exact node recipient identity captured in a chat destination fence.
+/// Historical node recipient identity captured in a chat destination fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatNodeTarget {
     /// A current Forge Agent assignment for the node.
@@ -120,240 +117,25 @@ fn current_node_observation_matches(
 }
 
 pub(super) fn resolve_node_chat(
-    catalog: &OperationsCatalog,
-    profiles: &AgentProfileCatalog,
-    workspace: WorkspaceId,
     query: &ChatQuery,
     observation: Option<&ChatSourceObservation>,
-    now: TimestampMillis,
 ) -> Result<ResolvedChat, ChatError> {
     let scope = query.node_scope.ok_or(ChatError::Identity)?;
-    if scope.workspace_id() != workspace || query.agent_profile_id.is_some() {
+    if scope.workspace_id() != query.workspace_id || query.agent_profile_id.is_some() {
         return Err(ChatError::Identity);
     }
-    let Some(observed) =
-        observation.filter(|observed| current_node_observation_matches(scope, observed))
-    else {
-        return Ok(unavailable(
-            "This node has no current Forge destination. History remains available.",
-        ));
-    };
-    let binding = catalog.node_team_binding(scope)?;
-    if let Some(binding) = binding.filter(|value| value.team_id().is_some()) {
-        resolve_team_chat(catalog, profiles, workspace, query, now, &binding)
-    } else {
-        resolve_agent_chat(catalog, profiles, workspace, query, now, scope, observed)
-    }
+    let unavailable =
+        if observation.is_some_and(|value| current_node_observation_matches(scope, value)) {
+            "ChatGPT destinations are retired. Node history remains available."
+        } else {
+            "This node has no current Forge destination. History remains available."
+        };
+    Ok(unavailable_chat(unavailable))
 }
 
-fn resolve_team_chat(
-    catalog: &OperationsCatalog,
-    profiles: &AgentProfileCatalog,
-    workspace: WorkspaceId,
-    query: &ChatQuery,
-    now: TimestampMillis,
-    binding: &NodeTeamBinding,
-) -> Result<ResolvedChat, ChatError> {
-    let team = binding.team_id().ok_or(ChatError::TargetChanged)?;
-    let scope = LeadershipScope::team(workspace, team);
-    let Some(authority) = catalog.current_leadership_authority(scope)? else {
-        return Ok(unavailable(
-            "This Team has no confirmed leader available for messages.",
-        ));
-    };
-    let Some(view) = catalog.leadership_scope_view(scope, now.get())? else {
-        return Ok(unavailable(
-            "This Team has no confirmed leader available for messages.",
-        ));
-    };
-    if view.leader_participant_id() != Some(authority.participant_id())
-        || view.leadership_revision() != authority.leadership_revision()
-    {
-        return Ok(unavailable("The Team leader changed. Refresh this node."));
-    }
-    let Some(profile) = view.leader_profile_id() else {
-        return Ok(unavailable("The Team leader has no active conversation."));
-    };
-    let binding_revision = i64::try_from(binding.revision()).map_err(|_| ChatError::Identity)?;
-    let node_target = ChatNodeTarget::Team {
-        team_id: team,
-        binding_revision,
-    };
-    resolve_node_profile(
-        catalog,
-        profiles,
-        workspace,
-        query,
-        now,
-        &NodeRecipient {
-            profile: AgentProfileId::from_uuid(profile)?,
-            participant: authority.participant_id(),
-            session: None,
-            activity: None,
-            node_target,
-            leadership_revision: Some(authority.leadership_revision()),
-        },
-    )
-}
-
-fn resolve_agent_chat(
-    catalog: &OperationsCatalog,
-    profiles: &AgentProfileCatalog,
-    workspace: WorkspaceId,
-    query: &ChatQuery,
-    now: TimestampMillis,
-    scope: NodeTeamBindingScope,
-    observed: &ChatSourceObservation,
-) -> Result<ResolvedChat, ChatError> {
-    let Some(assignment) = observed
-        .assignment
-        .filter(|assignment| assignment.state.is_active() && !assignment.cancellation_requested)
-    else {
-        return Ok(unavailable(
-            "This node has no active Agent assignment. History remains available.",
-        ));
-    };
-    let Some(affinity) = catalog.read_assignment_affinity(workspace, assignment.id)? else {
-        return Ok(unavailable(
-            "This node assignment has not been admitted by Orchestration. History remains available.",
-        ));
-    };
-    let binding_revision = catalog
-        .node_team_binding(scope)?
-        .map(|value| value.revision());
-    if affinity.node_scope() != Some(scope)
-        || affinity.team_id().is_some()
-        || affinity.binding_revision() != binding_revision
-        || affinity.target_agent_id() != assignment.target_agent_id
-        || affinity.target_session_id() != assignment.target_session_id
-        || !matches!(
-            affinity.disposition(),
-            AssignmentAffinityDisposition::Pending | AssignmentAffinityDisposition::Active
-        )
-    {
-        return Ok(unavailable(
-            "This node assignment has not been admitted by Orchestration. History remains available.",
-        ));
-    }
-    let Some(link) = profiles.logical_session_link(assignment.target_session_id)? else {
-        return Ok(unavailable("The assigned Agent has no linked Profile."));
-    };
-    let Some(identity) =
-        catalog.logical_identity_for_session(workspace, assignment.target_session_id)?
-    else {
-        return Ok(unavailable(
-            "The assigned Agent is not active in this Workspace.",
-        ));
-    };
-    let Some(participation) = catalog.workspace_participation(workspace, link.profile_id())? else {
-        return Ok(unavailable(
-            "This node assignment has not been admitted by Orchestration. History remains available.",
-        ));
-    };
-    if affinity.target_participant_id() != identity.participant_id()
-        || affinity.target_participation_id() != participation.participation_id()
-    {
-        return Ok(unavailable(
-            "This node assignment has not been admitted by Orchestration. History remains available.",
-        ));
-    }
-    if !identity.effect_bindings().iter().any(|binding| {
-        binding.activity_id() == scope.activity_id()
-            && binding.agent_id() == assignment.target_agent_id
-    }) {
-        return Ok(unavailable(
-            "The assigned Agent binding changed. Refresh this node.",
-        ));
-    }
-    let node_target = ChatNodeTarget::Agent {
-        assignment_id: assignment.id.into_uuid(),
-        assignment_revision: assignment.revision.get(),
-        agent_id: assignment.target_agent_id.into_uuid(),
-        session_id: assignment.target_session_id.into_uuid(),
-    };
-    resolve_node_profile(
-        catalog,
-        profiles,
-        workspace,
-        query,
-        now,
-        &NodeRecipient {
-            profile: link.profile_id(),
-            participant: identity.participant_id(),
-            session: Some(assignment.target_session_id),
-            activity: Some(scope.activity_id()),
-            node_target,
-            leadership_revision: None,
-        },
-    )
-}
-
-struct NodeRecipient {
-    profile: AgentProfileId,
-    participant: Uuid,
-    session: Option<AgentSessionId>,
-    activity: Option<ActivityId>,
-    node_target: ChatNodeTarget,
-    leadership_revision: Option<i64>,
-}
-
-fn resolve_node_profile(
-    catalog: &OperationsCatalog,
-    profiles: &AgentProfileCatalog,
-    workspace: WorkspaceId,
-    query: &ChatQuery,
-    now: TimestampMillis,
-    recipient: &NodeRecipient,
-) -> Result<ResolvedChat, ChatError> {
-    let direct = ChatQuery {
-        workspace_id: workspace,
-        agent_profile_id: Some(recipient.profile),
-        runtime: query.runtime,
-        node_scope: None,
-        before_sequence: None,
-    };
-    let mut resolved = resolve_chat(catalog, profiles, workspace, &direct, now)?;
-    let Some(participation) = catalog.workspace_participation(workspace, recipient.profile)? else {
-        return Ok(unavailable(
-            "The node recipient is no longer in this Workspace.",
-        ));
-    };
-    let current_identity =
-        catalog.logical_identity_for_participant(workspace, recipient.participant)?;
-    if !current_identity.is_some_and(|identity| {
-        recipient
-            .session
-            .is_none_or(|session| identity.session_id() == session)
-    }) {
-        return Ok(unavailable(
-            "The node recipient Session changed. Refresh this node.",
-        ));
-    }
-    let routes = catalog.workspace_chat_targets(workspace, recipient.profile, 8)?;
-    if routes.truncated() {
-        return Err(ChatError::TargetChanged);
-    }
-    resolved.targets.retain(|(fence, _)| {
-        participation.session_mappings().iter().any(|mapping| {
-            mapping.profile_mapping_request_id() == fence.operation_id
-                && mapping.participant_id() == recipient.participant
-        }) && recipient.activity.is_none_or(|activity| {
-            routes.targets().iter().any(|route| {
-                route.operation_id() == fence.operation_id && route.activity_id() == activity
-            })
-        })
-    });
-    for (fence, _) in &mut resolved.targets {
-        fence.node_target = Some(recipient.node_target.clone());
-        fence.leadership_revision = recipient.leadership_revision;
-    }
-    Ok(resolved)
-}
-
-pub(super) fn unavailable(reason: &'static str) -> ResolvedChat {
+pub(super) fn unavailable_chat(reason: &'static str) -> ResolvedChat {
     ResolvedChat {
         channel: None,
-        targets: Vec::new(),
         unavailable: Some(reason),
     }
 }

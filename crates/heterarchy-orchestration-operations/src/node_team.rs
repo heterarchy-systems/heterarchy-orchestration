@@ -17,8 +17,6 @@ use crate::{
 
 pub const MAX_NODE_TEAM_BINDINGS_PER_READ: usize = 64;
 
-pub(crate) const NODE_TEAM_BINDINGS_V35_SQL: &str = "CREATE TABLE ops_dag_node_team_bindings (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16 AND workspace_id != zeroblob(16)), goal_id BLOB NOT NULL CHECK(length(goal_id)=16 AND goal_id != zeroblob(16)), dag_revision INTEGER NOT NULL CHECK(dag_revision>=1), node_id BLOB NOT NULL CHECK(length(node_id)=16 AND node_id != zeroblob(16)), team_id BLOB NOT NULL CHECK(length(team_id)=16 AND team_id != zeroblob(16)), bound_by TEXT NOT NULL CHECK(bound_by IN('operator','orchestrator')), bound_at_ms INTEGER NOT NULL CHECK(bound_at_ms>=0), revision INTEGER NOT NULL CHECK(revision>=1), PRIMARY KEY(workspace_id,goal_id,dag_revision,node_id))";
-
 const NODE_TEAM_BINDINGS_SQL: &str = "CREATE TABLE ops_dag_node_team_bindings (workspace_id BLOB NOT NULL CHECK(length(workspace_id)=16 AND workspace_id != zeroblob(16)), activity_id BLOB CHECK(activity_id IS NULL OR (length(activity_id)=16 AND activity_id != zeroblob(16))), goal_id BLOB NOT NULL CHECK(length(goal_id)=16 AND goal_id != zeroblob(16)), goal_created_at_ms INTEGER CHECK(goal_created_at_ms IS NULL OR goal_created_at_ms>=0), dag_revision INTEGER NOT NULL CHECK(dag_revision>=1), dag_base_goal_revision INTEGER CHECK(dag_base_goal_revision IS NULL OR dag_base_goal_revision>=1), node_id BLOB NOT NULL CHECK(length(node_id)=16 AND node_id != zeroblob(16)), team_id BLOB CHECK(team_id IS NULL OR (length(team_id)=16 AND team_id != zeroblob(16))), bound_by TEXT NOT NULL CHECK(bound_by IN('operator','orchestrator')), bound_at_ms INTEGER NOT NULL CHECK(bound_at_ms>=0), revision INTEGER NOT NULL CHECK(revision>=1), legacy_retirement_request_id BLOB CHECK(legacy_retirement_request_id IS NULL OR (length(legacy_retirement_request_id)=16 AND legacy_retirement_request_id != zeroblob(16))), legacy_retired_at_ms INTEGER CHECK(legacy_retired_at_ms IS NULL OR legacy_retired_at_ms>=0), legacy_retired_by TEXT CHECK(legacy_retired_by IS NULL OR legacy_retired_by IN('operator','orchestrator')), legacy_retired_activity_id BLOB CHECK(legacy_retired_activity_id IS NULL OR (length(legacy_retired_activity_id)=16 AND legacy_retired_activity_id != zeroblob(16))), legacy_retired_agent_id BLOB CHECK(legacy_retired_agent_id IS NULL OR (length(legacy_retired_agent_id)=16 AND legacy_retired_agent_id != zeroblob(16))), legacy_retired_session_id BLOB CHECK(legacy_retired_session_id IS NULL OR (length(legacy_retired_session_id)=16 AND legacy_retired_session_id != zeroblob(16))), legacy_retired_participant_id BLOB CHECK(legacy_retired_participant_id IS NULL OR (length(legacy_retired_participant_id)=16 AND legacy_retired_participant_id != zeroblob(16))), legacy_retired_leadership_revision INTEGER CHECK(legacy_retired_leadership_revision IS NULL OR legacy_retired_leadership_revision>=1), PRIMARY KEY(workspace_id,activity_id,goal_id,goal_created_at_ms,dag_revision,dag_base_goal_revision,node_id), CHECK((activity_id IS NULL AND goal_created_at_ms IS NULL AND dag_base_goal_revision IS NULL) OR (activity_id IS NOT NULL AND goal_created_at_ms IS NOT NULL AND dag_base_goal_revision IS NOT NULL)), CHECK(legacy_retirement_request_id IS NULL OR activity_id IS NULL), CHECK((legacy_retirement_request_id IS NULL AND legacy_retired_at_ms IS NULL AND legacy_retired_by IS NULL AND legacy_retired_activity_id IS NULL AND legacy_retired_agent_id IS NULL AND legacy_retired_session_id IS NULL AND legacy_retired_participant_id IS NULL AND legacy_retired_leadership_revision IS NULL) OR (legacy_retirement_request_id IS NOT NULL AND legacy_retired_at_ms IS NOT NULL AND legacy_retired_by='operator' AND legacy_retired_activity_id IS NULL AND legacy_retired_agent_id IS NULL AND legacy_retired_session_id IS NULL AND legacy_retired_participant_id IS NULL AND legacy_retired_leadership_revision IS NULL) OR (legacy_retirement_request_id IS NOT NULL AND legacy_retired_at_ms IS NOT NULL AND legacy_retired_by='orchestrator' AND legacy_retired_activity_id IS NOT NULL AND legacy_retired_agent_id IS NOT NULL AND legacy_retired_session_id IS NOT NULL AND legacy_retired_participant_id IS NOT NULL AND legacy_retired_leadership_revision IS NOT NULL)))";
 const NODE_TEAM_BINDINGS_SCOPE_INDEX: &str = "CREATE INDEX ops_dag_node_team_bindings_scope_idx ON ops_dag_node_team_bindings(workspace_id,goal_id,dag_revision,node_id,activity_id,goal_created_at_ms,dag_base_goal_revision)";
 const NODE_TEAM_BINDINGS_LEGACY_RETIREMENT_INDEX: &str = "CREATE UNIQUE INDEX ops_dag_node_team_bindings_legacy_retirement_request_idx ON ops_dag_node_team_bindings(legacy_retirement_request_id) WHERE legacy_retirement_request_id IS NOT NULL";
@@ -43,32 +41,10 @@ pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)
     ]
 }
 
-pub(crate) fn schema_objects_v35() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![(
-        "table",
-        "ops_dag_node_team_bindings",
-        NODE_TEAM_BINDINGS_V35_SQL,
-    )]
-}
-
 pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsError> {
     for (_, _, sql) in schema_objects() {
         connection.execute_batch(sql)?;
     }
-    Ok(())
-}
-
-/// Add exact generation columns while retaining each old row as unknown scope.
-pub(crate) fn migrate_v35_to_v36(tx: &Transaction<'_>) -> Result<(), OperationsError> {
-    tx.execute_batch(
-        "ALTER TABLE ops_dag_node_team_bindings RENAME TO ops_dag_node_team_bindings_v35",
-    )?;
-    create_schema(tx)?;
-    tx.execute(
-        "INSERT INTO ops_dag_node_team_bindings(workspace_id,activity_id,goal_id,goal_created_at_ms,dag_revision,dag_base_goal_revision,node_id,team_id,bound_by,bound_at_ms,revision) SELECT workspace_id,NULL,goal_id,NULL,dag_revision,NULL,node_id,team_id,bound_by,bound_at_ms,revision FROM ops_dag_node_team_bindings_v35",
-        [],
-    )?;
-    tx.execute_batch("DROP TABLE ops_dag_node_team_bindings_v35")?;
     Ok(())
 }
 

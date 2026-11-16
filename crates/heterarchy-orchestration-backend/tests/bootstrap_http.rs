@@ -107,6 +107,7 @@ use heterarchy_orchestration_sessions::SessionCatalogAuthority;
 use hyper::StatusCode;
 use hyper::header::HeaderValue;
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -628,6 +629,7 @@ async fn register_and_admit_operator_member(
     assert_durable_agent_request(
         flow.client,
         flow.bearer,
+        flow.backend_address,
         &registration.target,
         registration.progress.agent_id,
         leadership_revision,
@@ -1095,6 +1097,7 @@ async fn assert_live_forge_coordinator(
 async fn assert_durable_agent_request(
     client: &OrchestrationHttpClient,
     bearer: &HeaderValue,
+    backend_address: std::net::SocketAddr,
     target: &MemberTarget,
     coordinator_agent_id: Uuid,
     coordinator_revision: i64,
@@ -1113,63 +1116,45 @@ async fn assert_durable_agent_request(
         independence: AdmissionIndependenceWire::IndependentFromCurrentWriter,
         reason: "Independent source-backed evidence review".to_owned(),
     };
-    let result = match client.admit_agent_request(bearer, &request).await {
-        Ok(result) => result,
-        Err(
-            error @ (ClientError::ReadbackRequired { .. } | ClientError::UnknownOutcome { .. }),
-        ) => {
-            use heterarchy_orchestration_backend::client::ReadbackTarget;
+    let body = json!({
+        "workspaceId": request.scope.workspace_id,
+        "activityId": request.activity_id,
+        "requesterAgentId": request.coordinator_agent_id,
+        "requesterSessionId": request.coordinator_session_id,
+        "coordinatorRevision": request.coordinator_revision,
+        "requestId": request.request_id,
+        "objective": request.objective.clone(),
+        "capability": request.capability.clone(),
+        "count": request.count,
+        "effectScope": "read_only",
+        "independence": "independent_from_current_writer",
+        "reason": request.reason.clone(),
+    });
+    let (status, submitted) = raw_post_json(
+        backend_address,
+        "/internal/v1/agent-requests",
+        bearer,
+        &body,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(submitted["request"]["requestId"], json!(request.request_id));
+    assert_eq!(submitted["request"]["state"], "resolution_pending");
+    assert_eq!(submitted["request"]["revision"], 1);
+    assert_eq!(submitted["request"]["created"], true);
+    assert!(submitted["resolution"].is_null());
 
-            let readback_target_matches = match &error {
-                ClientError::ReadbackRequired {
-                    readback: ReadbackTarget::AgentRequestAdmission(original),
-                }
-                | ClientError::UnknownOutcome {
-                    readback: ReadbackTarget::AgentRequestAdmission(original),
-                } => original.as_ref() == &request,
-                _ => false,
-            };
-            if !readback_target_matches {
-                return Err(format!(
-                    "AgentRequest admission has a foreign readback target: {error:?}"
-                )
-                .into());
-            }
-            let recovered = client
-                .recover_agent_request_admission(bearer, &request)
-                .await
-                .map_err(|readback_error| {
-                    format!(
-                        "AgentRequest exact readback failed after {error:?}: {readback_error:?}"
-                    )
-                })?;
-            if recovered.request != request {
-                return Err("AgentRequest readback changed the original request".into());
-            }
-            let evidence = match recovered.snapshot {
-                Some(snapshot) => format!("snapshot={snapshot:?}"),
-                None => "exact request snapshot absent".to_owned(),
-            };
-            return Err(format!(
-                "AgentRequest admission unresolved: original={error:?}; {evidence}; the snapshot cannot prove the original created flag, so no success is reconstructed and no mutation is retried"
-            )
-            .into());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    assert_eq!(result.request, request);
-    assert!(result.receipt.created);
-    assert_eq!(result.receipt.request_id, request.request_id);
-    assert_eq!(result.receipt.activity_id, target.activity_id);
     let historical = client
         .recover_agent_request_admission(bearer, &request)
         .await?;
     assert_eq!(historical.request, request);
     let persisted = historical
         .snapshot
-        .ok_or("AgentRequest admission receipt was not durable")?;
+        .ok_or("AgentRequest intent was not durable")?;
     assert_eq!(persisted.receipt.request_id, request.request_id);
-    assert_eq!(persisted.receipt.revision, result.receipt.revision);
+    assert_eq!(persisted.receipt.revision, 1);
+    assert!(persisted.resolution.is_none());
+    assert!(persisted.operations.is_empty());
     let observed = client
         .agent_request(
             bearer,
@@ -1185,7 +1170,56 @@ async fn assert_durable_agent_request(
         .ok_or("source-scoped AgentRequest was not readable")?;
     assert_eq!(detail.request_id, request.request_id);
     assert_eq!(detail.requested_count, request.count);
+    assert_eq!(detail.state, "resolution_pending");
+    let list = client
+        .agent_requests(
+            bearer,
+            &AgentRequestListQueryRequest {
+                scope: target.scope.clone(),
+                session_id: Some(target.session_id),
+                limit: 10,
+            },
+        )
+        .await?;
+    assert!(
+        list.items
+            .iter()
+            .any(|item| item.request_id == request.request_id)
+    );
     Ok(())
+}
+
+async fn raw_post_json(
+    address: std::net::SocketAddr,
+    path: &str,
+    bearer: &HeaderValue,
+    value: &serde_json::Value,
+) -> TestResult<(StatusCode, serde_json::Value)> {
+    let body = serde_json::to_vec(value)?;
+    let mut stream = tokio::net::TcpStream::connect(address).await?;
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {address}\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        bearer.to_str()?,
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    stream.write_all(&body).await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or("HTTP response has no header terminator")?;
+    let headers = std::str::from_utf8(&response[..header_end])?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or("HTTP response has no status")?
+        .parse::<u16>()?;
+    let status = StatusCode::from_u16(status)?;
+    let body = serde_json::from_slice(&response[header_end + 4..])?;
+    Ok((status, body))
 }
 
 struct SourceGoalPlan {
@@ -2046,7 +2080,7 @@ async fn assert_team_observations_and_approval(
         case.assignments.unassigned_node,
     )
     .await?;
-    assert_unprovisioned_team_node_chat(
+    assert_team_node_chat_history(
         case.client,
         case.bearer,
         case.creator,
@@ -2064,10 +2098,8 @@ async fn assert_team_observations_and_approval(
     .await
 }
 
-/// A Ready Team with a genuine Forge Node still has no Provider conversation
-/// until a real Runtime/Participation destination is provisioned. Never
-/// substitute an invented conversation ID or claim message delivery.
-async fn assert_unprovisioned_team_node_chat(
+/// A Ready Team's exact Node history remains readable after provider retirement.
+async fn assert_team_node_chat_history(
     client: &OrchestrationHttpClient,
     bearer: &HeaderValue,
     sender: &MemberTarget,
@@ -2090,8 +2122,6 @@ async fn assert_unprovisioned_team_node_chat(
     assert_eq!(observed.request, query);
     assert_eq!(observed.snapshot.workspace_id, sender.scope.workspace_id);
     assert_eq!(observed.snapshot.node_scope, Some(node));
-    assert!(observed.snapshot.targets.is_empty());
-    assert!(observed.snapshot.target.is_none());
     assert!(observed.snapshot.messages.is_empty());
     assert!(observed.snapshot.unavailable_reason.is_some());
     Ok(())
@@ -3093,6 +3123,7 @@ async fn bind_fixture_profile_session(
                 preferred_model: None,
                 preferred_reasoning: None,
                 base_capabilities: vec!["verification".to_owned()],
+                execution_preference: None,
             },
         )
         .await

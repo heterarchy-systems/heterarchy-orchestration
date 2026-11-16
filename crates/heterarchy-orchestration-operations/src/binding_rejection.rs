@@ -23,19 +23,14 @@ const ATTEMPTS_SQL: &str = "CREATE TABLE ops_binding_rejection_attempts (request
 const RESOLUTIONS_SQL: &str = "CREATE TABLE ops_binding_rejection_attempt_resolutions (request_id BLOB PRIMARY KEY NOT NULL REFERENCES ops_binding_rejection_attempts(request_id), resolution_request_id BLOB NOT NULL UNIQUE CHECK(length(resolution_request_id)=16 AND resolution_request_id != zeroblob(16)), attempt_request_digest BLOB NOT NULL CHECK(length(attempt_request_digest)=32 AND attempt_request_digest != zeroblob(32)), legacy_client_artifact_digest BLOB NOT NULL CHECK(length(legacy_client_artifact_digest)=32 AND legacy_client_artifact_digest != zeroblob(32)), envelope_policy INTEGER NOT NULL CHECK(envelope_policy=0), durable_uuid_version INTEGER NOT NULL CHECK(durable_uuid_version=8), source_contract INTEGER NOT NULL CHECK(source_contract=0), source_get_observed_at_ms INTEGER NOT NULL CHECK(source_get_observed_at_ms>=0), operator_principal_kind INTEGER NOT NULL CHECK(operator_principal_kind IN(0,1,2)), operator_principal_id BLOB CHECK(operator_principal_id IS NULL OR length(operator_principal_id)=16), resolved_at_ms INTEGER NOT NULL CHECK(resolved_at_ms>=source_get_observed_at_ms), consume_request_id BLOB UNIQUE CHECK(consume_request_id IS NULL OR (length(consume_request_id)=16 AND consume_request_id != zeroblob(16))), consumed_at_ms INTEGER CHECK(consumed_at_ms IS NULL OR consumed_at_ms>=resolved_at_ms), CHECK((operator_principal_kind=0 AND operator_principal_id IS NULL) OR (operator_principal_kind IN(1,2) AND operator_principal_id IS NOT NULL)), CHECK((consume_request_id IS NULL AND consumed_at_ms IS NULL) OR (consume_request_id IS NOT NULL AND consumed_at_ms IS NOT NULL)))";
 
 pub(crate) fn schema_objects() -> Vec<(&'static str, &'static str, &'static str)> {
-    let mut objects = schema_objects_v44();
-    objects.push((
-        "table",
-        "ops_binding_rejection_attempt_resolutions",
-        RESOLUTIONS_SQL,
-    ));
-    objects
-}
-
-pub(crate) fn schema_objects_v44() -> Vec<(&'static str, &'static str, &'static str)> {
     vec![
         ("table", "ops_binding_rejection_attempts", ATTEMPTS_SQL),
         ("table", "ops_binding_rejections", REJECTIONS_SQL),
+        (
+            "table",
+            "ops_binding_rejection_attempt_resolutions",
+            RESOLUTIONS_SQL,
+        ),
     ]
 }
 
@@ -43,21 +38,6 @@ pub(crate) fn create_schema(connection: &Connection) -> Result<(), OperationsErr
     connection.execute_batch(ATTEMPTS_SQL)?;
     connection.execute_batch(REJECTIONS_SQL)?;
     connection.execute_batch(RESOLUTIONS_SQL)?;
-    Ok(())
-}
-
-pub(crate) fn create_resolution_schema(connection: &Connection) -> Result<(), OperationsError> {
-    connection.execute_batch(RESOLUTIONS_SQL)?;
-    Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn drop_schema_for_legacy_fixture(
-    connection: &Connection,
-) -> Result<(), OperationsError> {
-    connection.execute_batch(
-        "DROP TABLE IF EXISTS ops_binding_rejection_attempt_resolutions; DROP TABLE ops_binding_rejections; DROP TABLE ops_binding_rejection_attempts;",
-    )?;
     Ok(())
 }
 

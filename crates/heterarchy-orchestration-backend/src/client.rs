@@ -25,6 +25,7 @@ use crate::wire::{
 mod agent_request_admission;
 mod agent_requests;
 mod approval;
+mod autonomy_loop;
 mod coordination;
 mod departure;
 mod forge_reads;
@@ -48,11 +49,10 @@ mod operations_import;
 mod participation;
 mod profile_sessions;
 mod profiles;
-mod provider_worker;
 mod provisioning_operations;
-mod provisioning_participation;
 mod reviewer_participation;
 mod reviewer_qualification_rule;
+mod swarm;
 mod team_commands;
 mod team_expansion;
 mod team_expansion_v2;
@@ -133,29 +133,10 @@ pub enum ReadbackTarget {
     ReviewerParticipationMutation(
         Box<crate::wire::reviewer_participation::ReviewerParticipationMutationRequest>,
     ),
-    /// Bounded current selection observation, never original-request proof or retry permission.
-    ProviderProvisionDispatch,
-    /// Bounded current pending/unknown outboxes, without request attribution or retry permission.
-    ProviderMessageDispatch,
-    /// Pure operator readback for one exact released operation.
-    ProviderProvisionOperation { operation_id: Uuid },
-    /// Pure operator readback for one exact message, without an Inspect transition.
-    ProviderMessageOutbox { message_id: Uuid },
-    /// Read back one immutable UNKNOWN-isolation acknowledgement by its exact request and message IDs.
-    ProviderMessageUnknownIsolation { message_id: Uuid, request_id: Uuid },
-    /// Original incoming intent; a pure turn lookup, never replaying the writer.
-    ProviderIncomingTurn(Box<crate::wire::provider_worker::ProviderIncomingMessage>),
-    /// Exact original capability-request intent, without retry authorization.
-    AgentRequestAdmission(Box<crate::wire::agent_request_admission::AgentRequestAdmissionRequest>),
     /// Complete immutable pre-offer intent for pure admission recovery.
     NodeAssignmentAdmission(
         Box<crate::wire::node_assignment_admission::NodeAssignmentAdmissionRequest>,
     ),
-    /// Complete immutable Profile-direct message intent for pure recovery.
-    WorkspaceChat(Box<crate::wire::workspace_chat::WorkspaceChatSendRequest>),
-    /// Recover the immutable actor, body, context and target witness of this
-    /// message. An absent receipt does not authorize a blind retry.
-    NodeChat(Box<crate::wire::node_chat::NodeChatSendRequest>),
     /// Observe the exact Node-Team scope after an uncertain CAS. This query
     /// cannot prove mutation attribution and does not authorize a retry.
     NodeTeam(Box<crate::wire::node_team::NodeTeamQueryRequest>),
@@ -169,11 +150,6 @@ pub enum ReadbackTarget {
         session_id: Uuid,
         request_id: Uuid,
         expected_agent_revision: i64,
-    },
-    /// Read the caller-owned confirmed participation after an uncertain stage.
-    AgentRequestParticipation {
-        operation_id: Uuid,
-        session_id: Option<Uuid>,
     },
     /// Read the exact logical-member registration after an uncertain source or commit.
     MemberRegistration {
@@ -269,11 +245,6 @@ pub enum ReadbackTarget {
         profile_id: Uuid,
         session_id: Uuid,
     },
-    /// Read the exact provision operation after uncertain cancellation. No receipt nonce is implied.
-    ProvisionOperation {
-        workspace_id: Uuid,
-        operation_id: Uuid,
-    },
     /// Read current policy and compare the intended result revision/configuration.
     /// A policy CAS has no replay nonce; revision alone cannot attribute a commit.
     WorkspacePolicy {
@@ -288,6 +259,79 @@ pub enum ReadbackTarget {
     },
     /// Read the exact import progress after an uncertain operator mutation.
     OperationsImport(Box<OperationsImportReadback>),
+    /// Observe the Workspace scope registry after an uncertain scope mutation.
+    WorkspaceScopeMutation {
+        workspace_id: Uuid,
+        request_id: Uuid,
+        expected_revision: u64,
+    },
+    /// Observe the reviewer assignment gate after an uncertain assignment request.
+    ReviewerAssignment {
+        workspace_id: Uuid,
+        request_id: Uuid,
+        correlation: Box<crate::wire::autonomy_loop::WorkCorrelationWire>,
+    },
+    /// Observe the reviewer assignment gate after an uncertain verdict submission.
+    ReviewerVerdict {
+        workspace_id: Uuid,
+        request_id: Uuid,
+        correlation: Box<crate::wire::autonomy_loop::WorkCorrelationWire>,
+        expected_revision: u64,
+    },
+    /// Read the exact Launch Ledger attempt after an uncertain snapshot preparation.
+    ExecutionSnapshot {
+        workspace_id: Uuid,
+        snapshot_id: Uuid,
+        correlation: Box<crate::wire::autonomy_loop::WorkCorrelationWire>,
+    },
+    /// Inspect Workspace Swarm runs after an uncertain run creation request.
+    SwarmRunCreate {
+        workspace_id: Uuid,
+        request_id: Uuid,
+    },
+    /// Inspect the Swarm run snapshot after an uncertain channel creation.
+    SwarmChannelCreate {
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        channel_id: Uuid,
+    },
+    /// Inspect the Swarm run snapshot after an uncertain channel subscription.
+    SwarmChannelSubscription {
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        channel_id: Uuid,
+        member_id: Uuid,
+    },
+    /// Inspect the Swarm run snapshot after an uncertain member/turn/model mutation.
+    SwarmMemberMutation {
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        member_id: Uuid,
+    },
+    /// Read the Swarm board incrementally after an uncertain message post.
+    SwarmBoardMessage {
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        message_id: Uuid,
+    },
+    /// Inspect the Swarm run snapshot after an uncertain verification panel creation.
+    SwarmVerificationPanel {
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        request_id: Uuid,
+    },
+    /// Inspect the Swarm run snapshot after an uncertain verdict submission.
+    SwarmVerdict {
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        request_id: Uuid,
+    },
+    /// Inspect the Swarm run snapshot after an uncertain run-level state mutation.
+    SwarmRunMutation {
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        request_id: Option<Uuid>,
+    },
 }
 
 /// Original operator import mutation intent retained for durable readback.
@@ -329,6 +373,8 @@ pub enum ServiceCode {
     ResyncRequired,
     /// The requested Workspace scope is unavailable from the current authority.
     ScopeUnavailable,
+    /// Provider-backed effects have been retired.
+    ProviderRetired,
     /// Unrecognized peer classification; do not infer retry safety.
     Unknown,
 }
@@ -345,6 +391,7 @@ impl ServiceCode {
             Self::Conflict => "ORCHESTRATION_CONFLICT",
             Self::ResyncRequired => "RESYNC_REQUIRED",
             Self::ScopeUnavailable => "WORKSPACE_SCOPE_UNAVAILABLE",
+            Self::ProviderRetired => "PROVIDER_RETIRED",
             Self::Unknown => "ORCHESTRATION_REJECTED",
         }
     }
@@ -391,6 +438,12 @@ impl fmt::Debug for OrchestrationHttpClient {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ExchangeLimits {
+    pub(super) max_response_bytes: usize,
+    pub(super) timeout: Duration,
+}
+
 impl OrchestrationHttpClient {
     /// Select one trusted loopback endpoint and a deadline capped at five seconds.
     ///
@@ -417,6 +470,10 @@ impl OrchestrationHttpClient {
         request: &AgentProfileCreateRequest,
     ) -> Result<AgentProfileCreateResponse, ClientError> {
         let nonce = canonical_identity(&request.request_id)?;
+        if let Some(pref) = &request.execution_preference {
+            pref.to_execution_preference()
+                .map_err(|_| ClientError::InvalidRequest)?;
+        }
         let readback = ReadbackTarget::ProfileRequest(nonce);
         let response: AgentProfileCreateResponse = self
             .call(
@@ -427,7 +484,10 @@ impl OrchestrationHttpClient {
                 Some(readback.clone()),
             )
             .await?;
-        if response.profile.request_id != nonce || !valid_profile(&response.profile) {
+        if response.profile.request_id != nonce
+            || (response.created && response.profile.provider_family != "unbound")
+            || !valid_profile(&response.profile)
+        {
             return Err(ClientError::UnknownOutcome { readback });
         }
         Ok(response)
@@ -586,13 +646,51 @@ impl OrchestrationHttpClient {
         body: Option<&B>,
         readback: Option<ReadbackTarget>,
     ) -> Result<T, ClientError> {
-        let response_limit = if mission_evidence::is_mission_evidence_path(&path) {
+        let response_limit = if swarm::is_swarm_path(&path) {
+            swarm::MAX_SWARM_RESPONSE_BYTES
+        } else if mission_evidence::is_mission_evidence_path(&path) {
             mission_evidence::MAX_MISSION_EVIDENCE_RESPONSE_BYTES
         } else {
             MAX_RESPONSE_BYTES
         };
         self.call_with_response_limit(authorization, method, path, body, readback, response_limit)
             .await
+    }
+
+    pub(super) async fn call_with_custom_timeout<T: DeserializeOwned, B: Serialize>(
+        &self,
+        authorization: &HeaderValue,
+        method: Method,
+        path: String,
+        body: Option<&B>,
+        readback: Option<ReadbackTarget>,
+        limits: ExchangeLimits,
+    ) -> Result<T, ClientError> {
+        let (status, response_body) = self
+            .perform_bounded_exchange_with_timeout(
+                authorization,
+                method,
+                path,
+                body,
+                readback.as_ref(),
+                limits,
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(service_error(status, &response_body, readback));
+        }
+        let expected_status = status == StatusCode::OK
+            || (status == StatusCode::CREATED && accepts_created_status(readback.as_ref()));
+        if !expected_status {
+            return Err(readback.map_or(ClientError::Protocol, |readback| {
+                ClientError::UnknownOutcome { readback }
+            }));
+        }
+        serde_json::from_slice(&response_body).map_err(|_| {
+            readback.map_or(ClientError::Protocol, |readback| {
+                ClientError::UnknownOutcome { readback }
+            })
+        })
     }
 
     async fn call_with_response_limit<T: DeserializeOwned, B: Serialize>(
@@ -604,7 +702,99 @@ impl OrchestrationHttpClient {
         readback: Option<ReadbackTarget>,
         max_response_bytes: usize,
     ) -> Result<T, ClientError> {
-        if max_response_bytes == 0 || max_response_bytes > MAX_REVIEW_RESPONSE_BYTES {
+        self.call_with_custom_timeout(
+            authorization,
+            method,
+            path,
+            body,
+            readback,
+            ExchangeLimits {
+                max_response_bytes,
+                timeout: self.timeout,
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn call_with_conflict_outcome<T, B, F>(
+        &self,
+        authorization: &HeaderValue,
+        method: Method,
+        path: String,
+        body: Option<&B>,
+        readback: Option<ReadbackTarget>,
+        is_domain_conflict: F,
+    ) -> Result<(StatusCode, T), ClientError>
+    where
+        T: DeserializeOwned,
+        B: Serialize,
+        F: FnOnce(&T) -> bool,
+    {
+        let (status, response_body) = self
+            .perform_bounded_exchange(
+                authorization,
+                method,
+                path,
+                body,
+                readback.as_ref(),
+                MAX_RESPONSE_BYTES,
+            )
+            .await?;
+        if status == StatusCode::OK {
+            let parsed = serde_json::from_slice::<T>(&response_body).map_err(|_| {
+                readback.map_or(ClientError::Protocol, |readback| {
+                    ClientError::UnknownOutcome { readback }
+                })
+            })?;
+            return Ok((status, parsed));
+        }
+        if status == StatusCode::CONFLICT
+            && let Ok(parsed) = serde_json::from_slice::<T>(&response_body)
+            && is_domain_conflict(&parsed)
+        {
+            return Ok((status, parsed));
+        }
+        Err(service_error(status, &response_body, readback))
+    }
+
+    async fn perform_bounded_exchange<B: Serialize>(
+        &self,
+        authorization: &HeaderValue,
+        method: Method,
+        path: String,
+        body: Option<&B>,
+        readback: Option<&ReadbackTarget>,
+        max_response_bytes: usize,
+    ) -> Result<(StatusCode, Bytes), ClientError> {
+        self.perform_bounded_exchange_with_timeout(
+            authorization,
+            method,
+            path,
+            body,
+            readback,
+            ExchangeLimits {
+                max_response_bytes,
+                timeout: self.timeout,
+            },
+        )
+        .await
+    }
+
+    async fn perform_bounded_exchange_with_timeout<B: Serialize>(
+        &self,
+        authorization: &HeaderValue,
+        method: Method,
+        path: String,
+        body: Option<&B>,
+        readback: Option<&ReadbackTarget>,
+        limits: ExchangeLimits,
+    ) -> Result<(StatusCode, Bytes), ClientError> {
+        let max_response_bytes = limits.max_response_bytes;
+        let exchange_timeout = limits.timeout;
+        if max_response_bytes == 0
+            || max_response_bytes > MAX_REVIEW_RESPONSE_BYTES
+            || exchange_timeout.is_zero()
+        {
             return Err(ClientError::InvalidRequest);
         }
         let value = authorization
@@ -620,57 +810,42 @@ impl OrchestrationHttpClient {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ClientError::Capacity)?;
-        let request_limit = if mission_evidence::is_mission_evidence_path(&path) {
+        let request_limit = if swarm::is_swarm_path(&path) {
+            crate::wire::swarm::MAX_SWARM_HTTP_BODY_BYTES
+        } else if mission_evidence::is_mission_evidence_path(&path) {
             mission_evidence::MAX_MISSION_EVIDENCE_REQUEST_BYTES
         } else {
             MAX_REQUEST_BYTES
         };
-        let body = body
+        let encoded_body = body
             .map(|value| bounded_json_with_limit(value, request_limit))
             .transpose()?
             .unwrap_or_default();
         let uncertain = || {
             readback
-                .clone()
+                .cloned()
                 .map_or(ClientError::Unavailable, |readback| {
                     ClientError::UnknownOutcome { readback }
                 })
         };
         let result = tokio::time::timeout(
-            self.timeout,
-            self.exchange(authorization, method, path, body, max_response_bytes),
+            exchange_timeout,
+            self.exchange(
+                authorization,
+                method,
+                path,
+                encoded_body,
+                max_response_bytes,
+            ),
         )
         .await
         .map_err(|_| uncertain())?;
-        let (status, body) = result.map_err(|error| {
+        result.map_err(|error| {
             if readback.is_some() {
                 uncertain()
             } else {
                 error
             }
-        })?;
-        if !status.is_success() {
-            return Err(service_error(status, &body, readback));
-        }
-        let expected_status = status == StatusCode::OK
-            || (status == StatusCode::CREATED
-                && matches!(
-                    readback,
-                    Some(
-                        ReadbackTarget::ProfileRequest(_)
-                            | ReadbackTarget::SessionRequest(_)
-                            | ReadbackTarget::ProfileSession { .. }
-                    )
-                ));
-        if !expected_status {
-            return Err(readback.clone().map_or(ClientError::Protocol, |readback| {
-                ClientError::UnknownOutcome { readback }
-            }));
-        }
-        serde_json::from_slice(&body).map_err(|_| {
-            readback.clone().map_or(ClientError::Protocol, |readback| {
-                ClientError::UnknownOutcome { readback }
-            })
         })
     }
 
@@ -737,10 +912,6 @@ fn canonical_identity(value: &str) -> Result<Uuid, ClientError> {
     Ok(id)
 }
 
-fn bounded_json<T: Serialize>(value: &T) -> Result<Vec<u8>, ClientError> {
-    bounded_json_with_limit(value, MAX_REQUEST_BYTES)
-}
-
 fn bounded_json_with_limit<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, ClientError> {
     struct BoundedBody {
         bytes: Vec<u8>,
@@ -779,7 +950,7 @@ fn valid_profile(value: &AgentProfileResponse) -> bool {
     !value.profile_id.is_nil()
         && !value.request_id.is_nil()
         && value.revision > 0
-        && value.provider_family == "chatgpt"
+        && matches!(value.provider_family.as_str(), "unbound" | "chatgpt")
         && value.created_at_ms >= 0
         && value.updated_at_ms >= value.created_at_ms
         && value.last_used_at_ms.is_none_or(|timestamp| timestamp >= 0)
@@ -791,6 +962,10 @@ fn valid_profile(value: &AgentProfileResponse) -> bool {
             value.lifecycle_state.as_str(),
             "active" | "disabled" | "retired"
         )
+        && value
+            .execution_preference
+            .as_ref()
+            .is_none_or(|pref| pref.to_execution_preference().is_ok())
 }
 
 fn valid_session(value: &AgentSessionResponse) -> bool {
@@ -818,9 +993,57 @@ fn valid_headers(headers: &HeaderMap) -> bool {
             })
 }
 
+fn accepts_created_status(readback: Option<&ReadbackTarget>) -> bool {
+    matches!(
+        readback,
+        Some(
+            ReadbackTarget::ProfileRequest(_)
+                | ReadbackTarget::SessionRequest(_)
+                | ReadbackTarget::ProfileSession { .. }
+                | ReadbackTarget::SwarmRunCreate { .. }
+                | ReadbackTarget::SwarmChannelCreate { .. }
+                | ReadbackTarget::SwarmMemberMutation { .. }
+                | ReadbackTarget::SwarmBoardMessage { .. }
+                | ReadbackTarget::SwarmVerificationPanel { .. }
+                | ReadbackTarget::SwarmVerdict { .. }
+        )
+    )
+}
+
 #[derive(Deserialize)]
 struct FailureBody {
     code: String,
+}
+
+fn is_swarm_conflict_code(code: Option<&str>, status: StatusCode) -> bool {
+    status == StatusCode::CONFLICT
+        && matches!(
+            code,
+            Some(
+                "SYBIL_LINEAGE_VIOLATION"
+                    | "VERIFIER_MUST_INHERIT"
+                    | "SPAWN_DEPTH_EXCEEDED"
+                    | "MAX_MEMBERS_EXCEEDED"
+                    | "TURN_BUDGET_EXCEEDED"
+                    | "DAG_NODE_HYBRID_CANNOT_SETTLE_DIRECTLY"
+                    | "VERDICT_DIFF_DIGEST_MISMATCH"
+                    | "REVIEW_NOT_ACCEPTED"
+                    | "INVALID_STATE_TRANSITION"
+                    | "FORBIDDEN_SSD_BUILD_WORKTREE"
+                    | "MEMBER_ALREADY_IN_FLIGHT"
+                    | "MEMBER_NOT_WAKE_QUEUED"
+                    | "PROFILE_INACTIVE"
+                    | "MISSING_EXECUTION_PREFERENCE"
+                    | "PROFILE_REVISION_MISMATCH"
+                    | "ENGINE_MISMATCH"
+                    | "MODEL_MISMATCH"
+                    | "REASONING_MISMATCH"
+                    | "ROLE_PROMPT_MISMATCH"
+                    | "INCOMPATIBLE_ENGINE_MODEL"
+                    | "INVALID_WORKTREE_PATH"
+                    | "INVALID_CLI_EXECUTABLE"
+            )
+        )
 }
 
 fn service_error(status: StatusCode, body: &[u8], readback: Option<ReadbackTarget>) -> ClientError {
@@ -865,8 +1088,10 @@ fn service_error(status: StatusCode, body: &[u8], readback: Option<ReadbackTarge
         Some("INVALID_INPUT" | "INVALID_IDENTITY") => ServiceCode::InvalidInput,
         Some("NOT_FOUND") => ServiceCode::NotFound,
         Some("ORCHESTRATION_CONFLICT" | "STALE_REVISION") => ServiceCode::Conflict,
+        _ if is_swarm_conflict_code(code, status) => ServiceCode::Conflict,
         Some("RESYNC_REQUIRED") => ServiceCode::ResyncRequired,
         Some("WORKSPACE_SCOPE_UNAVAILABLE") => ServiceCode::ScopeUnavailable,
+        Some("PROVIDER_RETIRED") if status == StatusCode::GONE => ServiceCode::ProviderRetired,
         _ => ServiceCode::Unknown,
     };
     if code == ServiceCode::Unknown

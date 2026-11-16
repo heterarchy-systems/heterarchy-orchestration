@@ -73,6 +73,7 @@ pub enum ForgeSourceConfigError {
 struct SourceConfig {
     address: SocketAddr,
     bearer_file: PathBuf,
+    #[serde(default)]
     scopes: Vec<ScopeDto>,
     #[serde(default)]
     effect_facts: Option<EffectFactConfig>,

@@ -1,4 +1,4 @@
-//! Profile-direct Workspace conversations over the canonical Runtime owner.
+//! Profile-direct Workspace history and exact historical recovery.
 
 use axum::{
     Extension, Json, Router,
@@ -19,7 +19,7 @@ use crate::{
     wire::workspace_chat::{
         WorkspaceChatMessageRequest, WorkspaceChatQueryRequest, WorkspaceChatQueryResponse,
         WorkspaceChatQueryWire, WorkspaceChatRecoverResponse, WorkspaceChatSendRequest,
-        WorkspaceChatSendResponse, WorkspaceChatSnapshotWire, WorkspaceChatTargetFenceWire,
+        WorkspaceChatSnapshotWire, WorkspaceChatTargetFenceWire,
     },
 };
 
@@ -28,10 +28,6 @@ pub(crate) fn routes() -> Router<BackendState> {
         .route(
             "/internal/v1/workspaces/{workspace_id}/workspace-chat/query",
             post(query),
-        )
-        .route(
-            "/internal/v1/workspaces/{workspace_id}/workspace-chat/send",
-            post(send),
         )
         .route(
             "/internal/v1/workspaces/{workspace_id}/workspace-chat/recover",
@@ -69,55 +65,6 @@ async fn query(
             Ok(Json(WorkspaceChatQueryResponse {
                 request: body,
                 snapshot: project_snapshot(&snapshot)?,
-            }))
-        })
-        .await
-}
-
-async fn send(
-    State(state): State<BackendState>,
-    Path(path): Path<String>,
-    Extension(principal): Extension<AuthenticatedPrincipal>,
-    Json(body): Json<WorkspaceChatSendRequest>,
-) -> Result<Json<WorkspaceChatSendResponse>, ApiError> {
-    let caller = caller(&path, &body.scope, body.session_id, body.sender_activity_id)?;
-    let request = domain_send(&body.request).map_err(ApiError::Runtime)?;
-    let owner = state.clone();
-    state
-        .run_owned(async move {
-            let frozen = request.clone();
-            let existing = owner
-                .catalog_job(move |runtime| {
-                    runtime
-                        .recover_workspace_chat(caller, principal, &frozen)
-                        .map_err(chat_runtime_error)
-                })
-                .await?;
-            if let Some(receipt) = existing {
-                return Ok(Json(WorkspaceChatSendResponse {
-                    request: body,
-                    receipt: crate::node_chat::project_receipt(&receipt),
-                }));
-            }
-            owner
-                .catalog_job(move |runtime| {
-                    runtime
-                        .authorize_chat_sender(caller, principal, request.query.workspace_id)
-                        .map_err(chat_runtime_error)
-                })
-                .await?;
-            owner.workspace_scope_proof(body.scope.clone()).await?;
-            let now = now()?;
-            let receipt = owner
-                .catalog_job(move |runtime| {
-                    runtime
-                        .send_workspace_chat(caller, principal, &request, now)
-                        .map_err(chat_runtime_error)
-                })
-                .await?;
-            Ok(Json(WorkspaceChatSendResponse {
-                request: body,
-                receipt: crate::node_chat::project_receipt(&receipt),
             }))
         })
         .await
@@ -208,28 +155,11 @@ fn project_snapshot(value: &ChatSnapshot) -> Result<WorkspaceChatSnapshotWire, A
     Ok(WorkspaceChatSnapshotWire {
         workspace_id: value.query.workspace_id.into_uuid(),
         agent_profile_id: profile.into_uuid(),
-        targets: value.targets.iter().map(project_fence).collect(),
-        target: value.target.as_ref().map(project_fence),
         messages: value.entries.iter().map(project_entry).collect(),
         before_sequence: value.query.before_sequence,
         next_before_sequence: value.next_before_sequence,
         unavailable_reason: value.unavailable_reason.map(str::to_owned),
     })
-}
-
-fn project_fence(
-    value: &heterarchy_orchestration_runtime::chat::ChatTargetFence,
-) -> WorkspaceChatTargetFenceWire {
-    WorkspaceChatTargetFenceWire {
-        operation_id: value.operation_id,
-        profile_id: value.profile_id,
-        profile_name: value.profile_name.clone(),
-        participation_id: value.participation_id,
-        participation_revision: value.participation_revision,
-        runtime_session_id: value.runtime_session_id,
-        runtime_revision: value.runtime_revision,
-        provider_conversation_id: value.provider_conversation_id.clone(),
-    }
 }
 
 fn domain_direct_fence(

@@ -39,6 +39,59 @@ impl Default for BrokerClusterConfig {
 }
 
 impl BrokerClusterConfig {
+    /// Build a single-node Broker routing configuration from one Broker address.
+    ///
+    /// When no explicit operations port is provided, defaults to `port + 1000`
+    /// (or `port + 1` if `port + 1000` overflows `u16`). Single-node routing
+    /// communicates directly with `broker_address` via [`agent_broker_client::AsyncBrokerClient`].
+    ///
+    /// # Errors
+    /// Returns [`BrokerClusterProbeError::InvalidAddress`] when the Broker
+    /// client rejects the address.
+    pub fn from_broker_address(
+        broker_address: SocketAddr,
+    ) -> Result<Self, BrokerClusterProbeError> {
+        let default_ops_port = broker_address
+            .port()
+            .checked_add(1_000)
+            .or_else(|| broker_address.port().checked_add(1))
+            .unwrap_or(broker_address.port());
+        let operations_address = SocketAddr::new(broker_address.ip(), default_ops_port);
+        Self::from_single_node(broker_address, operations_address)
+    }
+
+    /// Build a single-node Broker routing configuration from one Broker/Operations
+    /// address pair.
+    ///
+    /// # Errors
+    /// Returns [`BrokerClusterProbeError::InvalidAddress`] when the Broker
+    /// client rejects the address.
+    pub fn from_single_node(
+        broker_address: SocketAddr,
+        operations_address: SocketAddr,
+    ) -> Result<Self, BrokerClusterProbeError> {
+        let node = StaticClusterNode {
+            node_id: 1,
+            broker_address,
+            operations_address,
+        };
+        Self {
+            nodes: [node, node, node],
+            timeout: DEFAULT_BROKER_CLUSTER_TIMEOUT,
+        }
+        .validated()
+    }
+
+    /// Return whether this configuration targets a single Broker node rather
+    /// than a three-node cluster.
+    #[must_use]
+    pub fn is_single_node(&self) -> bool {
+        self.nodes[0].broker_address == self.nodes[1].broker_address
+            && self.nodes[1].broker_address == self.nodes[2].broker_address
+            && self.nodes[0].operations_address == self.nodes[1].operations_address
+            && self.nodes[1].operations_address == self.nodes[2].operations_address
+    }
+
     /// Build the routing configuration from per-node Broker/Operations
     /// address pairs. Address policy (loopback-only today) stays with the
     /// Broker client's own validation.
@@ -49,6 +102,9 @@ impl BrokerClusterConfig {
     pub fn from_node_pairs(
         pairs: [(SocketAddr, SocketAddr); 3],
     ) -> Result<Self, BrokerClusterProbeError> {
+        if pairs[0] == pairs[1] && pairs[1] == pairs[2] {
+            return Self::from_single_node(pairs[0].0, pairs[0].1);
+        }
         let nodes = [
             StaticClusterNode {
                 node_id: 1,
@@ -73,7 +129,18 @@ impl BrokerClusterConfig {
         .validated()
     }
 
-    fn validated(self) -> Result<Self, BrokerClusterProbeError> {
+    pub(crate) fn validated(self) -> Result<Self, BrokerClusterProbeError> {
+        if self.is_single_node() {
+            if !self.nodes[0].operations_address.ip().is_loopback()
+                || self.nodes[0].operations_address.port() == 0
+            {
+                return Err(BrokerClusterProbeError::InvalidAddress);
+            }
+            self.client_config()
+                .validate()
+                .map_err(|_| BrokerClusterProbeError::InvalidAddress)?;
+            return Ok(self);
+        }
         StaticClusterRouterConfig {
             nodes: self.nodes,
             timeout: self.timeout,
@@ -83,6 +150,14 @@ impl BrokerClusterConfig {
         .validate()
         .map_err(|_| BrokerClusterProbeError::InvalidAddress)?;
         Ok(self)
+    }
+
+    pub(crate) fn client_config(self) -> BrokerClientConfig {
+        BrokerClientConfig {
+            address: self.nodes[0].broker_address,
+            timeout: self.timeout,
+            max_response_frame_bytes: MAX_RESPONSE_FRAME_BYTES,
+        }
     }
 
     pub(crate) fn router_config(self) -> StaticClusterRouterConfig {
@@ -99,6 +174,24 @@ impl BrokerClusterConfig {
     /// never acquires authority.
     #[must_use]
     pub fn probe(self) -> BrokerClusterProbe {
+        if self.is_single_node() {
+            let node = self.nodes[0];
+            let broker_reachable = tcp_reachable(node.broker_address);
+            let operations_reachable = tcp_reachable(node.operations_address);
+            let health_ok = broker_reachable && Self::node_health(node.broker_address).is_ok();
+            let single = BrokerClusterNodeProbe {
+                node_id: node.node_id,
+                broker_address: node.broker_address.to_string(),
+                operations_address: node.operations_address.to_string(),
+                broker_reachable,
+                operations_reachable,
+                health_ok,
+            };
+            return BrokerClusterProbe {
+                healthy: health_ok,
+                nodes: [single.clone(), single.clone(), single],
+            };
+        }
         let nodes = self.nodes.map(|node| {
             let broker_reachable = tcp_reachable(node.broker_address);
             let operations_reachable = tcp_reachable(node.operations_address);

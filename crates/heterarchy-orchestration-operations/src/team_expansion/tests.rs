@@ -13,8 +13,8 @@ use forge_domain::{
 };
 use heterarchy_orchestration_sessions::{
     AgentProfileCatalog, AgentProfileCreationOrigin, AgentProfileId,
-    AgentProfileLogicalSessionLink, AgentProfileProviderFamily, AgentSessionCatalog,
-    CreateAgentProfile, link_existing_logical_session,
+    AgentProfileLogicalSessionLink, AgentSessionCatalog, CreateAgentProfile,
+    link_existing_logical_session,
 };
 use rusqlite::{Connection, params};
 use std::{
@@ -539,7 +539,6 @@ fn create_synthetic_profile_session_pair(
         Uuid::from_u128(seed + 1),
         format!("team-expansion-profile-{seed:x}"),
         "Synthetic Team expansion Profile".to_owned(),
-        AgentProfileProviderFamily::ChatGpt,
         Some("gpt-5.6-luna".to_owned()),
         Some("max".to_owned()),
         vec!["rust".to_owned()],
@@ -1009,7 +1008,6 @@ fn ensure_expansion_test_schemas(connection: &Connection) -> Result<(), Box<dyn 
         let transaction = connection.unchecked_transaction()?;
         super::create_workspace_hold_schema(&transaction)?;
         super::create_legacy_slot_recovery_schema(&transaction)?;
-        transaction.execute(super::workspace_hold::PRE_HOLD_DECISION_BACKFILL_SQL, [])?;
         transaction.commit()?;
     }
     let has_transfer_source_schema = connection.query_row(
