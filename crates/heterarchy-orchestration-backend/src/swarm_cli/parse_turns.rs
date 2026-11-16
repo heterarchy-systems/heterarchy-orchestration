@@ -42,7 +42,7 @@ where
         "settle" => parse_settle(arguments, index, conn, env_lookup),
         "abort" => parse_abort(arguments, index, conn, env_lookup),
         "stall-check" => parse_stall_check(arguments, index, conn, env_lookup),
-        _ => Err(CliSupportError::InvalidArguments),
+        other => super::parse_bridge::dispatch_bridge(other, arguments, index, conn, env_lookup),
     }
 }
 
@@ -271,6 +271,7 @@ struct DispatchFlags {
     dispatched_at_ms: Option<i64>,
     clean_exit_output_commit_oid: Option<String>,
     clean_exit_output_tree_blake3_hex: Option<String>,
+    forge_session_id: Option<String>,
 }
 
 fn parse_dispatch<F>(
@@ -412,6 +413,9 @@ fn consume_dispatch_grant_and_timeout_flag(
             &mut flags.clean_exit_output_tree_blake3_hex,
             next_utf8_value(arguments, index)?.to_owned(),
         ),
+        "--forge-session-id" => {
+            set_canonical_uuid_string(&mut flags.forge_session_id, arguments, index)
+        }
         _ => Err(CliSupportError::InvalidArguments),
     }
 }
@@ -437,15 +441,18 @@ fn build_dispatch_request(
         }),
         _ => return Err(CliSupportError::InvalidArguments),
     };
+    let default_worktree_path = match flags.default_worktree_path {
+        Some(path) => path,
+        None if flags.forge_session_id.is_some() => String::new(),
+        None => return Err(CliSupportError::InvalidArguments),
+    };
     Ok(DispatchSwarmTurnRequest {
         snapshot_request_id: flags
             .snapshot_request_id
             .unwrap_or_else(|| Uuid::now_v7().to_string()),
         snapshot_id: flags.snapshot_id.ok_or(CliSupportError::InvalidArguments)?,
         activity_id: flags.activity_id.ok_or(CliSupportError::InvalidArguments)?,
-        default_worktree_path: flags
-            .default_worktree_path
-            .ok_or(CliSupportError::InvalidArguments)?,
+        default_worktree_path,
         lease_id: flags.lease_id.ok_or(CliSupportError::InvalidArguments)?,
         lease_revision: flags
             .lease_revision
@@ -473,6 +480,7 @@ fn build_dispatch_request(
         dispatched_at_ms: flags.dispatched_at_ms,
         clean_exit_output_commit_oid: flags.clean_exit_output_commit_oid,
         clean_exit_output_tree_blake3_hex: flags.clean_exit_output_tree_blake3_hex,
+        forge_session_id: flags.forge_session_id,
     })
 }
 

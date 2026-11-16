@@ -3819,6 +3819,7 @@ mod client_and_cli_e2e {
             dispatched_at_ms: None,
             clean_exit_output_commit_oid: None,
             clean_exit_output_tree_blake3_hex: None,
+            forge_session_id: None,
         })
     }
 
@@ -3949,5 +3950,944 @@ mod client_and_cli_e2e {
         assert_eq!(status.run.swarm_run_id, run_id);
         assert_eq!(status.members.len(), 2);
         Ok(())
+    }
+}
+
+mod live_east_west_bridge_e2e {
+    use std::fs;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    use forge_backend::config::BackendConfig;
+    use forge_backend::http::{BackendClients, assemble, serve};
+    use forge_control::{
+        AgentBindingActivateRequest, AgentBindingReserveRequest, AgentOperationsDelegationRequest,
+        CoordinatorClaimRequest, ForgeApprovalCoordinator, ForgeControl, ForgeControlClient,
+        ForgeControlWorker, ForgeExecutionCoordinator, ResolvedWorkspaceScope,
+    };
+    use forge_domain::{
+        ActivityId, AgentDeclaredRole, AgentDisplayName, AgentInstanceId, AgentSessionId,
+        AgentSessionOpenRequestId, AgentTransportKind, AuthenticatedPrincipal, EstablishWorkspace,
+        ForgeBackendId, LocationId, LocationRevision, OpenAgentSession, OrchestrationIssuerId,
+        RuntimeInstanceId, TimestampMillis, WorkspaceId, WorkspaceRoot,
+    };
+    use forge_persistence::{
+        AgentBindingActivationRequest, AgentBindingReservationRequest,
+        AgentOperationsFreezeRequest, GlobalRegistry, WorkspaceStore,
+    };
+    use forge_workspace::{LocationService, WorkspaceStateLayout};
+    use heterarchy_orchestration_backend::{
+        CoordinatorAuthority, SwarmHostOptions,
+        client::{ClientError, OrchestrationHttpClient, ServiceCode},
+        forge_source_config, serve_with_runtime_and_swarm_options,
+        wire::{
+            AgentProfileCreateRequest, AgentProfileCreateResponse, ExecutionPreferenceWire,
+            autonomy_loop::{ExecutionPermissionsWire, ExecutionTimeoutsWire},
+            swarm::{
+                AddSwarmMemberRequest, DispatchSwarmTurnRequest, ForgeConvergeSwarmRequest,
+                ForgeSettleSwarmRequest, PostSwarmMessageRequest, RecordSwarmVerdictRequest,
+                SyncAutonomyOutboxRequest,
+            },
+        },
+    };
+    use heterarchy_orchestration_runtime::{
+        OrchestrationRuntime,
+        access::OperatorPolicy,
+        execution_supervisor::{CommandOverride, LocalProcessRunnerConfig},
+    };
+    use hyper::StatusCode;
+    use hyper::header::HeaderValue;
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+    use tokio::sync::Notify;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::{
+        FakeSingleNodeBroker, IssuedTokens, READY_DEADLINE, TempDir, TestResult,
+        author_identity_wire, reserve_loopback_addr, send_http_raw, standalone_run_request,
+        start_tokens, wait_for_ready,
+    };
+
+    const FORGE_BEARER_SECRET: &str = "live-e2e7-forge-bearer-secret";
+    const WORKER_WRITE_SCRIPT: &str =
+        "printf 'settled from live east-west swarm\\n' > e2e7_settled.txt";
+
+    struct VarTmpScratch(PathBuf);
+
+    impl VarTmpScratch {
+        fn create(label: &str) -> TestResult<Self> {
+            let raw = PathBuf::from(format!(
+                "/var/tmp/heterarchy-{label}-{}-{}",
+                std::process::id(),
+                Uuid::now_v7()
+            ));
+            fs::create_dir_all(&raw)?;
+            fs::set_permissions(&raw, fs::Permissions::from_mode(0o700))?;
+            Ok(Self(raw.canonicalize()?))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for VarTmpScratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct SeededForgeState {
+        root: PathBuf,
+        workspace_root: PathBuf,
+        registry_path: PathBuf,
+        scope: ResolvedWorkspaceScope,
+        activity_id: ActivityId,
+        session_id: AgentSessionId,
+        coordinator_agent_id: AgentInstanceId,
+        migration_id: Uuid,
+    }
+
+    struct RunningForgeServer {
+        state: forge_backend::AppState,
+        address: SocketAddr,
+        backend_id: Uuid,
+        worker: ForgeControlWorker,
+        lease_worker: ForgeControlWorker,
+        execution: ForgeExecutionCoordinator,
+        approval: ForgeApprovalCoordinator,
+    }
+
+    impl RunningForgeServer {
+        async fn shutdown(self) -> TestResult {
+            let Self {
+                state,
+                mut worker,
+                mut lease_worker,
+                mut execution,
+                mut approval,
+                ..
+            } = self;
+            let report = state.shutdown(Duration::from_secs(5)).await;
+            assert!(report.is_successful(), "forge drain report: {report:?}");
+            let _ = approval.shutdown();
+            let _ = execution.shutdown();
+            worker.shutdown()?;
+            lease_worker.shutdown()?;
+            Ok(())
+        }
+    }
+
+    struct LiveSseCollector {
+        kinds: Arc<Mutex<Vec<String>>>,
+        notify: Arc<Notify>,
+        reader_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for LiveSseCollector {
+        fn drop(&mut self) {
+            self.reader_task.abort();
+        }
+    }
+
+    fn now_ts() -> TestResult<TimestampMillis> {
+        let ms = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+        Ok(TimestampMillis::new(ms)?)
+    }
+
+    fn add_ms(base: TimestampMillis, delta: i64) -> TestResult<TimestampMillis> {
+        Ok(TimestampMillis::new(
+            base.get().checked_add(delta).ok_or("timestamp overflow")?,
+        )?)
+    }
+
+    #[tokio::test]
+    async fn e2e_7_live_forge_and_orchestration_east_west_swarm_bridge_and_sse_events() -> TestResult
+    {
+        let scratch = VarTmpScratch::create("e2e7-east-west")?;
+        let orch_dir = TempDir::create("e2e7-orch")?;
+        let broker = FakeSingleNodeBroker::start().await?;
+        let tokens = start_tokens(&orch_dir.path().join("auth"))?;
+        let runtime_root = orch_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_root)?;
+        let runtime = Arc::new(
+            OrchestrationRuntime::open_with_broker_cluster(
+                &runtime_root,
+                broker.cluster_config()?,
+            )?
+            .with_operator_policy(OperatorPolicy::new(vec![tokens.operator_principal])?),
+        );
+
+        let seeded = seed_forge_workspace_and_coordinator(
+            &scratch.path().join("forge"),
+            tokens.operator_principal,
+            runtime.destination_id(),
+        )?;
+        let forge_server = start_live_forge_server(&seeded, runtime.destination_id()).await?;
+        let authority = load_http_coordinator_authority(
+            scratch.path(),
+            forge_server.address,
+            &seeded.scope,
+            forge_server.backend_id,
+            runtime.destination_id(),
+        )?;
+
+        let (orch_addr, orch_cancel, orch_task) = start_live_orchestration_server(
+            scratch.path(),
+            &tokens,
+            Arc::clone(&runtime),
+            authority,
+        )
+        .await?;
+        let ws_uuid = seeded.scope.workspace_id().into_uuid();
+        let sse = connect_workspace_sse(orch_addr, &tokens.operator_bearer, ws_uuid).await?;
+
+        let flow_res = exercise_live_bridge_lifecycle(orch_addr, &tokens, &seeded).await;
+        let sse_res = wait_for_expected_sse_kinds(&sse).await;
+
+        orch_cancel.cancel();
+        orch_task.await??;
+        drop(tokens.token_runtime);
+        forge_server.shutdown().await?;
+
+        flow_res?;
+        sse_res
+    }
+
+    fn seed_forge_workspace_and_coordinator(
+        forge_root: &Path,
+        principal: AuthenticatedPrincipal,
+        destination_id: Uuid,
+    ) -> TestResult<SeededForgeState> {
+        fs::create_dir_all(forge_root)?;
+        let now = now_ts()?;
+        let registry_path = forge_root.join("registry.sqlite3");
+        let (scope, workspace_root) = create_forge_location_and_workspace(&registry_path, now)?;
+        fs::write(workspace_root.join("README.md"), "baseline\n")?;
+
+        let activity_id = ActivityId::from_uuid(Uuid::now_v7());
+        let session_id = AgentSessionId::from_uuid(Uuid::now_v7());
+        let coordinator_agent_id = AgentInstanceId::from_uuid(Uuid::now_v7());
+        let migration_id = Uuid::now_v7();
+
+        let control = ForgeControl::new(GlobalRegistry::open(&registry_path)?);
+        let _ = control.bootstrap_activity(
+            &scope,
+            activity_id,
+            RuntimeInstanceId::from_uuid(Uuid::now_v7()),
+            now,
+            add_ms(now, 600_000)?,
+        )?;
+        let _ = control.agent_session_open(&OpenAgentSession::new(
+            session_id,
+            AgentSessionOpenRequestId::from_uuid(Uuid::now_v7()),
+            principal,
+            add_ms(now, 1)?,
+        ))?;
+
+        let layout = WorkspaceStateLayout::inspect_existing(&workspace_root)?
+            .ok_or("missing forge workspace layout")?;
+        let mut store = WorkspaceStore::open_existing(&layout)?;
+        let freeze = store.freeze_agent_operations(&AgentOperationsFreezeRequest::new(
+            migration_id,
+            destination_id,
+            add_ms(now, 5)?,
+        )?)?;
+        drop(store);
+
+        let (client, mut worker) =
+            ForgeControlWorker::start(ForgeControl::new(GlobalRegistry::open(&registry_path)?))?;
+        bind_and_claim_coordinator(
+            &client,
+            &scope,
+            (activity_id, coordinator_agent_id, session_id, principal),
+            freeze,
+            now,
+        )?;
+        worker.shutdown()?;
+
+        Ok(SeededForgeState {
+            root: forge_root.to_path_buf(),
+            workspace_root,
+            registry_path,
+            scope,
+            activity_id,
+            session_id,
+            coordinator_agent_id,
+            migration_id,
+        })
+    }
+
+    fn create_forge_location_and_workspace(
+        registry_path: &Path,
+        now: TimestampMillis,
+    ) -> TestResult<(ResolvedWorkspaceScope, PathBuf)> {
+        let location_root = registry_path
+            .parent()
+            .ok_or("registry parent missing")?
+            .join("location");
+        let workspace_root = location_root.join("workspace-0");
+        fs::create_dir_all(&workspace_root)?;
+        let location_id = LocationId::from_uuid(Uuid::now_v7());
+        let workspace_id = WorkspaceId::from_uuid(Uuid::now_v7());
+
+        let mut locations = LocationService::new(GlobalRegistry::open(registry_path)?);
+        let location =
+            locations.register_selected_path(location_id, "e2e7-loc", &location_root, now)?;
+        let layout = WorkspaceStateLayout::initialize(&workspace_root)?;
+        let establish = EstablishWorkspace::new(
+            workspace_id,
+            location.id(),
+            WorkspaceRoot::from_canonical(layout.workspace_root().to_path_buf())?,
+            layout.root_fingerprint()?,
+            add_ms(now, 1)?,
+        );
+        drop(WorkspaceStore::open(&layout, &establish)?);
+        drop(locations);
+
+        let control = ForgeControl::new(GlobalRegistry::open(registry_path)?);
+        let locator = control
+            .workspace_discover(location_id, LocationRevision::INITIAL)?
+            .into_iter()
+            .find(|entry| entry.display_name() == "workspace-0")
+            .ok_or("workspace-0 discovery missing")?
+            .locator()
+            .clone();
+        let scope = control.resolve_workspace(location_id, LocationRevision::INITIAL, &locator)?;
+        Ok((scope, workspace_root))
+    }
+
+    fn bind_and_claim_coordinator(
+        client: &ForgeControlClient,
+        scope: &ResolvedWorkspaceScope,
+        ids: (
+            ActivityId,
+            AgentInstanceId,
+            AgentSessionId,
+            AuthenticatedPrincipal,
+        ),
+        freeze: forge_persistence::AgentOperationsFreeze,
+        now: TimestampMillis,
+    ) -> TestResult {
+        let (activity_id, agent_id, session_id, principal) = ids;
+        let req_id = Uuid::now_v7();
+        let reservation = AgentBindingReservationRequest::new(
+            req_id,
+            activity_id,
+            agent_id,
+            session_id,
+            principal,
+            add_ms(now, 10)?,
+        )?;
+        let _ = client.reserve_agent_binding(AgentBindingReserveRequest {
+            scope: scope.clone(),
+            freeze: freeze.clone(),
+            reservation,
+            observed_at: add_ms(now, 11)?,
+        })?;
+        let delegation = client.delegate_agent_operations(AgentOperationsDelegationRequest {
+            scope: scope.clone(),
+            freeze,
+            manifest_digest: [0xE7; 32],
+            observed_at: add_ms(now, 12)?,
+        })?;
+        let activation = AgentBindingActivationRequest::new(
+            req_id,
+            [0xE8; 32],
+            AgentDisplayName::new("e2e7-coordinator".to_owned())?,
+            AgentDeclaredRole::new("coordinator".to_owned())?,
+            AgentTransportKind::StreamableHttp,
+        )?;
+        let _ = client.activate_agent_binding(AgentBindingActivateRequest {
+            scope: scope.clone(),
+            delegation,
+            activation,
+            session_id,
+            principal,
+            observed_at: add_ms(now, 13)?,
+        })?;
+        let _ = client.activity_coordinator_claim(CoordinatorClaimRequest {
+            session_id,
+            scope: scope.clone(),
+            activity_id,
+            agent_id,
+            principal,
+            observed_at: add_ms(now, 14)?,
+        })?;
+        Ok(())
+    }
+
+    async fn start_live_forge_server(
+        seeded: &SeededForgeState,
+        destination_id: Uuid,
+    ) -> TestResult<RunningForgeServer> {
+        let control = ForgeControl::new(GlobalRegistry::open_existing(&seeded.registry_path)?);
+        let (client, worker) = ForgeControlWorker::start(control)?;
+        let (activity_leases, lease_worker) = ForgeControlWorker::start_activity_lease(
+            ForgeControl::new(GlobalRegistry::open_existing(&seeded.registry_path)?),
+        )?;
+        let execution = ForgeExecutionCoordinator::start(client.clone(), 2)?;
+        let approval = ForgeApprovalCoordinator::start(client.clone(), execution.client())?;
+        let execution_client = execution.client();
+        let approval_client = approval.client();
+        let product_cache = seeded.root.join("product-cache");
+        let backend_id = Uuid::now_v7();
+        let state = assemble(
+            BackendConfig::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                0,
+                FORGE_BEARER_SECRET,
+                ForgeBackendId::from_uuid(backend_id),
+                OrchestrationIssuerId::from_uuid(Uuid::now_v7()),
+            )?,
+            BackendClients {
+                control: &client,
+                execution: &execution_client,
+                approval: &approval_client,
+                activity_leases: &activity_leases,
+                runtime_instance_id: Uuid::now_v7(),
+                product_cache_root: &product_cache,
+                destination_id,
+            },
+        )?;
+        let address = serve(state.clone()).await?;
+        Ok(RunningForgeServer {
+            state,
+            address,
+            backend_id,
+            worker,
+            lease_worker,
+            execution,
+            approval,
+        })
+    }
+
+    fn load_http_coordinator_authority(
+        scratch: &Path,
+        forge_address: SocketAddr,
+        scope: &ResolvedWorkspaceScope,
+        backend_id: Uuid,
+        destination_id: Uuid,
+    ) -> TestResult<CoordinatorAuthority> {
+        let bearer_path = scratch.join("forge-source.bearer");
+        fs::write(&bearer_path, format!("{FORGE_BEARER_SECRET}\n"))?;
+        fs::set_permissions(&bearer_path, fs::Permissions::from_mode(0o600))?;
+        let config_path = scratch.join("forge-source.json");
+        let doc = json!({
+            "address": forge_address.to_string(),
+            "bearer_file": bearer_path,
+            "scopes": [{
+                "workspace_id": scope.workspace_id().into_uuid(),
+                "workspace_revision": scope.workspace_revision().get(),
+                "locator": {
+                    "location_id": scope.locator().location_id().into_uuid(),
+                    "expected_revision": scope.locator().expected_revision().get(),
+                    "relative_root": scope.locator().relative_root().to_string_lossy(),
+                }
+            }],
+            "effect_facts": {
+                "backend_id": backend_id,
+                "destination_id": destination_id,
+            }
+        });
+        fs::write(&config_path, serde_json::to_vec_pretty(&doc)?)?;
+        Ok(forge_source_config::load(&config_path)?)
+    }
+
+    async fn start_live_orchestration_server(
+        scratch: &Path,
+        tokens: &IssuedTokens,
+        runtime: Arc<OrchestrationRuntime>,
+        authority: CoordinatorAuthority,
+    ) -> TestResult<(
+        SocketAddr,
+        CancellationToken,
+        tokio::task::JoinHandle<Result<(), heterarchy_orchestration_backend::BackendError>>,
+    )> {
+        let raw_reveal = tokens
+            .operator_bearer
+            .strip_prefix("Bearer ")
+            .ok_or("expected Bearer prefix")?;
+        let worker_bearer = scratch.join("orch-worker.token");
+        fs::write(&worker_bearer, format!("{raw_reveal}\n"))?;
+        fs::set_permissions(&worker_bearer, fs::Permissions::from_mode(0o600))?;
+        let runner_cfg = LocalProcessRunnerConfig::new()
+            .with_command_override(CommandOverride::new("/bin/sh", ["-c", WORKER_WRITE_SCRIPT]));
+        let swarm_options = SwarmHostOptions::default()
+            .with_worker_bearer_file(worker_bearer.canonicalize()?)
+            .with_process_runner_config(runner_cfg);
+
+        let address = reserve_loopback_addr()?;
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(serve_with_runtime_and_swarm_options(
+            runtime,
+            address,
+            tokens.token_runtime.client(),
+            Some(authority),
+            swarm_options,
+            cancellation.clone(),
+        ));
+        wait_for_ready(address).await?;
+        Ok((address, cancellation, task))
+    }
+
+    async fn connect_workspace_sse(
+        address: SocketAddr,
+        bearer: &str,
+        workspace_id: Uuid,
+    ) -> TestResult<LiveSseCollector> {
+        let stream = TcpStream::connect(address).await?;
+        let (read_half, mut write_half) = stream.into_split();
+        let req = format!(
+            "GET /v1/workspaces/{workspace_id}/events HTTP/1.1\r\nHost: {address}\r\nAuthorization: {bearer}\r\nAccept: text/event-stream\r\n\r\n"
+        );
+        write_half.write_all(req.as_bytes()).await?;
+        write_half.flush().await?;
+
+        let mut reader = BufReader::new(read_half);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await?;
+        assert!(
+            status_line.starts_with("HTTP/1.1 200"),
+            "unexpected SSE status: {status_line}"
+        );
+        loop {
+            let mut hdr = String::new();
+            reader.read_line(&mut hdr).await?;
+            if hdr == "\r\n" || hdr.is_empty() {
+                break;
+            }
+        }
+
+        let kinds = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(Notify::new());
+        let kinds_clone = Arc::clone(&kinds);
+        let notify_clone = Arc::clone(&notify);
+        let reader_task = tokio::spawn(async move {
+            let _keep_write = write_half;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(n) = reader.read_line(&mut line).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                if let Some(json_str) = line.trim_end().strip_prefix("data:")
+                    && let Ok(val) = serde_json::from_str::<Value>(json_str.trim())
+                    && let Some(kind) = val.get("kind").and_then(Value::as_str)
+                    && let Ok(mut guard) = kinds_clone.lock()
+                {
+                    guard.push(kind.to_owned());
+                    drop(guard);
+                    notify_clone.notify_waiters();
+                }
+            }
+        });
+        Ok(LiveSseCollector {
+            kinds,
+            notify,
+            reader_task,
+        })
+    }
+
+    async fn exercise_live_bridge_lifecycle(
+        orch_addr: SocketAddr,
+        tokens: &IssuedTokens,
+        seeded: &SeededForgeState,
+    ) -> TestResult {
+        let profile_id = create_active_worker_profile(orch_addr, &tokens.operator_bearer).await?;
+        let client = OrchestrationHttpClient::new(orch_addr, Duration::from_secs(10))?;
+        let auth = HeaderValue::from_str(&tokens.operator_bearer)?;
+        let ws = seeded.scope.workspace_id().into_uuid();
+
+        let (run_id, worker_id, verifier_id) =
+            seed_swarm_roster(&client, &auth, ws, profile_id).await?;
+        dispatch_and_verify_auto_capture(&client, &auth, ws, run_id, worker_id, seeded).await?;
+
+        let converged = client
+            .forge_converge_swarm_run(
+                &auth,
+                ws,
+                run_id,
+                &ForgeConvergeSwarmRequest {
+                    request_id: Uuid::now_v7().to_string(),
+                    session_id: seeded.session_id.into_uuid().to_string(),
+                    candidate_member_ids: Vec::new(),
+                    stage_candidate_only: true,
+                },
+            )
+            .await?;
+        assert_eq!(converged.run.state, "CANDIDATE_READY");
+        assert_eq!(converged.changed_files, vec!["e2e7_settled.txt".to_owned()]);
+        let diff_hex = converged
+            .run
+            .converged_diff_digest_hex
+            .ok_or("missing converged_diff_digest_hex")?;
+
+        verify_settle_gating_and_finalize(
+            &client,
+            &auth,
+            ws,
+            run_id,
+            verifier_id,
+            &diff_hex,
+            seeded,
+        )
+        .await
+    }
+
+    async fn create_active_worker_profile(orch_addr: SocketAddr, bearer: &str) -> TestResult<Uuid> {
+        let (status, created): (_, AgentProfileCreateResponse) = post_json_raw(
+            orch_addr,
+            bearer,
+            "/internal/v1/agent-profiles",
+            &AgentProfileCreateRequest {
+                request_id: Uuid::now_v7().to_string(),
+                stable_name: "e2e7-bridge-worker".to_owned(),
+                display_name: "E2E7 Bridge Worker".to_owned(),
+                preferred_model: Some("gpt-6-astra".to_owned()),
+                preferred_reasoning: Some("high".to_owned()),
+                base_capabilities: vec!["rust".to_owned()],
+                execution_preference: Some(ExecutionPreferenceWire {
+                    cli_engine: "codex".to_owned(),
+                    preferred_model: "gpt-6-astra".to_owned(),
+                    preferred_reasoning: Some("high".to_owned()),
+                    capabilities: vec!["rust".to_owned()],
+                    role_prompt_digest_hex: None,
+                }),
+            },
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CREATED);
+        Ok(created.profile.profile_id)
+    }
+
+    async fn post_json_raw<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+        addr: SocketAddr,
+        bearer: &str,
+        path: &str,
+        body: &Req,
+    ) -> TestResult<(StatusCode, Resp)> {
+        let encoded = serde_json::to_vec(body)?;
+        let (status, bytes) = send_http_raw(addr, "POST", path, Some(bearer), &encoded).await?;
+        Ok((status, serde_json::from_slice(&bytes)?))
+    }
+
+    async fn seed_swarm_roster(
+        client: &OrchestrationHttpClient,
+        auth: &HeaderValue,
+        ws: Uuid,
+        profile_id: Uuid,
+    ) -> TestResult<(Uuid, Uuid, Uuid)> {
+        let created = client
+            .create_swarm_run(
+                auth,
+                ws,
+                &standalone_run_request(Uuid::now_v7(), "E2E 7 Live East-West Swarm"),
+            )
+            .await?;
+        let run_id = created.run.swarm_run_id;
+
+        let mut coord_ident = author_identity_wire(0xD1);
+        coord_ident.profile_id = profile_id.to_string();
+        let coord = client
+            .add_swarm_member(
+                auth,
+                ws,
+                run_id,
+                &AddSwarmMemberRequest {
+                    member_id: Uuid::now_v7().to_string(),
+                    roster_name: "e2e7-coord".to_owned(),
+                    role_kind: "COORDINATOR".to_owned(),
+                    parent_member_id: None,
+                    workspace_mode: "INHERIT".to_owned(),
+                    worktree_path: None,
+                    identity: coord_ident,
+                    initial_channels: Vec::new(),
+                },
+            )
+            .await?;
+
+        let mut worker_ident = author_identity_wire(0xD2);
+        worker_ident.profile_id = profile_id.to_string();
+        let worker = client
+            .add_swarm_member(
+                auth,
+                ws,
+                run_id,
+                &AddSwarmMemberRequest {
+                    member_id: Uuid::now_v7().to_string(),
+                    roster_name: "e2e7-worker".to_owned(),
+                    role_kind: "WORKER".to_owned(),
+                    parent_member_id: Some(coord.member_id.to_string()),
+                    workspace_mode: "SHARE".to_owned(),
+                    worktree_path: None,
+                    identity: worker_ident,
+                    initial_channels: Vec::new(),
+                },
+            )
+            .await?;
+
+        let verifier = client
+            .add_swarm_member(
+                auth,
+                ws,
+                run_id,
+                &AddSwarmMemberRequest {
+                    member_id: Uuid::now_v7().to_string(),
+                    roster_name: "e2e7-verifier".to_owned(),
+                    role_kind: "VERIFIER".to_owned(),
+                    parent_member_id: None,
+                    workspace_mode: "INHERIT".to_owned(),
+                    worktree_path: None,
+                    identity: author_identity_wire(0xD3),
+                    initial_channels: Vec::new(),
+                },
+            )
+            .await?;
+
+        Ok((run_id, worker.member_id, verifier.member_id))
+    }
+
+    async fn dispatch_and_verify_auto_capture(
+        client: &OrchestrationHttpClient,
+        auth: &HeaderValue,
+        ws: Uuid,
+        run_id: Uuid,
+        worker_id: Uuid,
+        seeded: &SeededForgeState,
+    ) -> TestResult {
+        let wake = client
+            .post_swarm_message(
+                auth,
+                ws,
+                run_id,
+                &PostSwarmMessageRequest {
+                    message_id: Uuid::now_v7().to_string(),
+                    channel_id: None,
+                    author_member_id: None,
+                    body: "@e2e7-worker produce settled artifact".to_owned(),
+                },
+            )
+            .await?;
+        assert_eq!(wake.woken_member_ids, vec![worker_id]);
+
+        let now_ms = now_ts()?.get();
+        let dispatched = client
+            .dispatch_swarm_member_turn(
+                auth,
+                ws,
+                run_id,
+                worker_id,
+                &DispatchSwarmTurnRequest {
+                    snapshot_request_id: Uuid::now_v7().to_string(),
+                    snapshot_id: Uuid::now_v7().to_string(),
+                    activity_id: seeded.activity_id.into_uuid().to_string(),
+                    default_worktree_path: String::new(),
+                    lease_id: Uuid::now_v7().to_string(),
+                    lease_revision: 1,
+                    lease_expires_at_ms: now_ms + 300_000,
+                    mcp_grant: None,
+                    permissions: ExecutionPermissionsWire {
+                        allow_workspace_write: true,
+                        allow_local_shell: true,
+                        allow_network: false,
+                    },
+                    timeouts: ExecutionTimeoutsWire {
+                        startup_timeout_ms: 5_000,
+                        execution_timeout_ms: 15_000,
+                        termination_grace_ms: 2_000,
+                    },
+                    dispatched_at_ms: Some(now_ms),
+                    clean_exit_output_commit_oid: None,
+                    clean_exit_output_tree_blake3_hex: None,
+                    forge_session_id: Some(seeded.session_id.into_uuid().to_string()),
+                },
+            )
+            .await?;
+        assert_eq!(dispatched.supervision.exit_code, Some(0));
+        assert_eq!(dispatched.disposition.kind, "COMPLETED");
+        assert!(
+            dispatched
+                .disposition
+                .member
+                .last_output_commit_oid
+                .is_some()
+        );
+        assert!(
+            dispatched
+                .disposition
+                .member
+                .last_output_tree_blake3_hex
+                .is_some()
+        );
+        assert!(!seeded.workspace_root.join("e2e7_settled.txt").exists());
+        Ok(())
+    }
+
+    async fn verify_settle_gating_and_finalize(
+        client: &OrchestrationHttpClient,
+        auth: &HeaderValue,
+        ws: Uuid,
+        run_id: Uuid,
+        verifier_id: Uuid,
+        diff_hex: &str,
+        seeded: &SeededForgeState,
+    ) -> TestResult {
+        let premature = client
+            .forge_settle_swarm_run(
+                auth,
+                ws,
+                run_id,
+                &ForgeSettleSwarmRequest {
+                    request_id: Uuid::now_v7().to_string(),
+                    session_id: seeded.session_id.into_uuid().to_string(),
+                    activity_id: Some(seeded.activity_id.into_uuid().to_string()),
+                    coordinator_agent_id: seeded.coordinator_agent_id.into_uuid().to_string(),
+                    outbox_migration_id: Some(seeded.migration_id.to_string()),
+                    outbox_after_sequence: Some(0),
+                    purge_ephemeral: true,
+                },
+            )
+            .await;
+        assert_eq!(
+            premature,
+            Err(ClientError::Rejected {
+                status: 409,
+                code: ServiceCode::Conflict,
+            })
+        );
+        assert!(!seeded.workspace_root.join("e2e7_settled.txt").exists());
+
+        let verdict = client
+            .record_swarm_verdict(
+                auth,
+                ws,
+                run_id,
+                &RecordSwarmVerdictRequest {
+                    request_id: Uuid::now_v7().to_string(),
+                    panel_id: None,
+                    verifier_member_id: verifier_id.to_string(),
+                    outcome: "ACCEPTED".to_owned(),
+                    reviewed_diff_digest_hex: diff_hex.to_owned(),
+                    rationale: "verified converged diff".to_owned(),
+                },
+            )
+            .await?;
+        assert_eq!(verdict.outcome, "ACCEPTED");
+
+        let settled = client
+            .forge_settle_swarm_run(
+                auth,
+                ws,
+                run_id,
+                &ForgeSettleSwarmRequest {
+                    request_id: Uuid::now_v7().to_string(),
+                    session_id: seeded.session_id.into_uuid().to_string(),
+                    activity_id: Some(seeded.activity_id.into_uuid().to_string()),
+                    coordinator_agent_id: seeded.coordinator_agent_id.into_uuid().to_string(),
+                    outbox_migration_id: Some(seeded.migration_id.to_string()),
+                    outbox_after_sequence: Some(0),
+                    purge_ephemeral: true,
+                },
+            )
+            .await?;
+        assert_eq!(settled.run.state, "SETTLED");
+        assert!(settled.settled_file_count >= 1);
+        assert!(settled.purged_ephemeral);
+        assert_eq!(settled.outbox_sequence, Some(1));
+        let sync_receipt = settled.outbox_sync.ok_or("missing outbox_sync receipt")?;
+        assert_eq!(sync_receipt.applied_count, 1);
+        assert_eq!(sync_receipt.swarm_settled_count, 1);
+        assert_eq!(sync_receipt.last_sequence, 1);
+
+        let disk_content = fs::read_to_string(seeded.workspace_root.join("e2e7_settled.txt"))?;
+        assert_eq!(disk_content, "settled from live east-west swarm\n");
+
+        verify_replay_and_mismatched_settle(client, auth, ws, run_id, seeded).await
+    }
+
+    async fn verify_replay_and_mismatched_settle(
+        client: &OrchestrationHttpClient,
+        auth: &HeaderValue,
+        ws: Uuid,
+        run_id: Uuid,
+        seeded: &SeededForgeState,
+    ) -> TestResult {
+        let replay_sync = client
+            .sync_autonomy_outbox(
+                auth,
+                ws,
+                &SyncAutonomyOutboxRequest {
+                    migration_id: seeded.migration_id.to_string(),
+                    after_sequence: 0,
+                    limit: Some(16),
+                },
+            )
+            .await?;
+        assert_eq!(replay_sync.applied_count, 0);
+        assert_eq!(replay_sync.dag_settled_count, 0);
+        assert_eq!(replay_sync.swarm_settled_count, 0);
+        assert_eq!(replay_sync.last_sequence, 1);
+
+        let mismatched_settle = client
+            .forge_settle_swarm_run(
+                auth,
+                ws,
+                run_id,
+                &ForgeSettleSwarmRequest {
+                    request_id: Uuid::now_v7().to_string(),
+                    session_id: seeded.session_id.into_uuid().to_string(),
+                    activity_id: Some(seeded.activity_id.into_uuid().to_string()),
+                    coordinator_agent_id: seeded.coordinator_agent_id.into_uuid().to_string(),
+                    outbox_migration_id: None,
+                    outbox_after_sequence: None,
+                    purge_ephemeral: false,
+                },
+            )
+            .await;
+        assert_eq!(
+            mismatched_settle,
+            Err(ClientError::Rejected {
+                status: 409,
+                code: ServiceCode::Conflict,
+            })
+        );
+        Ok(())
+    }
+
+    async fn wait_for_expected_sse_kinds(sse: &LiveSseCollector) -> TestResult {
+        let required = [
+            "swarm_run_changed",
+            "swarm_member_state_changed",
+            "swarm_board_message_posted",
+            "swarm_verdict_recorded",
+            "settlement_projected",
+        ];
+        let deadline = Instant::now() + READY_DEADLINE;
+        loop {
+            let observed = sse.kinds.lock().map_err(|_| "sse kinds poisoned")?.clone();
+            if required
+                .iter()
+                .all(|expected| observed.iter().any(|k| k == expected))
+            {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "timed out waiting for SSE kinds {required:?}, observed: {observed:?}"
+                )
+                .into());
+            }
+            let _ = tokio::time::timeout(deadline - now, sse.notify.notified()).await;
+        }
     }
 }

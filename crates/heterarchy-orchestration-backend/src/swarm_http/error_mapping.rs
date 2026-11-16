@@ -97,8 +97,14 @@ pub(super) fn map_swarm_dispatch_error<T>(
         SwarmDispatchError::OperationsCatalogPoisoned
         | SwarmDispatchError::ProfileCatalogPoisoned
         | SwarmDispatchError::InflightGuardPoisoned
-        | SwarmDispatchError::SemaphoreClosed => Err(ApiError::Unavailable),
-        SwarmDispatchError::UnsupportedOutboxFactKind(_)
+        | SwarmDispatchError::SemaphoreClosed
+        | SwarmDispatchError::ForgeBridge("unavailable") => Err(ApiError::Unavailable),
+        SwarmDispatchError::ForgeBridge("denied") => Ok(SwarmReply::DomainRejected(
+            StatusCode::FORBIDDEN,
+            SwarmErrorResponse::permanent("FORGE_BRIDGE_DENIED", error.to_string()),
+        )),
+        SwarmDispatchError::ForgeBridge(_)
+        | SwarmDispatchError::UnsupportedOutboxFactKind(_)
         | SwarmDispatchError::OutboxDestinationMismatch { .. }
         | SwarmDispatchError::OutboxSequenceRegression { .. }
         | SwarmDispatchError::OutboxDigestMismatch => Ok(SwarmReply::DomainRejected(

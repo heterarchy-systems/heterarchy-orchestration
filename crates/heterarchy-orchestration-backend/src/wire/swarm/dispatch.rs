@@ -34,6 +34,7 @@ pub struct DispatchSwarmTurnRequest {
     pub snapshot_request_id: String,
     pub snapshot_id: String,
     pub activity_id: String,
+    #[serde(default)]
     pub default_worktree_path: String,
     pub lease_id: String,
     pub lease_revision: u64,
@@ -48,6 +49,8 @@ pub struct DispatchSwarmTurnRequest {
     pub clean_exit_output_commit_oid: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clean_exit_output_tree_blake3_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge_session_id: Option<String>,
 }
 
 impl DispatchSwarmTurnRequest {
@@ -92,21 +95,29 @@ impl DispatchSwarmTurnRequest {
             Some(ts) => ts,
             None => fallback_dispatched_at_ms,
         };
+        if let Some(raw_session_id) = &self.forge_session_id {
+            let _ = canonical_uuid(raw_session_id)?;
+        }
         let clean_exit_output = parse_clean_exit_output(
             self.clean_exit_output_commit_oid.as_deref(),
             self.clean_exit_output_tree_blake3_hex.as_deref(),
         )?;
-        let default_worktree =
-            match ForgeWorktreeRef::new(PathBuf::from(&self.default_worktree_path)) {
-                Ok(valid) => valid,
-                Err(SnapshotValidationError::ForbiddenSsdBuildWorktree) => {
-                    return Ok(Err(SwarmErrorResponse::permanent(
-                        "FORBIDDEN_SSD_BUILD_WORKTREE",
-                        "Swarm worktrees under /Volumes/256.SSD/RustBuild are strictly forbidden",
-                    )));
-                }
-                Err(_) => return Err(ApiError::Runtime(RuntimeError::InvalidInput)),
+        let raw_worktree =
+            if self.default_worktree_path.trim().is_empty() && self.forge_session_id.is_some() {
+                "/var/tmp/heterarchy-forge-auto-provision"
+            } else {
+                self.default_worktree_path.as_str()
             };
+        let default_worktree = match ForgeWorktreeRef::new(PathBuf::from(raw_worktree)) {
+            Ok(valid) => valid,
+            Err(SnapshotValidationError::ForbiddenSsdBuildWorktree) => {
+                return Ok(Err(SwarmErrorResponse::permanent(
+                    "FORBIDDEN_SSD_BUILD_WORKTREE",
+                    "Swarm worktrees under /Volumes/256.SSD/RustBuild are strictly forbidden",
+                )));
+            }
+            Err(_) => return Err(ApiError::Runtime(RuntimeError::InvalidInput)),
+        };
 
         Ok(Ok(SwarmDispatchTurnRequest {
             snapshot_request_id,
@@ -162,6 +173,7 @@ impl From<&SwarmDispatchTurnRequest> for DispatchSwarmTurnRequest {
             dispatched_at_ms: Some(req.dispatched_at_ms),
             clean_exit_output_commit_oid,
             clean_exit_output_tree_blake3_hex,
+            forge_session_id: None,
         }
     }
 }

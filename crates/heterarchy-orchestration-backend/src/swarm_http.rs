@@ -9,6 +9,7 @@
 //! deterministic zero-token Rust stall/livelock remediation.
 
 mod error_mapping;
+mod forge_bridge;
 mod projections;
 
 use axum::{
@@ -24,11 +25,12 @@ use heterarchy_orchestration_operations::{
     FailOrSuspendSwarmTurnCommand, KillSwarmMemberCommand, MAX_SWARM_BOARD_PAGE_SIZE,
     MessageContext, PostSwarmMessageCommand, ReadSwarmBoardQuery, RecordSwarmVerdictCommand,
     SWARM_MAIN_CHANNEL_NAME, SettleStandaloneSwarmCommand, SubscribeSwarmChannelCommand,
-    SwarmError, SwarmMemberIdentity, SwarmMessageAuthor,
+    SwarmError, SwarmMemberIdentity, SwarmMemberState, SwarmMessageAuthor, SwarmRunState,
 };
 use heterarchy_orchestration_runtime::{RuntimeError, SwitchSwarmMemberModelCommand};
 use uuid::Uuid;
 
+use crate::realtime::RealtimeEventKind;
 use crate::wire::autonomy_loop::parse_review_verdict_outcome;
 use crate::wire::swarm::{
     AbortSwarmRunRequest, AddSwarmMemberRequest, ClaimSwarmWakeupRequest, CompleteSwarmTurnRequest,
@@ -117,8 +119,16 @@ pub(crate) fn routes() -> Router<BackendState> {
             post(converge_swarm),
         )
         .route(
+            "/v1/workspaces/{workspace_id}/swarms/{swarm_run_id}/forge-converge",
+            post(forge_bridge::forge_converge_swarm),
+        )
+        .route(
             "/v1/workspaces/{workspace_id}/swarms/{swarm_run_id}/settle",
             post(settle_swarm),
+        )
+        .route(
+            "/v1/workspaces/{workspace_id}/swarms/{swarm_run_id}/forge-settle",
+            post(forge_bridge::forge_settle_swarm),
         )
         .route(
             "/v1/workspaces/{workspace_id}/swarms/{swarm_run_id}/abort",
@@ -127,6 +137,10 @@ pub(crate) fn routes() -> Router<BackendState> {
         .route(
             "/v1/workspaces/{workspace_id}/swarms/{swarm_run_id}/stall-check",
             post(check_stall),
+        )
+        .route(
+            "/internal/v1/workspaces/{workspace_id}/autonomy-outbox/sync",
+            post(forge_bridge::sync_autonomy_outbox),
         )
         .layer(DefaultBodyLimit::max(MAX_SWARM_HTTP_BODY_BYTES))
 }
@@ -201,6 +215,7 @@ async fn create_swarm(
         baseline_tree_blake3,
         created_at_ms,
     };
+    let publisher = state.clone();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
             let run = match runtime.create_swarm_run(&command)? {
@@ -216,6 +231,14 @@ async fn create_swarm(
                 Ok(None) => return Ok(Err(SwarmError::NotFound("swarm main channel"))),
                 Err(err) => return Ok(Err(err)),
             };
+            if !run.replayed() {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmRunChanged,
+                    run.swarm_run_id(),
+                    run.revision(),
+                    Some(workspace_uuid),
+                );
+            }
             Ok(Ok((run, main_channel)))
         })
         .await?;
@@ -307,9 +330,27 @@ async fn create_channel(
         created_by_member_id,
         created_at_ms,
     };
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.create_swarm_channel(&command)
+            let already_existed = matches!(
+                runtime.get_swarm_run_snapshot(workspace_id, swarm_run_id)?,
+                Ok(Some(snap))
+                    if snap.channels().iter().any(|ch| ch.channel_id() == command.channel_id)
+            );
+            let created = runtime.create_swarm_channel(&command)?;
+            if let Ok(ref channel) = created
+                && !already_existed
+            {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmChannelChanged,
+                    channel.channel_id(),
+                    1,
+                    Some(ws_uuid),
+                );
+            }
+            Ok(created)
         })
         .await?;
     match outcome {
@@ -339,9 +380,20 @@ async fn subscribe_channel(
         member_id,
         subscribed_at_ms,
     };
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.subscribe_swarm_channel(command)
+            let subscribed = runtime.subscribe_swarm_channel(command)?;
+            if let Ok(true) = subscribed {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmChannelChanged,
+                    channel_id,
+                    1,
+                    Some(ws_uuid),
+                );
+            }
+            Ok(subscribed)
         })
         .await?;
     match outcome {
@@ -393,8 +445,28 @@ async fn add_member(
         initial_channels: request.initial_channels,
         added_at_ms,
     };
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
-        .run_operator_mutation(principal, move |runtime| runtime.add_swarm_member(&command))
+        .run_operator_mutation(principal, move |runtime| {
+            let already_existed = matches!(
+                runtime.get_swarm_run_snapshot(workspace_id, swarm_run_id)?,
+                Ok(Some(snap))
+                    if snap.members().iter().any(|m| m.member_id() == command.member_id)
+            );
+            let added = runtime.add_swarm_member(&command)?;
+            if let Ok(ref member) = added
+                && !already_existed
+            {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmMemberStateChanged,
+                    member.member_id(),
+                    member.attempt_epoch().max(1),
+                    Some(ws_uuid),
+                );
+            }
+            Ok(added)
+        })
         .await?;
     match outcome {
         Ok(member) => Ok(SwarmReply::Success(
@@ -420,8 +492,35 @@ async fn kill_member(
         member_id,
         killed_at_ms,
     };
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
-        .run_operator_mutation(principal, move |runtime| runtime.kill_swarm_member(command))
+        .run_operator_mutation(principal, move |runtime| {
+            let previously_killed =
+                match runtime.get_swarm_run_snapshot(workspace_id, swarm_run_id)? {
+                    Ok(Some(snap)) => snap
+                        .members()
+                        .iter()
+                        .filter(|m| m.member_state() == SwarmMemberState::Killed)
+                        .map(heterarchy_orchestration_operations::SwarmMemberRecord::member_id)
+                        .collect::<std::collections::BTreeSet<_>>(),
+                    _ => std::collections::BTreeSet::new(),
+                };
+            let result = runtime.kill_swarm_member(command)?;
+            if let Ok(ref killed) = result {
+                for member in killed {
+                    if !previously_killed.contains(&member.member_id()) {
+                        publisher.publish_state_changed(
+                            RealtimeEventKind::SwarmMemberStateChanged,
+                            member.member_id(),
+                            member.attempt_epoch().max(1),
+                            Some(ws_uuid),
+                        );
+                    }
+                }
+            }
+            Ok(result)
+        })
         .await?;
     match outcome {
         Ok(killed) => Ok(SwarmReply::Success(
@@ -454,6 +553,8 @@ async fn post_message(
     };
     let submitted_at_ms = current_timestamp_millis()?;
     let body = request.body;
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
             let channel_id = match explicit_channel_id {
@@ -480,7 +581,18 @@ async fn post_message(
                 context: MessageContext::default(),
                 submitted_at_ms,
             };
-            runtime.post_swarm_message(&command)
+            let posted = runtime.post_swarm_message(&command)?;
+            if let Ok(ref outcome) = posted
+                && !outcome.replayed()
+            {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmBoardMessagePosted,
+                    outcome.message().message_id(),
+                    outcome.message().sequence().max(1),
+                    Some(ws_uuid),
+                );
+            }
+            Ok(posted)
         })
         .await?;
     match outcome {
@@ -552,9 +664,20 @@ async fn claim_wakeup_turn(
         snapshot_id,
         claimed_at_ms,
     };
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.claim_swarm_wakeup_batch(command)
+            let claimed = runtime.claim_swarm_wakeup_batch(command)?;
+            if let Ok(ref batch) = claimed {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmMemberStateChanged,
+                    batch.member().member_id(),
+                    batch.member().attempt_epoch().max(1),
+                    Some(ws_uuid),
+                );
+            }
+            Ok(claimed)
         })
         .await?;
     match outcome {
@@ -585,9 +708,20 @@ async fn complete_member_turn(
         output,
         completed_at_ms,
     };
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.complete_swarm_member_turn(&command)
+            let completed = runtime.complete_swarm_member_turn(&command)?;
+            if let Ok(ref member) = completed {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmMemberStateChanged,
+                    member.member_id(),
+                    member.attempt_epoch().max(1),
+                    Some(ws_uuid),
+                );
+            }
+            Ok(completed)
         })
         .await?;
     match outcome {
@@ -619,9 +753,20 @@ async fn fail_or_suspend_member_turn(
         consume_turn: request.consume_turn,
         observed_at_ms,
     };
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.fail_or_suspend_swarm_member_turn(command)
+            let released = runtime.fail_or_suspend_swarm_member_turn(command)?;
+            if let Ok(ref member) = released {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmMemberStateChanged,
+                    member.member_id(),
+                    member.attempt_epoch().max(1),
+                    Some(ws_uuid),
+                );
+            }
+            Ok(released)
         })
         .await?;
     match outcome {
@@ -647,6 +792,15 @@ async fn dispatch_member_turn(
             Ok(valid) => valid,
             Err(rejected) => return Ok(SwarmReply::DomainRejected(StatusCode::CONFLICT, rejected)),
         };
+    if let Some(raw_session_id) = forge_bridge::should_use_forge_bridge(&request) {
+        return forge_bridge::dispatch_with_forge_session(
+            &state,
+            principal,
+            dispatch_request,
+            raw_session_id,
+        )
+        .await;
+    }
     match state
         .run_swarm_dispatch(principal, dispatch_request)
         .await?
@@ -676,9 +830,20 @@ async fn switch_member_model(
         target,
         updated_at_ms,
     };
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.switch_swarm_member_model_and_requeue(&command)
+            let switched = runtime.switch_swarm_member_model_and_requeue(&command)?;
+            if let Ok(ref res) = switched {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmMemberStateChanged,
+                    res.member.member_id(),
+                    res.member.attempt_epoch().max(1),
+                    Some(ws_uuid),
+                );
+            }
+            Ok(switched)
         })
         .await?;
     match outcome {
@@ -769,9 +934,22 @@ async fn record_verdict(
         rationale: request.rationale,
         recorded_at_ms,
     };
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let result = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.record_swarm_verdict(&command)
+            let recorded = runtime.record_swarm_verdict(&command)?;
+            if let Ok(ref verdict) = recorded
+                && !verdict.replayed()
+            {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmVerdictRecorded,
+                    verdict.verdict_id(),
+                    1,
+                    Some(ws_uuid),
+                );
+            }
+            Ok(recorded)
         })
         .await?;
     match result {
@@ -822,9 +1000,22 @@ async fn converge_swarm(
         stage_candidate_only: request.stage_candidate_only,
         observed_at_ms,
     };
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
-            execute_converge_swarm(runtime, &input)
+            let converged = execute_converge_swarm(runtime, &input)?;
+            if let Ok((ref run, _, _)) = converged
+                && !run.replayed()
+            {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmRunChanged,
+                    run.swarm_run_id(),
+                    run.revision(),
+                    Some(ws_uuid),
+                );
+            }
+            Ok(converged)
         })
         .await?;
     match outcome {
@@ -856,6 +1047,8 @@ async fn settle_swarm(
         swarm_run_id,
         settled_at_ms,
     };
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
             let settled_run = match runtime.settle_standalone_swarm_run(command)? {
@@ -866,6 +1059,14 @@ async fn settle_swarm(
                 Ok(gate) => gate,
                 Err(err) => return Ok(Err(err)),
             };
+            if !settled_run.replayed() {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmRunChanged,
+                    settled_run.swarm_run_id(),
+                    settled_run.revision(),
+                    Some(ws_uuid),
+                );
+            }
             Ok(Ok((settled_run, gate)))
         })
         .await?;
@@ -891,9 +1092,26 @@ async fn abort_swarm(
     let (workspace_id, swarm_run_id) =
         authorize_run_scope(&state, principal, &workspace_path, &run_path)?;
     let observed_at_ms = current_timestamp_millis()?;
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.abort_swarm_run(workspace_id, swarm_run_id, observed_at_ms)
+            let was_aborted = matches!(
+                runtime.get_swarm_run(workspace_id, swarm_run_id)?,
+                Ok(Some(existing)) if existing.state() == SwarmRunState::Aborted
+            );
+            let aborted = runtime.abort_swarm_run(workspace_id, swarm_run_id, observed_at_ms)?;
+            if let Ok(ref run) = aborted
+                && !was_aborted
+            {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmRunChanged,
+                    run.swarm_run_id(),
+                    run.revision(),
+                    Some(ws_uuid),
+                );
+            }
+            Ok(aborted)
         })
         .await?;
     match outcome {
@@ -914,14 +1132,30 @@ async fn check_stall(
     let (workspace_id, swarm_run_id) =
         authorize_run_scope(&state, principal, &workspace_path, &run_path)?;
     let (policy, observed_at_ms) = build_stall_policy_and_timestamp(&request)?;
+    let publisher = state.clone();
+    let ws_uuid = workspace_id.into_uuid();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.evaluate_swarm_stall_and_livelock(
+            let evaluated = runtime.evaluate_swarm_stall_and_livelock(
                 workspace_id,
                 swarm_run_id,
                 policy,
                 observed_at_ms,
-            )
+            )?;
+            if let Ok(ref _report) = evaluated {
+                let rev = runtime
+                    .get_swarm_run(workspace_id, swarm_run_id)?
+                    .ok()
+                    .flatten()
+                    .map_or(1, |run| run.revision().max(1));
+                publisher.publish_state_changed(
+                    RealtimeEventKind::SwarmStallEvaluated,
+                    swarm_run_id,
+                    rev,
+                    Some(ws_uuid),
+                );
+            }
+            Ok(evaluated)
         })
         .await?;
     match outcome {

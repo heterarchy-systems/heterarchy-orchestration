@@ -33,6 +33,7 @@ use heterarchy_orchestration_sessions::{
 };
 use uuid::Uuid;
 
+use crate::realtime::RealtimeEventKind;
 use crate::wire::autonomy_loop::{
     AssignReviewerRequest, DagSettlementAuthorityCheckRequest, DagSettlementAuthorityResponse,
     DagSettlementGovernanceQuery, DagSettlementGovernanceResponse, ExecutionAuthorWire,
@@ -144,13 +145,24 @@ async fn register_scope(
     )
     .map_err(RuntimeError::from)
     .map_err(ApiError::Runtime)?;
+    let workspace_id = request.scope.workspace_id;
     let command =
         ScopeRegistrationCommand::new(request_id, request.expected_revision, scope, observed_at_ms)
             .map_err(RuntimeError::from)
             .map_err(ApiError::Runtime)?;
+    let publisher = state.clone();
     let record = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.register_workspace_scope(&command)
+            let record = runtime.register_workspace_scope(&command)?;
+            if !record.replayed() {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::WorkspaceScopeChanged,
+                    workspace_id,
+                    record.revision(),
+                    Some(workspace_id),
+                );
+            }
+            Ok(record)
         })
         .await?;
     Ok(Json(RegisteredWorkspaceScopeResponse::from(&record)))
@@ -173,9 +185,19 @@ async fn unregister_scope(
     )
     .map_err(RuntimeError::from)
     .map_err(ApiError::Runtime)?;
+    let publisher = state.clone();
     let record = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.unregister_workspace_scope(&command)
+            let record = runtime.unregister_workspace_scope(&command)?;
+            if !record.replayed() {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::WorkspaceScopeChanged,
+                    workspace_id,
+                    record.revision(),
+                    Some(workspace_id),
+                );
+            }
+            Ok(record)
         })
         .await?;
     Ok(Json(RegisteredWorkspaceScopeResponse::from(&record)))
@@ -212,9 +234,21 @@ async fn assign_reviewer(
         qualification_domain: Some(domain),
         assigned_at_ms,
     };
+    let publisher = state.clone();
     let outcome = state
         .run_operator_mutation(principal, move |runtime| {
-            runtime.assign_independent_reviewer(&command)
+            let outcome = runtime.assign_independent_reviewer(&command)?;
+            if let Ok(ref record) = outcome
+                && !record.replayed()
+            {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::ReviewerAssignmentChanged,
+                    record.assignment_record_id(),
+                    record.revision(),
+                    Some(workspace_id),
+                );
+            }
+            Ok(outcome)
         })
         .await?;
     map_reviewer_outcome(outcome)
@@ -246,6 +280,7 @@ async fn record_verdict(
     }
     let expected_revision = request.expected_revision;
     let recorded_at_ms = current_timestamp_millis()?;
+    let publisher = state.clone();
     let result = state
         .run_operator_mutation(principal, move |runtime| {
             let Some(existing) = runtime.get_reviewer_assignment(correlation)? else {
@@ -291,7 +326,19 @@ async fn record_verdict(
                 ),
                 recorded_at_ms,
             };
-            runtime.record_review_verdict(&command)
+            let recorded = runtime.record_review_verdict(&command)?;
+            if let Ok(ref record) = recorded
+                && record.verdict().is_some()
+                && !record.replayed()
+            {
+                publisher.publish_state_changed(
+                    RealtimeEventKind::ReviewerVerdictRecorded,
+                    record.assignment_record_id(),
+                    record.revision(),
+                    Some(workspace_id),
+                );
+            }
+            Ok(recorded)
         })
         .await?;
     map_reviewer_outcome(result)
@@ -332,9 +379,25 @@ async fn prepare_execution_snapshot(
             map_snapshot_validation_error(&validation_err)
         }
         Ok((request_id, parts)) => {
+            let publisher = state.clone();
             let outcome = state
                 .run_operator_mutation(principal, move |runtime| {
-                    runtime.prepare_assignment_execution_snapshot(request_id, parts)
+                    let already_existed = runtime
+                        .get_assignment_execution_snapshot(parts.attempt_key)?
+                        .is_some();
+                    let outcome =
+                        runtime.prepare_assignment_execution_snapshot(request_id, parts)?;
+                    if let Ok(ref record) = outcome
+                        && !already_existed
+                    {
+                        publisher.publish_state_changed(
+                            RealtimeEventKind::ExecutionSnapshotCommitted,
+                            record.snapshot_id(),
+                            record.revision(),
+                            Some(workspace_id),
+                        );
+                    }
+                    Ok(outcome)
                 })
                 .await?;
             match outcome {

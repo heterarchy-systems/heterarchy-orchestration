@@ -9,7 +9,16 @@ mod departure;
 pub(crate) use departure::HandoffTargetSelector;
 mod home_transfer;
 mod membership;
+#[cfg_attr(not(test), allow(dead_code))]
+mod swarm_bridge;
 pub(crate) use home_transfer::ConfiguredHomeTransferSource;
+#[allow(unused_imports)]
+pub(crate) use swarm_bridge::{
+    ForgeAutonomyOutboxPageInput, ForgeSwarmCaptureInput, ForgeSwarmConvergeBridgeOutcome,
+    ForgeSwarmConvergeInput, ForgeSwarmHybridMaterializeBridgeOutcome,
+    ForgeSwarmHybridMaterializeInput, ForgeSwarmProvisionInput, ForgeSwarmPurgeInput,
+    ForgeSwarmSettleBridgeOutcome, ForgeSwarmSettleInput, ForgeSwarmWorkspaceProvisioned,
+};
 
 use forge_backend::{ForgeHttpClientError, ForgeHttpServiceCode};
 use forge_control::{

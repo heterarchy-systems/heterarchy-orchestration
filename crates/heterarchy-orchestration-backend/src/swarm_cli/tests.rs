@@ -434,3 +434,170 @@ async fn execute_rejects_missing_whitespace_and_oversized_bearer_files()
     ));
     Ok(())
 }
+
+#[test]
+fn forge_converge_and_settle_subcommands_parse_cleanly() -> Result<(), Box<dyn Error>> {
+    let ws = Uuid::from_u128(0x501);
+    let run_id = Uuid::from_u128(0x502);
+    let member_id = Uuid::from_u128(0x503);
+    let session_id = Uuid::from_u128(0x504);
+    let coord_id = Uuid::from_u128(0x505);
+    let migration_id = Uuid::from_u128(0x506);
+
+    let SwarmCliCommand::Run(conv) = parse_with_env(
+        &args(&[
+            "swarm",
+            "forge-converge",
+            "--bearer-file",
+            "/var/tmp/tok",
+            "--workspace-id",
+            &ws.to_string(),
+            "--swarm-run-id",
+            &run_id.to_string(),
+            "--session-id",
+            &session_id.to_string(),
+            "--candidate-member-id",
+            &member_id.to_string(),
+            "--stage-candidate-only",
+        ]),
+        no_env,
+    )?
+    else {
+        return Err("expected forge-converge Run".into());
+    };
+    assert!(matches!(
+        conv.action(),
+        SwarmAction::ForgeConverge {
+            workspace_id,
+            swarm_run_id,
+            payload: SwarmPayload::Inline(req),
+        } if (*workspace_id, *swarm_run_id) == (ws, run_id)
+            && req.session_id == session_id.to_string()
+            && req.candidate_member_ids == vec![member_id.to_string()]
+            && req.stage_candidate_only
+    ));
+
+    let SwarmCliCommand::Run(settle) = parse_with_env(
+        &args(&[
+            "swarm",
+            "forge-settle",
+            "--bearer-file",
+            "/var/tmp/tok",
+            "--workspace-id",
+            &ws.to_string(),
+            "--swarm-run-id",
+            &run_id.to_string(),
+            "--session-id",
+            &session_id.to_string(),
+            "--coordinator-agent-id",
+            &coord_id.to_string(),
+            "--outbox-migration-id",
+            &migration_id.to_string(),
+            "--outbox-after-sequence",
+            "2",
+            "--purge-ephemeral",
+        ]),
+        no_env,
+    )?
+    else {
+        return Err("expected forge-settle Run".into());
+    };
+    assert!(matches!(
+        settle.action(),
+        SwarmAction::ForgeSettle {
+            workspace_id,
+            swarm_run_id,
+            payload: SwarmPayload::Inline(req),
+        } if (*workspace_id, *swarm_run_id) == (ws, run_id)
+            && req.coordinator_agent_id == coord_id.to_string()
+            && req.outbox_migration_id.as_deref() == Some(migration_id.to_string().as_str())
+            && req.outbox_after_sequence == Some(2)
+            && req.purge_ephemeral
+    ));
+    Ok(())
+}
+
+#[test]
+fn outbox_sync_and_dispatch_forge_session_id_parse_cleanly() -> Result<(), Box<dyn Error>> {
+    let ws = Uuid::from_u128(0x501);
+    let run_id = Uuid::from_u128(0x502);
+    let member_id = Uuid::from_u128(0x503);
+    let session_id = Uuid::from_u128(0x504);
+    let migration_id = Uuid::from_u128(0x506);
+
+    let SwarmCliCommand::Run(sync) = parse_with_env(
+        &args(&[
+            "swarm",
+            "outbox-sync",
+            "--bearer-file",
+            "/var/tmp/tok",
+            "--workspace-id",
+            &ws.to_string(),
+            "--migration-id",
+            &migration_id.to_string(),
+            "--after-sequence",
+            "0",
+            "--limit",
+            "32",
+        ]),
+        no_env,
+    )?
+    else {
+        return Err("expected outbox-sync Run".into());
+    };
+    assert!(matches!(
+        sync.action(),
+        SwarmAction::OutboxSync {
+            workspace_id,
+            payload: SwarmPayload::Inline(req),
+        } if *workspace_id == ws
+            && req.migration_id == migration_id.to_string()
+            && req.limit == Some(32)
+    ));
+
+    let SwarmCliCommand::Run(disp) = parse_with_env(
+        &args(&[
+            "swarm",
+            "dispatch",
+            "--bearer-file",
+            "/var/tmp/tok",
+            "--workspace-id",
+            &ws.to_string(),
+            "--swarm-run-id",
+            &run_id.to_string(),
+            "--member-id",
+            &member_id.to_string(),
+            "--snapshot-id",
+            &Uuid::from_u128(0x507).to_string(),
+            "--activity-id",
+            &Uuid::from_u128(0x508).to_string(),
+            "--lease-id",
+            &Uuid::from_u128(0x509).to_string(),
+            "--lease-revision",
+            "1",
+            "--lease-expires-at-ms",
+            "10000",
+            "--startup-timeout-ms",
+            "1000",
+            "--execution-timeout-ms",
+            "5000",
+            "--termination-grace-ms",
+            "1000",
+            "--forge-session-id",
+            &session_id.to_string(),
+        ]),
+        no_env,
+    )?
+    else {
+        return Err("expected dispatch Run".into());
+    };
+    assert!(matches!(
+        disp.action(),
+        SwarmAction::Dispatch {
+            payload: SwarmPayload::Inline(req),
+            ..
+        } if req.forge_session_id.as_deref() == Some(session_id.to_string().as_str())
+            && req.default_worktree_path.is_empty()
+    ));
+    Ok(())
+}

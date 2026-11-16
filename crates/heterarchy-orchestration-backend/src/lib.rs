@@ -426,6 +426,7 @@ struct BackendState {
     coordinator_authority: Option<coordinator_authority::CoordinatorAuthority>,
     forge_query_slots: Arc<Semaphore>,
     swarm_dispatcher: Arc<SwarmRuntimeDispatcher<LocalProcessRunner>>,
+    autonomy_outbox: heterarchy_orchestration_runtime::AutonomyOutboxBridge,
 }
 
 impl BackendState {
@@ -439,6 +440,7 @@ impl BackendState {
             runtime.as_ref(),
             LocalProcessRunner::default(),
         ));
+        let autonomy_outbox = runtime.autonomy_outbox_bridge();
         Self {
             runtime,
             catalog_execution: CatalogExecution::new(),
@@ -446,6 +448,7 @@ impl BackendState {
             coordinator_authority: None,
             forge_query_slots: Arc::new(Semaphore::new(4)),
             swarm_dispatcher,
+            autonomy_outbox,
         }
     }
 
@@ -776,13 +779,94 @@ impl BackendState {
         >,
         ApiError,
     > {
-        self.run_operator_mutation(principal, move |runtime| {
-            runtime.require_operator(principal)
-        })
-        .await?;
+        self.run_swarm_dispatch_with_clean_exit_hook(principal, request, |_, _| async { Ok(None) })
+            .await
+    }
+
+    /// Authorize an operator + Broker owner and supervise a `SwarmRuntimeDispatcher`
+    /// turn with a clean-exit capture hook inside `catalog_execution.tasks`, publishing
+    /// [`RealtimeEventKind::SwarmMemberStateChanged`] once the turn outcome is durable.
+    pub(crate) async fn run_swarm_dispatch_with_clean_exit_hook<F, Fut>(
+        &self,
+        principal: forge_domain::AuthenticatedPrincipal,
+        request: heterarchy_orchestration_runtime::SwarmDispatchTurnRequest,
+        on_clean_exit: F,
+    ) -> Result<
+        Result<
+            heterarchy_orchestration_runtime::SwarmDispatchedTurnOutcome,
+            heterarchy_orchestration_runtime::SwarmDispatchError,
+        >,
+        ApiError,
+    >
+    where
+        F: FnOnce(
+                &heterarchy_orchestration_runtime::SwarmDispatchTurnRequest,
+                &heterarchy_orchestration_operations::AssignmentExecutionSnapshot,
+            ) -> Fut
+            + Send
+            + 'static,
+        Fut: Future<
+                Output = Result<
+                    Option<heterarchy_orchestration_operations::SwarmTurnOutput>,
+                    heterarchy_orchestration_runtime::SwarmDispatchError,
+                >,
+            > + Send
+            + 'static,
+    {
+        let pre_member = self
+            .run_operator_mutation(principal, {
+                let ws = request.workspace_id;
+                let run_id = request.swarm_run_id;
+                let member_id = request.member_id;
+                move |runtime| {
+                    runtime.require_operator(principal)?;
+                    let snap = runtime.get_swarm_run_snapshot(ws, run_id)?.ok().flatten();
+                    Ok(snap.and_then(|s| {
+                        s.members()
+                            .iter()
+                            .find(|m| m.member_id() == member_id)
+                            .map(|m| (m.member_state(), m.attempt_epoch()))
+                    }))
+                }
+            })
+            .await?;
         let dispatcher = Arc::clone(&self.swarm_dispatcher);
+        let publisher = self.clone();
+        let ws_domain = request.workspace_id;
+        let run_id = request.swarm_run_id;
+        let member_id = request.member_id;
+        let workspace_id = ws_domain.into_uuid();
         let receiver = self.catalog_execution.spawn_swarm_dispatch(async move {
-            Ok(dispatcher.dispatch_member_turn(request).await)
+            let outcome = dispatcher
+                .dispatch_member_turn_with_clean_exit_hook(request, on_clean_exit)
+                .await;
+            match outcome {
+                Ok(ref turn_outcome) => {
+                    let member = turn_outcome.disposition.member();
+                    publisher.publish_state_changed(
+                        RealtimeEventKind::SwarmMemberStateChanged,
+                        member.member_id(),
+                        member.attempt_epoch().max(1),
+                        Some(workspace_id),
+                    );
+                }
+                Err(_) => {
+                    if let Some(pre) = pre_member
+                        && let Ok(Ok(Some(snap))) =
+                            publisher.runtime.get_swarm_run_snapshot(ws_domain, run_id)
+                        && let Some(m) = snap.members().iter().find(|m| m.member_id() == member_id)
+                        && (m.member_state(), m.attempt_epoch()) != pre
+                    {
+                        publisher.publish_state_changed(
+                            RealtimeEventKind::SwarmMemberStateChanged,
+                            m.member_id(),
+                            m.attempt_epoch().max(1),
+                            Some(workspace_id),
+                        );
+                    }
+                }
+            }
+            Ok(outcome)
         })?;
         receiver.await.map_err(|_| ApiError::Unavailable)?
     }
@@ -1266,6 +1350,10 @@ fn router(state: BackendState, authorizer: auth::BearerAuthorizer) -> Router {
         .route("/internal/v1/events", get(event_routes::global))
         .route(
             "/internal/v1/workspaces/{workspace_id}/events",
+            get(event_routes::workspace),
+        )
+        .route(
+            "/v1/workspaces/{workspace_id}/events",
             get(event_routes::workspace),
         )
         .route(

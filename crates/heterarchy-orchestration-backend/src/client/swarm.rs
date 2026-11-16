@@ -15,16 +15,17 @@ use crate::wire::swarm::{
     AbortSwarmRunRequest, AddSwarmMemberRequest, ClaimSwarmWakeupRequest, CompleteSwarmTurnRequest,
     ConvergeSwarmRequest, ConvergeSwarmResponse, CreateSwarmChannelRequest, CreateSwarmRunRequest,
     CreateSwarmRunResponse, CreateSwarmVerificationPanelRequest, DispatchSwarmTurnRequest,
-    DispatchSwarmTurnResponse, FailSwarmTurnRequest, KillSwarmMemberRequest,
-    KillSwarmMemberResponse, ListSwarmRunsQuery, PostSwarmMessageRequest, PostSwarmMessageResponse,
-    ReadSwarmMessagesQuery, RecordSwarmVerdictRequest, SettleSwarmRequest,
-    SubscribeSwarmChannelRequest, SubscribeSwarmChannelResponse, SwarmBoardPageResponse,
-    SwarmChannelWire, SwarmMemberWire, SwarmModelSwitchResponse, SwarmRunInspectionResponse,
-    SwarmRunListResponse, SwarmRunWire, SwarmStallCheckRequest, SwarmStallCheckResponse,
-    SwarmVerdictWire, SwarmVerificationPanelWire, SwarmWakeupBatchWire,
-    SwitchSwarmMemberModelRequest, parse_non_zero_digest_hex, parse_swarm_commit_oid,
-    parse_swarm_convergence_target, parse_swarm_role_kind, parse_swarm_turn_failure_disposition,
-    parse_swarm_workspace_mode,
+    DispatchSwarmTurnResponse, FailSwarmTurnRequest, ForgeConvergeSwarmRequest,
+    ForgeConvergeSwarmResponse, ForgeSettleSwarmRequest, ForgeSettleSwarmResponse,
+    KillSwarmMemberRequest, KillSwarmMemberResponse, ListSwarmRunsQuery, PostSwarmMessageRequest,
+    PostSwarmMessageResponse, ReadSwarmMessagesQuery, RecordSwarmVerdictRequest,
+    SettleSwarmRequest, SubscribeSwarmChannelRequest, SubscribeSwarmChannelResponse,
+    SwarmBoardPageResponse, SwarmChannelWire, SwarmMemberWire, SwarmModelSwitchResponse,
+    SwarmRunInspectionResponse, SwarmRunListResponse, SwarmRunWire, SwarmStallCheckRequest,
+    SwarmStallCheckResponse, SwarmVerdictWire, SwarmVerificationPanelWire, SwarmWakeupBatchWire,
+    SwitchSwarmMemberModelRequest, SyncAutonomyOutboxRequest, SyncAutonomyOutboxResponse,
+    parse_non_zero_digest_hex, parse_swarm_commit_oid, parse_swarm_convergence_target,
+    parse_swarm_role_kind, parse_swarm_turn_failure_disposition, parse_swarm_workspace_mode,
 };
 
 use super::{
@@ -41,7 +42,8 @@ const MAX_SWARM_DISPATCH_TIMEOUT: Duration = Duration::from_mins(15);
 const SWARM_DISPATCH_SLACK_MS: u64 = 5_000;
 
 pub(super) fn is_swarm_path(path: &str) -> bool {
-    path.starts_with("/v1/workspaces/") && path.contains("/swarms")
+    (path.starts_with("/v1/workspaces/") && path.contains("/swarms"))
+        || (path.starts_with("/internal/v1/workspaces/") && path.ends_with("/autonomy-outbox/sync"))
 }
 
 impl OrchestrationHttpClient {
@@ -891,6 +893,127 @@ impl OrchestrationHttpClient {
         }
         Ok(response)
     }
+
+    /// Converge captured Swarm member candidates via Forge 3-way merge and stage `CandidateReady`.
+    ///
+    /// # Errors
+    /// Rejects malformed identities, bounded transport failures, typed service rejections,
+    /// or uncertain convergence outcomes.
+    pub async fn forge_converge_swarm_run(
+        &self,
+        authorization: &HeaderValue,
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        request: &ForgeConvergeSwarmRequest,
+    ) -> Result<ForgeConvergeSwarmResponse, ClientError> {
+        require_identity(workspace_id)?;
+        require_identity(swarm_run_id)?;
+        let nonce = canonical_identity(&request.request_id)?;
+        let _session_id = canonical_identity(&request.session_id)?;
+        for raw_member in &request.candidate_member_ids {
+            let _member_id = canonical_identity(raw_member)?;
+        }
+        let readback = ReadbackTarget::SwarmRunMutation {
+            workspace_id,
+            swarm_run_id,
+            request_id: Some(nonce),
+        };
+        let response: ForgeConvergeSwarmResponse = self
+            .call(
+                authorization,
+                Method::POST,
+                format!("/v1/workspaces/{workspace_id}/swarms/{swarm_run_id}/forge-converge"),
+                Some(request),
+                Some(readback.clone()),
+            )
+            .await?;
+        if response.run.swarm_run_id != swarm_run_id
+            || !valid_swarm_run(&response.run, workspace_id)
+        {
+            return Err(ClientError::UnknownOutcome { readback });
+        }
+        Ok(response)
+    }
+
+    /// Verify the `Verifier` quorum gate and settle a `Standalone` Swarm run across Forge and Orchestration.
+    ///
+    /// # Errors
+    /// Rejects malformed identities, bounded transport failures, typed service rejections,
+    /// or uncertain settlement outcomes.
+    pub async fn forge_settle_swarm_run(
+        &self,
+        authorization: &HeaderValue,
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        request: &ForgeSettleSwarmRequest,
+    ) -> Result<ForgeSettleSwarmResponse, ClientError> {
+        require_identity(workspace_id)?;
+        require_identity(swarm_run_id)?;
+        let nonce = canonical_identity(&request.request_id)?;
+        let _session_id = canonical_identity(&request.session_id)?;
+        let _coordinator_agent_id = canonical_identity(&request.coordinator_agent_id)?;
+        if let Some(raw_activity) = &request.activity_id {
+            let _activity_id = canonical_identity(raw_activity)?;
+        }
+        if let Some(raw_migration) = &request.outbox_migration_id {
+            let _migration_id = canonical_identity(raw_migration)?;
+        }
+        let readback = ReadbackTarget::SwarmRunMutation {
+            workspace_id,
+            swarm_run_id,
+            request_id: Some(nonce),
+        };
+        let response: ForgeSettleSwarmResponse = self
+            .call(
+                authorization,
+                Method::POST,
+                format!("/v1/workspaces/{workspace_id}/swarms/{swarm_run_id}/forge-settle"),
+                Some(request),
+                Some(readback.clone()),
+            )
+            .await?;
+        if response.settlement_id != nonce
+            || response.run.swarm_run_id != swarm_run_id
+            || !valid_swarm_run(&response.run, workspace_id)
+        {
+            return Err(ClientError::UnknownOutcome { readback });
+        }
+        Ok(response)
+    }
+
+    /// Read one bounded page from Forge's autonomy outbox and reconcile `DAG_SETTLED_KIND = 5`
+    /// and `SWARM_SETTLED_KIND = 6` facts in Orchestration.
+    ///
+    /// # Errors
+    /// Rejects malformed identities or out-of-range limits (`0` or `> 64`), bounded transport
+    /// failures, typed service rejections, or regressive sequence responses.
+    pub async fn sync_autonomy_outbox(
+        &self,
+        authorization: &HeaderValue,
+        workspace_id: Uuid,
+        request: &SyncAutonomyOutboxRequest,
+    ) -> Result<SyncAutonomyOutboxResponse, ClientError> {
+        require_identity(workspace_id)?;
+        let _migration_id = canonical_identity(&request.migration_id)?;
+        if let Some(limit) = request.limit
+            && !(1..=64).contains(&limit)
+        {
+            return Err(ClientError::InvalidRequest);
+        }
+        let response: SyncAutonomyOutboxResponse = self
+            .call(
+                authorization,
+                Method::POST,
+                format!("/internal/v1/workspaces/{workspace_id}/autonomy-outbox/sync"),
+                Some(request),
+                None,
+            )
+            .await?;
+        if response.last_sequence < request.after_sequence {
+            return Err(ClientError::Protocol);
+        }
+        Ok(response)
+    }
 }
 
 fn validate_create_swarm_request(
@@ -1035,7 +1158,10 @@ fn validate_dispatch_turn_request(
     let snapshot_id = canonical_identity(&request.snapshot_id)?;
     let _activity_id = canonical_identity(&request.activity_id)?;
     let _lease_id = canonical_identity(&request.lease_id)?;
-    if request.default_worktree_path.trim().is_empty()
+    if let Some(raw_session_id) = &request.forge_session_id {
+        let _forge_session_id = canonical_identity(raw_session_id)?;
+    }
+    if (request.default_worktree_path.trim().is_empty() && request.forge_session_id.is_none())
         || request.lease_revision == 0
         || i64::try_from(request.lease_revision).is_err()
         || request.lease_expires_at_ms < 0

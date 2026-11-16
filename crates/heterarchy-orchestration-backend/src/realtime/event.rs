@@ -40,6 +40,28 @@ pub enum RealtimeEventKind {
     AgentRequestStateChanged,
     /// Scheduling / coordination projection changed.
     SchedulingChanged,
+    /// Workspace scope configuration or trust boundary changed.
+    WorkspaceScopeChanged,
+    /// Reviewer assignment state changed.
+    ReviewerAssignmentChanged,
+    /// A reviewer verdict was recorded.
+    ReviewerVerdictRecorded,
+    /// An execution snapshot was committed.
+    ExecutionSnapshotCommitted,
+    /// A Swarm run lifecycle state changed.
+    SwarmRunChanged,
+    /// A Swarm communication channel changed.
+    SwarmChannelChanged,
+    /// A Swarm member state changed.
+    SwarmMemberStateChanged,
+    /// A Swarm board message was posted.
+    SwarmBoardMessagePosted,
+    /// A Swarm verdict was recorded.
+    SwarmVerdictRecorded,
+    /// A Swarm stall check was evaluated.
+    SwarmStallEvaluated,
+    /// A Forge settlement was projected into Orchestration.
+    SettlementProjected,
 }
 
 /// Notification of one committed domain change.
@@ -58,4 +80,106 @@ pub struct RealtimeEvent {
     pub workspace_id: Option<Uuid>,
     /// Wall-clock milliseconds supplied by the committing boundary.
     pub occurred_at_ms: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RealtimeEventKind;
+
+    #[test]
+    fn serializes_all_event_kinds_in_snake_case() -> Result<(), serde_json::Error> {
+        let expected = [
+            (
+                RealtimeEventKind::AgentStateChanged,
+                "\"agent_state_changed\"",
+            ),
+            (
+                RealtimeEventKind::AgentProfileStateChanged,
+                "\"agent_profile_state_changed\"",
+            ),
+            (
+                RealtimeEventKind::LogicalSessionChanged,
+                "\"logical_session_changed\"",
+            ),
+            (RealtimeEventKind::TeamChanged, "\"team_changed\""),
+            (
+                RealtimeEventKind::MembershipChanged,
+                "\"membership_changed\"",
+            ),
+            (
+                RealtimeEventKind::LeadershipChanged,
+                "\"leadership_changed\"",
+            ),
+            (
+                RealtimeEventKind::ProvisioningStateChanged,
+                "\"provisioning_state_changed\"",
+            ),
+            (
+                RealtimeEventKind::ApprovalRequestChanged,
+                "\"approval_request_changed\"",
+            ),
+            (
+                RealtimeEventKind::ApprovalDecisionChanged,
+                "\"approval_decision_changed\"",
+            ),
+            (
+                RealtimeEventKind::ApprovalPolicyChanged,
+                "\"approval_policy_changed\"",
+            ),
+            (
+                RealtimeEventKind::AgentRequestStateChanged,
+                "\"agent_request_state_changed\"",
+            ),
+            (
+                RealtimeEventKind::SchedulingChanged,
+                "\"scheduling_changed\"",
+            ),
+            (
+                RealtimeEventKind::WorkspaceScopeChanged,
+                "\"workspace_scope_changed\"",
+            ),
+            (
+                RealtimeEventKind::ReviewerAssignmentChanged,
+                "\"reviewer_assignment_changed\"",
+            ),
+            (
+                RealtimeEventKind::ReviewerVerdictRecorded,
+                "\"reviewer_verdict_recorded\"",
+            ),
+            (
+                RealtimeEventKind::ExecutionSnapshotCommitted,
+                "\"execution_snapshot_committed\"",
+            ),
+            (RealtimeEventKind::SwarmRunChanged, "\"swarm_run_changed\""),
+            (
+                RealtimeEventKind::SwarmChannelChanged,
+                "\"swarm_channel_changed\"",
+            ),
+            (
+                RealtimeEventKind::SwarmMemberStateChanged,
+                "\"swarm_member_state_changed\"",
+            ),
+            (
+                RealtimeEventKind::SwarmBoardMessagePosted,
+                "\"swarm_board_message_posted\"",
+            ),
+            (
+                RealtimeEventKind::SwarmVerdictRecorded,
+                "\"swarm_verdict_recorded\"",
+            ),
+            (
+                RealtimeEventKind::SwarmStallEvaluated,
+                "\"swarm_stall_evaluated\"",
+            ),
+            (
+                RealtimeEventKind::SettlementProjected,
+                "\"settlement_projected\"",
+            ),
+        ];
+
+        for (kind, wire) in expected {
+            assert_eq!(serde_json::to_string(&kind)?, wire);
+        }
+        Ok(())
+    }
 }

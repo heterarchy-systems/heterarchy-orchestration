@@ -421,6 +421,34 @@ mod tests {
             resync,
             r#"{"reason":{"lag":{"missedEvents":4}},"currentEpoch":7,"lastDeliveredSequence":9}"#
         );
+
+        let swarm_wire = serde_json::to_string(&EventWire {
+            epoch: 8,
+            sequence: 12,
+            kind: RealtimeEventKind::SwarmBoardMessagePosted,
+            resource_id: &Uuid::nil(),
+            resource_revision: 5,
+            workspace_id: Some(Uuid::nil()),
+            occurred_at_ms: 99,
+        })?;
+        assert_eq!(
+            swarm_wire,
+            r#"{"epoch":8,"sequence":12,"kind":"swarm_board_message_posted","resourceId":"00000000-0000-0000-0000-000000000000","resourceRevision":5,"workspaceId":"00000000-0000-0000-0000-000000000000","occurredAtMs":99}"#
+        );
+
+        let settlement_wire = serde_json::to_string(&EventWire {
+            epoch: 8,
+            sequence: 13,
+            kind: RealtimeEventKind::SettlementProjected,
+            resource_id: &Uuid::nil(),
+            resource_revision: 6,
+            workspace_id: Some(Uuid::nil()),
+            occurred_at_ms: 100,
+        })?;
+        assert_eq!(
+            settlement_wire,
+            r#"{"epoch":8,"sequence":13,"kind":"settlement_projected","resourceId":"00000000-0000-0000-0000-000000000000","resourceRevision":6,"workspaceId":"00000000-0000-0000-0000-000000000000","occurredAtMs":100}"#
+        );
         Ok(())
     }
 }

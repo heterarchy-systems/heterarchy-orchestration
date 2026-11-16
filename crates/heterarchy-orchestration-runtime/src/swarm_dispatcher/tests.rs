@@ -1680,3 +1680,109 @@ fn dispatcher_worker_bearer_file_builder_validates_and_forwards_optional_paths()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn clean_exit_hook_captures_output_on_zero_exit_skips_nonzero_and_recovers_on_error()
+-> TestResult {
+    let dir = TestRuntimeDir::new("clean-exit-hook")?;
+    let runtime = OrchestrationRuntime::open(&dir.0)?;
+    let workspace_id = WorkspaceId::from_uuid(Uuid::from_u128(0x7025));
+    let (run, main_channel, coordinator) =
+        setup_swarm_run_with_coordinator(&runtime, workspace_id)?;
+    let (worker, _, _) = add_share_worker(
+        &runtime,
+        workspace_id,
+        run.swarm_run_id(),
+        coordinator.member_id(),
+        &ShareWorkerSeed {
+            seed: 0x7900,
+            name: "hook-worker",
+            engine: CliEngine::Codex,
+            model: "gpt-6-luna",
+            added_at_ms: 120,
+        },
+    )?;
+    post_board_msg(
+        &runtime,
+        workspace_id,
+        run.swarm_run_id(),
+        main_channel.channel_id(),
+        coordinator.member_id(),
+        "@hook-worker build candidate",
+        150,
+    )?;
+
+    let runner = ScriptedRunner::new();
+    runner.push_exit(1)?;
+    runner.push_exit(0)?;
+    runner.push_exit(0)?;
+    let dispatcher = runtime.swarm_dispatcher(runner);
+
+    let crash_outcome = dispatcher
+        .dispatch_member_turn_with_clean_exit_hook(
+            sample_dispatch_request(workspace_id, run.swarm_run_id(), worker.member_id(), 200)?,
+            |_, _| async { Err(SwarmDispatchError::ForgeBridge("must not run on crash")) },
+        )
+        .await?;
+    assert!(matches!(
+        crash_outcome.disposition,
+        SwarmTurnDisposition::TransientFailed {
+            exit_code: Some(1),
+            ..
+        }
+    ));
+
+    let expected_oid = SwarmCommitOid::new("0123456789abcdef0123456789abcdef01234567")?;
+    let captured_oid = expected_oid.clone();
+    let clean_outcome = dispatcher
+        .dispatch_member_turn_with_clean_exit_hook(
+            sample_dispatch_request(workspace_id, run.swarm_run_id(), worker.member_id(), 250)?,
+            move |_, _| async move {
+                Ok(Some(SwarmTurnOutput {
+                    commit_oid: captured_oid,
+                    tree_blake3: [0xAB; 32],
+                }))
+            },
+        )
+        .await?;
+    assert_eq!(
+        clean_outcome.disposition.member().last_output_commit_oid(),
+        Some(&expected_oid)
+    );
+    assert_eq!(
+        clean_outcome.disposition.member().last_output_tree_blake3(),
+        Some([0xAB; 32])
+    );
+
+    post_board_msg(
+        &runtime,
+        workspace_id,
+        run.swarm_run_id(),
+        main_channel.channel_id(),
+        coordinator.member_id(),
+        "@hook-worker second task",
+        300,
+    )?;
+    let hook_err = dispatcher
+        .dispatch_member_turn_with_clean_exit_hook(
+            sample_dispatch_request(workspace_id, run.swarm_run_id(), worker.member_id(), 350)?,
+            |_, _| async { Err(SwarmDispatchError::ForgeBridge("unavailable")) },
+        )
+        .await;
+    assert!(matches!(
+        hook_err,
+        Err(SwarmDispatchError::ForgeBridge("unavailable"))
+    ));
+    let snapshot = runtime
+        .get_swarm_run_snapshot(workspace_id, run.swarm_run_id())?
+        .map_err(|e| format!("snapshot: {e}"))?
+        .ok_or("missing snapshot")?;
+    let recovered_member = snapshot
+        .members()
+        .iter()
+        .find(|m| m.member_id() == worker.member_id())
+        .ok_or("missing worker")?;
+    assert_eq!(recovered_member.member_state(), SwarmMemberState::Stopped);
+    assert_eq!(recovered_member.committed_seen_seq(), 1);
+    Ok(())
+}

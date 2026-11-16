@@ -6,6 +6,7 @@
 //! fallback `workspace_id`, `swarm_run_id`, and `member_id` identities when
 //! omitted on `argv`, and deterministic pretty-printed JSON is returned for `stdout`.
 
+mod parse_bridge;
 mod parse_subcommands;
 mod parse_turns;
 
@@ -26,13 +27,14 @@ use crate::wire::swarm::{
     AbortSwarmRunRequest, AddSwarmMemberRequest, ClaimSwarmWakeupRequest, CompleteSwarmTurnRequest,
     ConvergeSwarmRequest, CreateSwarmChannelRequest, CreateSwarmRunRequest,
     CreateSwarmVerificationPanelRequest, DispatchSwarmTurnRequest, FailSwarmTurnRequest,
-    KillSwarmMemberRequest, ListSwarmRunsQuery, MAX_SWARM_HTTP_BODY_BYTES, PostSwarmMessageRequest,
-    ReadSwarmMessagesQuery, RecordSwarmVerdictRequest, SettleSwarmRequest,
-    SubscribeSwarmChannelRequest, SwarmStallCheckRequest, SwitchSwarmMemberModelRequest,
+    ForgeConvergeSwarmRequest, ForgeSettleSwarmRequest, KillSwarmMemberRequest, ListSwarmRunsQuery,
+    MAX_SWARM_HTTP_BODY_BYTES, PostSwarmMessageRequest, ReadSwarmMessagesQuery,
+    RecordSwarmVerdictRequest, SettleSwarmRequest, SubscribeSwarmChannelRequest,
+    SwarmStallCheckRequest, SwitchSwarmMemberModelRequest, SyncAutonomyOutboxRequest,
 };
 
 /// Usage summary for the `swarm` CLI subcommand family.
-pub const SWARM_CLI_USAGE: &str = "usage: heterarchy-orchestration-backend swarm <create|list|status|channel-create|subscribe|member-add|member-kill|post|read|claim|complete|fail|dispatch|model-switch|panel-create|verdict|converge|settle|abort|stall-check> --bearer-file <path> [--addr <ip:port>] [--request <json-file> | <flags...>]";
+pub const SWARM_CLI_USAGE: &str = "usage: heterarchy-orchestration-backend swarm <create|list|status|channel-create|subscribe|member-add|member-kill|post|read|claim|complete|fail|dispatch|model-switch|panel-create|verdict|converge|forge-converge|settle|forge-settle|outbox-sync|abort|stall-check> --bearer-file <path> [--addr <ip:port>] [--request <json-file> | <flags...>]";
 
 /// Payload source alias for `swarm` CLI subcommands.
 pub type SwarmPayload<T> = CliPayload<T>;
@@ -158,6 +160,20 @@ pub enum SwarmAction {
         swarm_run_id: Uuid,
         payload: SwarmPayload<SwarmStallCheckRequest>,
     },
+    ForgeConverge {
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        payload: SwarmPayload<ForgeConvergeSwarmRequest>,
+    },
+    ForgeSettle {
+        workspace_id: Uuid,
+        swarm_run_id: Uuid,
+        payload: SwarmPayload<ForgeSettleSwarmRequest>,
+    },
+    OutboxSync {
+        workspace_id: Uuid,
+        payload: SwarmPayload<SyncAutonomyOutboxRequest>,
+    },
 }
 
 /// Validated `swarm` CLI invocation options.
@@ -265,6 +281,9 @@ async fn execute_action(
         | SwarmAction::Settle { .. }
         | SwarmAction::Abort { .. }
         | SwarmAction::StallCheck { .. } => execute_governance_action(client, auth, action).await,
+        SwarmAction::ForgeConverge { .. }
+        | SwarmAction::ForgeSettle { .. }
+        | SwarmAction::OutboxSync { .. } => execute_bridge_action(client, auth, action).await,
     }
 }
 
@@ -618,6 +637,56 @@ async fn execute_governance_action(
                     auth,
                     *workspace_id,
                     *swarm_run_id,
+                    &payload.resolve(MAX_SWARM_HTTP_BODY_BYTES)?,
+                )
+                .await?,
+        ),
+        _ => Err(CliSupportError::InvalidArguments),
+    }
+}
+
+async fn execute_bridge_action(
+    client: &crate::client::OrchestrationHttpClient,
+    auth: &hyper::header::HeaderValue,
+    action: &SwarmAction,
+) -> Result<String, CliSupportError> {
+    match action {
+        SwarmAction::ForgeConverge {
+            workspace_id,
+            swarm_run_id,
+            payload,
+        } => format_json_output(
+            &client
+                .forge_converge_swarm_run(
+                    auth,
+                    *workspace_id,
+                    *swarm_run_id,
+                    &payload.resolve(MAX_SWARM_HTTP_BODY_BYTES)?,
+                )
+                .await?,
+        ),
+        SwarmAction::ForgeSettle {
+            workspace_id,
+            swarm_run_id,
+            payload,
+        } => format_json_output(
+            &client
+                .forge_settle_swarm_run(
+                    auth,
+                    *workspace_id,
+                    *swarm_run_id,
+                    &payload.resolve(MAX_SWARM_HTTP_BODY_BYTES)?,
+                )
+                .await?,
+        ),
+        SwarmAction::OutboxSync {
+            workspace_id,
+            payload,
+        } => format_json_output(
+            &client
+                .sync_autonomy_outbox(
+                    auth,
+                    *workspace_id,
                     &payload.resolve(MAX_SWARM_HTTP_BODY_BYTES)?,
                 )
                 .await?,

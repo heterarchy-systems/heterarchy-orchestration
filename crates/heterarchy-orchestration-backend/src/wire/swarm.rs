@@ -29,10 +29,15 @@ use crate::wire::autonomy_loop::{
 use crate::{ApiError, RuntimeError, canonical_uuid};
 
 mod dispatch;
+mod forge_bridge;
 
 pub use dispatch::{
     CommittedExecutionSnapshotWire, DispatchSwarmTurnRequest, DispatchSwarmTurnResponse,
     DispatchedTurnDispositionWire, DispatchedTurnSupervisionWire,
+};
+pub use forge_bridge::{
+    ForgeConvergeSwarmRequest, ForgeConvergeSwarmResponse, ForgeSettleSwarmRequest,
+    ForgeSettleSwarmResponse, SyncAutonomyOutboxRequest, SyncAutonomyOutboxResponse,
 };
 
 /// Maximum JSON request body size accepted by Swarm HTTP endpoints (`128 KiB`).
@@ -1196,6 +1201,29 @@ mod tests {
             "extraField": true
         }"#;
         assert!(serde_json::from_str::<RecordSwarmVerdictRequest>(unknown_in_verdict).is_err());
+
+        let unknown_in_forge_converge = r#"{
+            "requestId": "0196ed00-0000-7000-8000-000000000004",
+            "sessionId": "0196ed00-0000-7000-8000-000000000005",
+            "unexpected": 1
+        }"#;
+        assert!(
+            serde_json::from_str::<ForgeConvergeSwarmRequest>(unknown_in_forge_converge).is_err()
+        );
+
+        let unknown_in_forge_settle = r#"{
+            "requestId": "0196ed00-0000-7000-8000-000000000006",
+            "sessionId": "0196ed00-0000-7000-8000-000000000007",
+            "coordinatorAgentId": "0196ed00-0000-7000-8000-000000000008",
+            "unexpected": 1
+        }"#;
+        assert!(serde_json::from_str::<ForgeSettleSwarmRequest>(unknown_in_forge_settle).is_err());
+
+        let unknown_in_outbox_sync = r#"{
+            "migrationId": "0196ed00-0000-7000-8000-000000000009",
+            "unexpected": 1
+        }"#;
+        assert!(serde_json::from_str::<SyncAutonomyOutboxRequest>(unknown_in_outbox_sync).is_err());
     }
 
     #[test]
@@ -1263,6 +1291,7 @@ mod tests {
             dispatched_at_ms: Some(12_345),
             clean_exit_output_commit_oid: Some("a".repeat(40)),
             clean_exit_output_tree_blake3_hex: Some("b2".repeat(32)),
+            forge_session_id: None,
         };
         let domain = wire
             .to_domain(ws, run_id, member_id, 9_999)

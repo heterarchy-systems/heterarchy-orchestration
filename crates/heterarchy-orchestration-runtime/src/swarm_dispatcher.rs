@@ -122,6 +122,8 @@ pub enum SwarmDispatchError {
     },
     #[error("swarm settled outbox digest does not match converged Swarm run state")]
     OutboxDigestMismatch,
+    #[error("forge swarm bridge error: {0}")]
+    ForgeBridge(&'static str),
     #[error("snapshot validation failed: {0}")]
     SnapshotValidation(#[from] SnapshotValidationError),
     #[error("agent profile catalog error: {0}")]

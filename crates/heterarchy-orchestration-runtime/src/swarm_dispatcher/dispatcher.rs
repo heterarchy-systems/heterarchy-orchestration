@@ -2,6 +2,7 @@ mod guards;
 mod prompt;
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -429,6 +430,32 @@ impl<R: ExecutionRunner + 'static> SwarmRuntimeDispatcher<R> {
         &self,
         request: SwarmDispatchTurnRequest,
     ) -> Result<SwarmDispatchedTurnOutcome, SwarmDispatchError> {
+        self.dispatch_member_turn_with_clean_exit_hook(request, |_, _| async { Ok(None) })
+            .await
+    }
+
+    /// Dispatch one `WakeQueued` Swarm member turn and run `on_clean_exit` after a clean
+    /// exit-code (`SwarmExitClassification::CleanSuccess`) supervision before durably completing
+    /// the member turn in `OperationsCatalog`.
+    ///
+    /// When `request.clean_exit_output.is_none()` and the supervised process exits cleanly,
+    /// `on_clean_exit(&request, &committed_snapshot)` is awaited with zero catalog locks held
+    /// while [`WorkingTurnDropGuard`] remains armed, and any returned [`SwarmTurnOutput`] is
+    /// stored atomically by `complete_swarm_member_turn`.
+    ///
+    /// # Errors
+    /// Rejects duplicate in-flight turns, non-`WakeQueued` members, inactive/missing profiles,
+    /// snapshot validation mismatches, spawn/supervision errors, clean-exit hook errors, or
+    /// catalog failures.
+    pub async fn dispatch_member_turn_with_clean_exit_hook<F, Fut>(
+        &self,
+        request: SwarmDispatchTurnRequest,
+        on_clean_exit: F,
+    ) -> Result<SwarmDispatchedTurnOutcome, SwarmDispatchError>
+    where
+        F: FnOnce(&SwarmDispatchTurnRequest, &AssignmentExecutionSnapshot) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Option<SwarmTurnOutput>, SwarmDispatchError>> + Send + 'static,
+    {
         let inflight_guard = InflightMemberGuard::try_acquire(
             &self.inflight_members,
             request.swarm_run_id,
@@ -457,16 +484,16 @@ impl<R: ExecutionRunner + 'static> SwarmRuntimeDispatcher<R> {
             .await
             .map_err(|_| SwarmDispatchError::SemaphoreClosed)?;
 
+        let guards = ClaimedTurnGuards {
+            needs_parent_slot,
+            _inflight_guard: inflight_guard,
+            _parent_permit: parent_permit,
+            _total_permit: total_permit,
+        };
         let dispatcher = self.clone();
         tokio::spawn(async move {
             dispatcher
-                .execute_claimed_turn_owned(
-                    request,
-                    needs_parent_slot,
-                    inflight_guard,
-                    parent_permit,
-                    total_permit,
-                )
+                .execute_claimed_turn_owned(request, guards, on_clean_exit)
                 .await
         })
         .await
@@ -475,17 +502,18 @@ impl<R: ExecutionRunner + 'static> SwarmRuntimeDispatcher<R> {
         })?
     }
 
-    async fn execute_claimed_turn_owned(
+    async fn execute_claimed_turn_owned<F, Fut>(
         self,
-        request: SwarmDispatchTurnRequest,
-        needs_parent_slot: bool,
-        inflight_guard: InflightMemberGuard,
-        parent_permit: Option<tokio::sync::OwnedSemaphorePermit>,
-        total_permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> Result<SwarmDispatchedTurnOutcome, SwarmDispatchError> {
-        let _keep_inflight = inflight_guard;
-        let _keep_parent = parent_permit;
-        let _keep_total = total_permit;
+        mut request: SwarmDispatchTurnRequest,
+        guards: ClaimedTurnGuards,
+        on_clean_exit: F,
+    ) -> Result<SwarmDispatchedTurnOutcome, SwarmDispatchError>
+    where
+        F: FnOnce(&SwarmDispatchTurnRequest, &AssignmentExecutionSnapshot) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Option<SwarmTurnOutput>, SwarmDispatchError>> + Send + 'static,
+    {
+        let needs_parent_slot = guards.needs_parent_slot;
+        let _keep_guards = guards;
 
         let (wakeup_batch, committed_snapshot) = self.claim_and_seal_snapshot(&request)?;
         let attempt_key = committed_snapshot.attempt_key();
@@ -511,6 +539,13 @@ impl<R: ExecutionRunner + 'static> SwarmRuntimeDispatcher<R> {
             }
             Err(context_err) => Err(context_err),
         };
+        if let Ok(SupervisionOutcome::Exited { exit_code, .. }) = &supervision_result
+            && self.exit_policy.classify_exit_code(*exit_code)
+                == SwarmExitClassification::CleanSuccess
+            && request.clean_exit_output.is_none()
+        {
+            request.clean_exit_output = on_clean_exit(&request, &committed_snapshot).await?;
+        }
         let (supervision, disposition) =
             self.finalize_supervised_turn(&request, &committed_snapshot, supervision_result)?;
         working_guard.disarm();
@@ -916,6 +951,13 @@ fn build_and_commit_member_snapshot(
     let (committed, _ledger) =
         catalog.commit_assignment_execution_snapshot(request.snapshot_request_id, &snapshot)?;
     Ok(committed)
+}
+
+struct ClaimedTurnGuards {
+    needs_parent_slot: bool,
+    _inflight_guard: InflightMemberGuard,
+    _parent_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    _total_permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 fn find_concurrently_killed_member(
