@@ -52,6 +52,31 @@ impl McpTokenCatalog {
         Ok(Self { path, connection })
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn path_exists(path: &Path) -> Result<bool, McpTokenCatalogError> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| McpTokenCatalogError::InvalidPath(path.to_path_buf()))?;
+        match fs::symlink_metadata(parent) {
+            Ok(_) => validate_catalog_path(path)?,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(McpTokenCatalogError::PathIo {
+                    path: parent.to_path_buf(),
+                    source,
+                });
+            }
+        }
+        match fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(McpTokenCatalogError::PathIo {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

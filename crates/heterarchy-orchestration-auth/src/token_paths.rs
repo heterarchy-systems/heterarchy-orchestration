@@ -58,6 +58,13 @@ impl TokenAuthorityPaths {
     pub fn application_support(&self) -> &Path {
         &self.application_support
     }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn for_application_support(application_support: PathBuf) -> Self {
+        Self {
+            application_support,
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

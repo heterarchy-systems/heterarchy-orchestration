@@ -1,4 +1,4 @@
-//! macOS Keychain adapter for the local MCP bearer-token hash pepper.
+//! Platform storage adapters for the local MCP bearer-token hash pepper.
 //!
 //! The adapter stores one fixed-width secret and never generates, formats, or
 //! logs it. Token lifecycle policy remains outside this platform boundary.
@@ -8,6 +8,9 @@ use std::fmt;
 use thiserror::Error;
 
 const PEPPER_BYTES: usize = 32;
+
+#[cfg(target_os = "linux")]
+pub(super) const LINUX_PEPPER_FILE_NAME: &str = "mcp-token-pepper-v1";
 
 // The service string is fixed: existing installed peppers live under it.
 #[cfg(target_os = "macos")]
@@ -31,6 +34,11 @@ impl McpTokenPepper {
     #[must_use]
     pub const fn into_bytes(self) -> [u8; PEPPER_BYTES] {
         self.0
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) const fn as_bytes(&self) -> &[u8; PEPPER_BYTES] {
+        &self.0
     }
 }
 
@@ -115,6 +123,9 @@ impl MacOsMcpTokenPepperStore {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(super) use crate::linux_pepper_store::LinuxMcpTokenPepperStore;
+
 #[derive(Debug, Error)]
 pub enum McpTokenPepperError {
     #[error("stored MCP token pepper has invalid length {actual}; expected {expected}")]
@@ -131,6 +142,18 @@ pub enum McpTokenPepperError {
     #[cfg(not(target_os = "macos"))]
     #[error("MCP token pepper storage is supported only on macOS")]
     UnsupportedPlatform,
+    #[cfg(target_os = "linux")]
+    #[error("Linux MCP token pepper path violates private storage requirements")]
+    LinuxPathSecurity,
+    #[cfg(target_os = "linux")]
+    #[error("Linux MCP token pepper file is invalid or insecure")]
+    LinuxFileSecurity,
+    #[cfg(target_os = "linux")]
+    #[error("Linux MCP token pepper filesystem operation failed")]
+    LinuxIo(#[source] std::io::Error),
+    #[cfg(target_os = "linux")]
+    #[error("secure Linux MCP token pepper filename randomness failed")]
+    LinuxRandomness(#[source] getrandom::Error),
 }
 
 #[cfg(test)]

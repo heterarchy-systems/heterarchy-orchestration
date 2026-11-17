@@ -6,7 +6,11 @@
 //! authority or bypassing the recovery check for a missing Keychain pepper.
 
 use crate::TokenAuthorityPaths;
-use crate::pepper_store::{MacOsMcpTokenPepperStore, McpTokenPepper};
+#[cfg(target_os = "linux")]
+use crate::pepper_store::LinuxMcpTokenPepperStore;
+#[cfg(not(target_os = "linux"))]
+use crate::pepper_store::MacOsMcpTokenPepperStore;
+use crate::pepper_store::{McpTokenPepper, McpTokenPepperError};
 use forge_domain::TimestampMillis;
 use thiserror::Error;
 
@@ -57,7 +61,8 @@ impl McpTokenRuntime {
     /// A missing catalog is allowed only for explicit authority
     /// initialization.  A missing pepper with existing records is always a
     /// recovery error; the runtime never fabricates a replacement authority
-    /// in that case.
+    /// in that case. Linux also rejects a missing pepper for a pre-existing
+    /// empty catalog.
     ///
     /// # Errors
     ///
@@ -68,27 +73,33 @@ impl McpTokenRuntime {
         mode: McpTokenBootstrapMode,
     ) -> Result<Self, McpTokenRuntimeError> {
         let catalog_path = paths.application_support().join(TOKEN_CATALOG_FILE_NAME);
-        let catalog = open_token_catalog(&catalog_path, mode)?;
-        let has_records = !catalog
-            .list(1)
-            .map_err(McpTokenRuntimeError::Catalog)?
-            .is_empty();
-        let store = MacOsMcpTokenPepperStore;
-        let pepper = match store.load().map_err(McpTokenRuntimeError::Pepper)? {
-            Some(pepper) => pepper,
-            None if mode.permits_initialization() && !has_records => {
-                let mut bytes = [0_u8; MCP_TOKEN_DIGEST_BYTES];
-                getrandom::fill(&mut bytes).map_err(McpTokenRuntimeError::PepperRandomness)?;
-                let candidate = McpTokenPepper::new(bytes);
-                store
-                    .store_if_absent(&candidate)
-                    .map_err(McpTokenRuntimeError::Pepper)?;
-                store
-                    .load()
-                    .map_err(McpTokenRuntimeError::Pepper)?
-                    .ok_or(McpTokenRuntimeError::PepperWriteUnconfirmed)?
-            }
-            None => return Err(McpTokenRuntimeError::PepperRecoveryRequired),
+        #[cfg(target_os = "linux")]
+        let (catalog, pepper) = start_linux_authority(paths, &catalog_path, mode)?;
+        #[cfg(not(target_os = "linux"))]
+        let (catalog, pepper) = {
+            let catalog = open_token_catalog(&catalog_path, mode)?;
+            let has_records = !catalog
+                .list(1)
+                .map_err(McpTokenRuntimeError::Catalog)?
+                .is_empty();
+            let store = MacOsMcpTokenPepperStore;
+            let pepper = match store.load().map_err(McpTokenRuntimeError::Pepper)? {
+                Some(pepper) => pepper,
+                None if mode.permits_initialization() && !has_records => {
+                    let mut bytes = [0_u8; MCP_TOKEN_DIGEST_BYTES];
+                    getrandom::fill(&mut bytes).map_err(McpTokenRuntimeError::PepperRandomness)?;
+                    let candidate = McpTokenPepper::new(bytes);
+                    store
+                        .store_if_absent(&candidate)
+                        .map_err(McpTokenRuntimeError::Pepper)?;
+                    store
+                        .load()
+                        .map_err(McpTokenRuntimeError::Pepper)?
+                        .ok_or(McpTokenRuntimeError::PepperWriteUnconfirmed)?
+                }
+                None => return Err(McpTokenRuntimeError::PepperRecoveryRequired),
+            };
+            (catalog, pepper)
         };
         let (client, worker) =
             McpTokenWorker::start(McpTokenService::new(pepper.into_bytes(), catalog))
@@ -194,6 +205,54 @@ impl McpTokenRuntime {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn start_linux_authority(
+    paths: &TokenAuthorityPaths,
+    catalog_path: &std::path::Path,
+    mode: McpTokenBootstrapMode,
+) -> Result<(McpTokenCatalog, McpTokenPepper), McpTokenRuntimeError> {
+    let catalog_exists =
+        McpTokenCatalog::path_exists(catalog_path).map_err(McpTokenRuntimeError::Catalog)?;
+    if !catalog_exists && !mode.permits_initialization() {
+        return Err(McpTokenRuntimeError::NotConfigured);
+    }
+
+    let store = LinuxMcpTokenPepperStore::prepare(
+        paths.application_support(),
+        mode.permits_initialization(),
+    )
+    .map_err(McpTokenRuntimeError::Pepper)?;
+    let stored_pepper = match store.load() {
+        Ok(pepper) => pepper,
+        Err(McpTokenPepperError::LinuxFileSecurity | McpTokenPepperError::CorruptLength { .. })
+            if catalog_exists =>
+        {
+            return Err(McpTokenRuntimeError::PepperRecoveryRequired);
+        }
+        Err(error) => return Err(McpTokenRuntimeError::Pepper(error)),
+    };
+    let pepper = match stored_pepper {
+        Some(pepper) => pepper,
+        None if mode.permits_initialization() && !catalog_exists => {
+            let mut bytes = [0_u8; MCP_TOKEN_DIGEST_BYTES];
+            getrandom::fill(&mut bytes).map_err(McpTokenRuntimeError::PepperRandomness)?;
+            let candidate = McpTokenPepper::new(bytes);
+            store
+                .store_if_absent(&candidate)
+                .map_err(McpTokenRuntimeError::Pepper)?;
+            store
+                .load()
+                .map_err(McpTokenRuntimeError::Pepper)?
+                .ok_or(McpTokenRuntimeError::PepperWriteUnconfirmed)?
+        }
+        None => return Err(McpTokenRuntimeError::PepperRecoveryRequired),
+    };
+
+    let catalog = open_token_catalog(catalog_path, mode)?;
+    let result = (catalog, pepper);
+    Ok(result)
+}
+
 impl Drop for McpTokenRuntime {
     fn drop(&mut self) {
         if let Some(worker) = self.worker.as_mut() {
@@ -226,11 +285,11 @@ pub enum McpTokenRuntimeError {
     NotConfigured,
     #[error("MCP token catalog failed")]
     Catalog(#[source] McpTokenCatalogError),
-    #[error("MCP token pepper Keychain operation failed")]
-    Pepper(#[source] crate::pepper_store::McpTokenPepperError),
+    #[error("MCP token pepper storage operation failed")]
+    Pepper(#[source] McpTokenPepperError),
     #[error("secure randomness for the MCP token pepper is unavailable")]
     PepperRandomness(#[source] getrandom::Error),
-    #[error("MCP token pepper is missing while durable token records exist")]
+    #[error("the existing token catalog requires its original MCP token pepper")]
     PepperRecoveryRequired,
     #[error("MCP token pepper write could not be confirmed")]
     PepperWriteUnconfirmed,
@@ -247,6 +306,9 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
     fn explicit_bootstrap_creates_missing_parent_but_existing_mode_does_not()
@@ -276,7 +338,7 @@ mod tests {
         let error = McpTokenRuntimeError::PepperRecoveryRequired;
         assert_eq!(
             error.to_string(),
-            "MCP token pepper is missing while durable token records exist"
+            "the existing token catalog requires its original MCP token pepper"
         );
     }
 
@@ -292,5 +354,134 @@ mod tests {
     fn bootstrap_mode_names_empty_authority_initialization_explicitly() {
         assert!(!McpTokenBootstrapMode::ExistingAuthority.permits_initialization());
         assert!(McpTokenBootstrapMode::InitializeAuthority.permits_initialization());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_explicit_initialization_publishes_private_key_before_catalog_and_reopens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = std::env::temp_dir().join(format!("linux-token-init-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root)?;
+        let application_support = root.join("Heterarchy Forge");
+        let paths = TokenAuthorityPaths::for_application_support(application_support.clone());
+        let key_path = application_support.join(crate::pepper_store::LINUX_PEPPER_FILE_NAME);
+        let catalog_path = application_support.join(TOKEN_CATALOG_FILE_NAME);
+
+        let mut first = McpTokenRuntime::start(&paths, McpTokenBootstrapMode::InitializeAuthority)?;
+        let key_before_restart = std::fs::read(&key_path)?;
+        assert_eq!(key_before_restart.len(), 32);
+        assert!(catalog_path.is_file());
+        assert_eq!(
+            std::fs::metadata(&application_support)?.mode() & 0o7777,
+            0o700
+        );
+        assert_eq!(std::fs::metadata(&key_path)?.mode() & 0o7777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&key_path)?.uid(),
+            rustix::process::geteuid().as_raw()
+        );
+        assert_eq!(std::fs::metadata(&key_path)?.nlink(), 1);
+        first.shutdown()?;
+
+        let mut reopened =
+            McpTokenRuntime::start(&paths, McpTokenBootstrapMode::ExistingAuthority)?;
+        assert_eq!(std::fs::read(&key_path)?, key_before_restart);
+        assert!(reopened.list(1)?.is_empty());
+        reopened.shutdown()?;
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_existing_empty_catalog_without_key_requires_recovery_without_rekeying()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("linux-token-recovery-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root)?;
+        let application_support = root.join("Heterarchy Forge");
+        std::fs::create_dir(&application_support)?;
+        std::fs::set_permissions(&application_support, std::fs::Permissions::from_mode(0o700))?;
+        let paths = TokenAuthorityPaths::for_application_support(application_support.clone());
+        let catalog_path = application_support.join(TOKEN_CATALOG_FILE_NAME);
+        let key_path = application_support.join(crate::pepper_store::LINUX_PEPPER_FILE_NAME);
+        drop(McpTokenCatalog::open(&catalog_path)?);
+
+        for mode in [
+            McpTokenBootstrapMode::ExistingAuthority,
+            McpTokenBootstrapMode::InitializeAuthority,
+        ] {
+            assert!(matches!(
+                McpTokenRuntime::start(&paths, mode),
+                Err(McpTokenRuntimeError::PepperRecoveryRequired)
+            ));
+            assert!(!key_path.exists());
+        }
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_corrupt_key_for_any_existing_catalog_requires_recovery_without_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("linux-token-corrupt-key-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root)?;
+        let application_support = root.join("Heterarchy Forge");
+        std::fs::create_dir(&application_support)?;
+        std::fs::set_permissions(&application_support, std::fs::Permissions::from_mode(0o700))?;
+        let paths = TokenAuthorityPaths::for_application_support(application_support.clone());
+        let catalog_path = application_support.join(TOKEN_CATALOG_FILE_NAME);
+        let key_path = application_support.join(crate::pepper_store::LINUX_PEPPER_FILE_NAME);
+        drop(McpTokenCatalog::open(&catalog_path)?);
+        std::fs::write(&key_path, [0x7c; 17])?;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+        let corrupt_key = std::fs::read(&key_path)?;
+
+        for mode in [
+            McpTokenBootstrapMode::ExistingAuthority,
+            McpTokenBootstrapMode::InitializeAuthority,
+        ] {
+            assert!(matches!(
+                McpTokenRuntime::start(&paths, mode),
+                Err(McpTokenRuntimeError::PepperRecoveryRequired)
+            ));
+            assert_eq!(std::fs::read(&key_path)?, corrupt_key);
+        }
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_persisted_key_without_catalog_resumes_only_explicit_initialization()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root =
+            std::env::temp_dir().join(format!("linux-token-resume-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root)?;
+        let application_support = root.join("Heterarchy Forge");
+        let paths = TokenAuthorityPaths::for_application_support(application_support.clone());
+        let key_path = application_support.join(crate::pepper_store::LINUX_PEPPER_FILE_NAME);
+        let store = crate::linux_pepper_store::LinuxMcpTokenPepperStore::prepare(
+            &application_support,
+            true,
+        )?;
+        let pepper = McpTokenPepper::new([0x6d; 32]);
+        store.store_if_absent(&pepper)?;
+
+        assert!(matches!(
+            McpTokenRuntime::start(&paths, McpTokenBootstrapMode::ExistingAuthority),
+            Err(McpTokenRuntimeError::NotConfigured)
+        ));
+        assert!(!application_support.join(TOKEN_CATALOG_FILE_NAME).exists());
+
+        let mut resumed =
+            McpTokenRuntime::start(&paths, McpTokenBootstrapMode::InitializeAuthority)?;
+        assert_eq!(std::fs::read(&key_path)?, vec![0x6d; 32]);
+        assert!(application_support.join(TOKEN_CATALOG_FILE_NAME).is_file());
+        resumed.shutdown()?;
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

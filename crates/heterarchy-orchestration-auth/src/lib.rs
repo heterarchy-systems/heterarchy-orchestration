@@ -2,6 +2,8 @@
 //! The token authority owns its typed model locally; the Forge domain no
 //! longer carries these types after the MCP retirement.
 
+#[cfg(target_os = "linux")]
+mod linux_pepper_store;
 mod pepper_store;
 mod token;
 mod token_catalog;
