@@ -41,12 +41,6 @@ impl ScratchDir {
         fs::create_dir_all(&path)?;
         Ok(Self { path })
     }
-
-    fn new_ambient_ssd(prefix: &str) -> TestResult<Self> {
-        let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::now_v7()));
-        fs::create_dir_all(&path)?;
-        Ok(Self { path })
-    }
 }
 
 impl Drop for ScratchDir {
@@ -245,17 +239,29 @@ fn with_bearer_file_rejects_empty_relative_missing_symlink_oversized_and_ssd_pat
         ));
     }
 
-    // Real regular file placed inside SSD tmp is also rejected.
-    let ssd_dir = ScratchDir::new_ambient_ssd("inv-bearer-ssd")?;
-    let ssd_real_file = ssd_dir.path.join("real.bearer");
-    fs::write(&ssd_real_file, "token-on-ssd")?;
+    // Ancestor links into the forbidden root are rejected even when it is absent.
+    let ssd_root_link = scratch.path.join("ssd-root-link");
+    symlink(FORBIDDEN_SSD_BUILD_PREFIX, &ssd_root_link)?;
     assert!(matches!(
-        CliExecutionContext::new().with_bearer_file(ssd_real_file),
-        Err(ExecutionSupervisorError::InvalidExecutionContext(_))
+        CliExecutionContext::new().with_bearer_file(ssd_root_link.join("real.bearer")),
+        Err(ExecutionSupervisorError::InvalidExecutionContext(
+            "bearer_file cannot reside under /Volumes/256.SSD/RustBuild"
+        ))
     ));
 
-    // Ancestor directory symlinked into SSD is rejected too.
+    // Real SSD files require the mount, independently of the runner's TMPDIR.
     if Path::new(FORBIDDEN_SSD_BUILD_PREFIX).is_dir() {
+        let path = Path::new(FORBIDDEN_SSD_BUILD_PREFIX)
+            .join(format!("inv-bearer-ssd-{}", Uuid::now_v7()));
+        fs::create_dir(&path)?;
+        let ssd_dir = ScratchDir { path };
+        let ssd_real_file = ssd_dir.path.join("real.bearer");
+        fs::write(&ssd_real_file, "token-on-ssd")?;
+        assert!(matches!(
+            CliExecutionContext::new().with_bearer_file(ssd_real_file),
+            Err(ExecutionSupervisorError::InvalidExecutionContext(_))
+        ));
+
         let ssd_dir_link = scratch.path.join("ssd-dir-link");
         symlink(&ssd_dir.path, &ssd_dir_link)?;
         assert!(matches!(

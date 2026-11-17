@@ -1651,8 +1651,9 @@ fn dispatcher_worker_bearer_file_builder_validates_and_forwards_optional_paths()
     std::os::unix::fs::symlink(&valid_file, &symlink_file)?;
     let oversized_file = scratch.0.join("oversized.bearer");
     std::fs::write(&oversized_file, vec![b'a'; 4_097])?;
-    let ssd_file = dir.0.join("ssd.bearer");
-    std::fs::write(&ssd_file, "tok-ssd")?;
+    // Forbidden paths are rejected before metadata lookup, including on CI without the mount.
+    let ssd_file = PathBuf::from(crate::execution_supervisor::FORBIDDEN_SSD_BUILD_PREFIX)
+        .join("swarm-worker.bearer");
 
     let none_disp = runtime
         .swarm_dispatcher(ScriptedRunner::new())
