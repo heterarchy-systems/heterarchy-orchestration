@@ -76,6 +76,29 @@ existing authenticated read-only logical Session resolver used by Forge.
 See the operator guide for the distinct issuer secret and exact existing
 catalog; this lookup does not grant admission or coordinator authority.
 
+## Private GHCR container
+
+`container-vX.Y.Z` tags matching the Backend Cargo version publish
+`ghcr.io/heterarchy-systems/heterarchy-orchestration:X.Y.Z` and `latest` privately
+after canonical CI, Linux authentication tests, and authenticated restart smoke.
+macOS packaging uses `make package`.
+
+On Linux, log in to GHCR with package-read permission, then initialize the
+credential authority once and start the service:
+
+```sh
+docker compose pull
+docker compose run --rm orchestration token issue --initialize-authority \
+  --label operator --output /state/operator-bearer
+```
+
+Set `HETERARCHY_ORCHESTRATION_OPERATOR_PRINCIPALS` to the command's printed
+`operator_principal` value for operator access, then run `docker compose up -d`.
+Compose uses host networking and the existing `127.0.0.1:8798` listener.
+The persistent `/state` volume contains runtime data, the token catalog and the
+owner-only Linux pepper file.
+macOS authentication uses the installed Keychain identity.
+
 ## Operating and migration references
 
 - [Headless capability and acceptance matrix](docs/repair/2026-10-03-headless-capability-matrix.md) — current route families, retained requirements, and external gaps.

@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'container-v*'
   pull_request:
     branches:
       - main
@@ -11,6 +13,10 @@ on:
 
 permissions:
   contents: read
+
+env:
+  FORGE_SOURCE_REF: c850f30ca3eb5ea455ddd613d0cd5456da4422c9
+  BROKER_SOURCE_REF: 17eb66ad47b284384aee6a77d2945fe09825220d
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -34,7 +40,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: heterarchy-systems/heterarchy-forge
-          ref: main
+          ref: ${{ env.FORGE_SOURCE_REF }}
           path: heterarchy-forge
           fetch-depth: 1
           persist-credentials: false
@@ -45,7 +51,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: heterarchy-systems/heterarchy-broker
-          ref: main
+          ref: ${{ env.BROKER_SOURCE_REF }}
           path: heterarchy-broker
           fetch-depth: 1
           persist-credentials: false
@@ -74,4 +80,119 @@ jobs:
       - name: Run canonical CI harness
         working-directory: heterarchy-orchestration
         run: make ci
+
+      - name: Validate container helper syntax
+        working-directory: heterarchy-orchestration
+        run: |
+          for script in .github/scripts/*.sh; do
+            bash -n "$script"
+          done
+
+  image:
+    name: Verify and publish private Orchestration image
+    needs: ci
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/container-v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: heterarchy-orchestration
+    env:
+      IMAGE: ghcr.io/heterarchy-systems/heterarchy-orchestration
+    steps:
+      - name: Checkout Orchestration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: heterarchy-orchestration
+          persist-credentials: false
+
+      - name: Checkout pinned Forge source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: heterarchy-systems/heterarchy-forge
+          ref: ${{ env.FORGE_SOURCE_REF }}
+          path: heterarchy-forge
+          persist-credentials: false
+
+      - name: Checkout pinned Broker source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: heterarchy-systems/heterarchy-broker
+          ref: ${{ env.BROKER_SOURCE_REF }}
+          path: heterarchy-broker
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+
+      - name: Validate numeric container version
+        id: release
+        run: .github/scripts/container-version.sh >> "$GITHUB_OUTPUT"
+
+      - name: Verify private package and numeric version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          phase=inspect
+          if [[ "$GITHUB_REF" == refs/tags/container-v* ]]; then
+            phase=prepare
+          fi
+          .github/scripts/check_ghcr.sh "$IMAGE" "$VERSION" "$phase"
+
+      - name: Login to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build Linux image and run Linux authentication regressions
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          docker build --platform linux/amd64 --file Dockerfile \
+            --build-arg "VERSION=$VERSION" --build-arg "VCS_REF=$GITHUB_SHA" \
+            --tag "$IMAGE:$VERSION" --tag "$IMAGE:latest" ..
+
+      - name: Verify normal CLI authentication and restart
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: .github/scripts/smoke-image.sh "$IMAGE:$VERSION" "$VERSION"
+
+      - name: Publish numeric image
+        if: startsWith(github.ref, 'refs/tags/container-v')
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+
+      - name: Verify published private digest
+        if: startsWith(github.ref, 'refs/tags/container-v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          verified=false
+          for attempt in {1..10}; do
+            if .github/scripts/check_ghcr.sh "$IMAGE" "$VERSION" published; then
+              verified=true
+              break
+            fi
+            sleep 3
+          done
+          [[ "$verified" == true ]]
+          digest_ref=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION")
+          docker pull "$digest_ref"
+          .github/scripts/smoke-image.sh "$digest_ref" "$VERSION"
+          printf 'Published private image: %s\n' "$digest_ref"
+          printf 'Private image `%s:%s`\n\nDigest `%s`\n' "$IMAGE" "$VERSION" "$digest_ref" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Logout of GHCR
+        if: always()
+        run: docker logout ghcr.io
 
